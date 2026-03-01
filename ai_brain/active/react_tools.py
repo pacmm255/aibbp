@@ -68,7 +68,7 @@ class ToolDeps:
     current_state: dict[str, Any] | None = None  # For tools that need state read access
     max_turns: int = 150  # 0 = indefinite mode
     default_headers: dict[str, str] = field(default_factory=dict)  # Custom headers for bug bounty programs
-    _cf_cookie_jar: dict[str, dict[str, str]] = field(default_factory=dict)  # domain -> cookies from CF bypass
+    _cf_cookie_jar: dict[str, tuple[float, dict[str, str]]] = field(default_factory=dict)  # domain -> (timestamp, cookies)
 
 
 def _truncate(text: str, max_size: int = _MAX_INLINE_SIZE) -> str:
@@ -76,6 +76,18 @@ def _truncate(text: str, max_size: int = _MAX_INLINE_SIZE) -> str:
     if len(text) <= max_size:
         return text
     return text[:max_size] + f"\n... [truncated, {len(text)} chars total]"
+
+
+def _get_cf_cookies(deps: ToolDeps, domain: str) -> dict[str, str]:
+    """Get cached CF cookies for a domain, respecting 25-min TTL."""
+    entry = deps._cf_cookie_jar.get(domain)
+    if not entry:
+        return {}
+    ts, cookies = entry
+    if time.monotonic() - ts > 1500:  # 25 min — buffer before CF's 30-min expiry
+        del deps._cf_cookie_jar[domain]
+        return {}
+    return cookies
 
 
 def _httpx_kwargs(deps: ToolDeps, **extra: Any) -> dict[str, Any]:
@@ -88,6 +100,15 @@ def _httpx_kwargs(deps: ToolDeps, **extra: Any) -> dict[str, Any]:
         headers = dict(deps.default_headers)
         headers.update(extra.pop("headers", {}))
         kwargs["headers"] = headers
+    # Inject cached CF cookies when URL is provided
+    url = extra.pop("cf_inject_url", None)
+    if url and deps._cf_cookie_jar:
+        from urllib.parse import urlparse
+        domain = urlparse(url).hostname or ""
+        cf_cookies = _get_cf_cookies(deps, domain)
+        if cf_cookies:
+            existing = extra.get("cookies") or {}
+            extra["cookies"] = {**cf_cookies, **existing}  # explicit cookies win
     kwargs.update(extra)
     return kwargs
 
@@ -144,7 +165,7 @@ def _is_cloudflare_challenge(status: int, headers: dict[str, str], body: str) ->
     if body_stripped.startswith("{") or body_stripped.startswith("["):
         return False
     # Look for Cloudflare challenge markers in HTML body
-    cf_markers = ("challenge-platform", "Just a moment", "Checking your browser", "cloudflare")
+    cf_markers = ("challenge-platform", "Just a moment", "Checking your browser", "cf-chl-", "_cf_chl_opt")
     return any(marker in body for marker in cf_markers)
 
 
@@ -170,7 +191,7 @@ async def _solve_cloudflare_challenge(
                     # Found it — grab all cookies for this domain
                     for cc in raw_cookies:
                         cookies[cc["name"]] = cc["value"]
-                    deps._cf_cookie_jar[domain] = cookies
+                    deps._cf_cookie_jar[domain] = (time.monotonic(), cookies)
                     logger.info(
                         "cloudflare_bypass_success",
                         domain=domain,
@@ -184,7 +205,7 @@ async def _solve_cloudflare_challenge(
         for c in raw_cookies:
             cookies[c["name"]] = c["value"]
         if cookies:
-            deps._cf_cookie_jar[domain] = cookies
+            deps._cf_cookie_jar[domain] = (time.monotonic(), cookies)
         logger.warning(
             "cloudflare_bypass_timeout",
             domain=domain,
@@ -329,7 +350,7 @@ async def _dispatch(
         for method in methods:
             try:
                 import httpx
-                async with httpx.AsyncClient(**_httpx_kwargs(deps)) as client:
+                async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=url)) as client:
                     resp = await client.request(method, url, headers=headers_extra)
                     results.append({
                         "method": method,
@@ -369,7 +390,7 @@ async def _dispatch(
             test_methods.append("POST")
 
         import httpx
-        async with httpx.AsyncClient(**_httpx_kwargs(deps)) as client:
+        async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=url)) as client:
             for bh in bypass_headers:
                 for test_method in test_methods:
                     try:
@@ -436,7 +457,7 @@ async def _dispatch(
                 new_query = urlencode(params, doseq=True)
                 test_url = urlunparse(parsed._replace(query=new_query))
             try:
-                async with httpx.AsyncClient(**_httpx_kwargs(deps)) as client:
+                async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=test_url)) as client:
                     resp = await client.request(method, test_url)
                     results.append({
                         "value": val,
@@ -499,7 +520,7 @@ async def _dispatch(
 
         # Inject cached Cloudflare cookies for this domain
         domain = _urlparse(url).hostname or ""
-        cf_cookies = deps._cf_cookie_jar.get(domain, {})
+        cf_cookies = _get_cf_cookies(deps, domain)
         if cf_cookies:
             merged_cookies = {**cf_cookies, **cookies}  # explicit cookies win
         else:
