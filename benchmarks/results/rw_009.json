@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-02-25T01:32:44",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 1874.8849337100983,
+  "total_cost": 6.792991,
+  "category_breakdown": {
+    "chain": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "real_world": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "RW-009-26",
+      "tags": [
+        "chain",
+        "real_world"
+      ],
+      "level": 3,
+      "passed": false,
+      "elapsed_seconds": 1813.7306051254272,
+      "budget_spent": 6.792991,
+      "turns": 60,
+      "done_reason": "Max turns reached (60)",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

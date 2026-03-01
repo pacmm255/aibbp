@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-24T06:14:22",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 564.4875876903534,
+  "total_cost": 1.979311,
+  "category_breakdown": {
+    "xss": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-064-24",
+      "tags": [
+        "xss"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 538.9728832244873,
+      "budget_spent": 1.979311,
+      "turns": 23,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 1
+    }
+  ]
+}

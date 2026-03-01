@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-02-25T01:29:20",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 1683.9092621803284,
+  "total_cost": 6.977088,
+  "category_breakdown": {
+    "auth": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "real_world": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "RW-003-26",
+      "tags": [
+        "auth",
+        "real_world"
+      ],
+      "level": 3,
+      "passed": false,
+      "elapsed_seconds": 1614.7360837459564,
+      "budget_spent": 6.977088,
+      "turns": 60,
+      "done_reason": "Max turns reached (60)",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+# Multi-stage build for the Python AI brain.
+
+# ── Stage 1: Install dependencies ───────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Install Playwright browsers for headless validation
+RUN pip install --no-cache-dir --prefix=/install playwright && \
+    PLAYWRIGHT_BROWSERS_PATH=/install/browsers \
+    python -m playwright install chromium --with-deps 2>/dev/null || true
+
+# ── Stage 2: Runtime ────────────────────────────────────────────────
+FROM python:3.12-slim
+
+# Install runtime dependencies for Playwright
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --uid 1000 aibrain
+
+# Copy installed packages
+COPY --from=builder /install /usr/local
+COPY --from=builder /install/browsers /usr/local/browsers 2>/dev/null || true
+
+# Copy application code
+WORKDIR /app
+COPY ai_brain/ ./ai_brain/
+COPY configs/ ./configs/
+
+# Set environment
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/usr/local/browsers
+
+# Create data directory
+RUN mkdir -p /data/reports /data/checkpoints && \
+    chown -R aibrain:aibrain /data /app
+
+USER aibrain
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "from ai_brain.config import AIBrainConfig; print('ok')" || exit 1
+
+# Default command - run the orchestrator
+CMD ["python", "-m", "ai_brain"]

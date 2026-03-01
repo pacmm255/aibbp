@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-02-24T00:18:58",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 25.5167338848114,
+  "total_cost": 0.0,
+  "category_breakdown": {
+    "privilege_escalation": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "business_logic": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-085-24",
+      "tags": [
+        "privilege_escalation",
+        "business_logic"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 9.976678848266602,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

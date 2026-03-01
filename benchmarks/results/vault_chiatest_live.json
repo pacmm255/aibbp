@@ -1,0 +1,26 @@
+{
+  "target_url": "https://vault.chiatest.net",
+  "elapsed_seconds": 2603,
+  "turns": 85,
+  "done_reason": "Budget exhausted: Budget exhausted for target:https://vault.chiatest.net: $10.1348 / $10.0000",
+  "budget_spent": 10.144546999999998,
+  "budget_limit": 999.0,
+  "graph_error": null,
+  "endpoints": {
+    "https://api.vault.chiatest.net/graphql": {
+      "method": "GET",
+      "notes": "discovered via fuzzing"
+    }
+  },
+  "findings": {},
+  "confirmed_findings": {},
+  "hypotheses": {},
+  "accounts": {},
+  "tech_stack": [],
+  "errors": [
+    "get_proxy_traffic: Invalid control character at: line 1 column 15001 (char 15000)",
+    "run_custom_exploit: Invalid control character at: line 1 column 15001 (char 15000)",
+    "run_custom_exploit: Invalid control character at: line 1 column 15001 (char 15000)",
+    "run_custom_exploit: Invalid control character at: line 1 column 15001 (char 15000)"
+  ]
+}

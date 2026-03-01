@@ -1,0 +1,18 @@
+{
+  "target_url": "https://vault.chiatest.net",
+  "elapsed_seconds": 6544,
+  "turns": 0,
+  "done_reason": "Recursion limit of 500 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+  "budget_spent": 23.818763999999998,
+  "budget_limit": 999.0,
+  "graph_error": "Recursion limit of 500 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",
+  "endpoints": {},
+  "findings": {},
+  "confirmed_findings": {},
+  "hypotheses": {},
+  "accounts": {},
+  "tech_stack": [],
+  "errors": [
+    "Graph error: Recursion limit of 500 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT"
+  ]
+}

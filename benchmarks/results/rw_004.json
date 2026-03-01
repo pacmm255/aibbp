@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-02-25T01:11:14",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 591.2910740375519,
+  "total_cost": 2.7285600000000003,
+  "category_breakdown": {
+    "prioritization": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "real_world": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "RW-004-26",
+      "tags": [
+        "prioritization",
+        "real_world"
+      ],
+      "level": 2,
+      "passed": false,
+      "elapsed_seconds": 554.39799284935,
+      "budget_spent": 2.7285600000000003,
+      "turns": 25,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 9
+    }
+  ]
+}

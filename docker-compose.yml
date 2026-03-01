@@ -1,0 +1,203 @@
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: aibbp-postgres
+    environment:
+      POSTGRES_DB: aibbp
+      POSTGRES_USER: aibbp
+      POSTGRES_PASSWORD: aibbp_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibbp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aibbp-redis
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6382:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+  # ── NATS JetStream ───────────────────────────────────────────────
+  nats:
+    image: nats:2-alpine
+    container_name: aibbp-nats
+    command: >
+      -js
+      --store_dir /data
+      -m 8222
+    ports:
+      - "4222:4222"   # Client
+      - "8222:8222"   # Monitoring
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ── Scanner Worker ──────────────────────────────────────────────────
+  scanner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.scanner
+    container_name: aibbp-scanner
+    command: ["scanner"]
+    environment:
+      AIBBP_NATS_URL: nats://nats:4222
+      AIBBP_REDIS_ADDR: redis:6379
+      AIBBP_DB_HOST: postgres
+      AIBBP_DB_PORT: "5432"
+      AIBBP_DB_NAME: aibbp
+      AIBBP_DB_USER: aibbp
+      AIBBP_DB_PASSWORD: aibbp_dev
+    volumes:
+      - scandata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    restart: unless-stopped
+
+  # ── Preprocessor Worker ────────────────────────────────────────────
+  preprocessor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.scanner
+    container_name: aibbp-preprocessor
+    command: ["preprocessor"]
+    environment:
+      AIBBP_NATS_URL: nats://nats:4222
+      AIBBP_DB_HOST: postgres
+      AIBBP_DB_PORT: "5432"
+      AIBBP_DB_NAME: aibbp
+      AIBBP_DB_USER: aibbp
+      AIBBP_DB_PASSWORD: aibbp_dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+
+  # ── AI Brain ───────────────────────────────────────────────────────
+  ai-brain:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ai-brain
+    container_name: aibbp-ai-brain
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      AIBBP_DB_HOST: postgres
+      AIBBP_DB_PORT: "5432"
+      AIBBP_DB_NAME: aibbp
+      AIBBP_DB_USER: aibbp
+      AIBBP_DB_PASSWORD: aibbp_dev
+      AIBBP_NATS_URL: nats://nats:4222
+    volumes:
+      - reportdata:/data/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    restart: unless-stopped
+
+  # ── Active Testing Browser (opt-in via --profile active) ──────────
+  active-browser:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.active-browser
+    container_name: aibbp-active-browser
+    profiles: [active]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      AIBBP_DB_HOST: postgres
+      AIBBP_DB_PORT: "5432"
+      AIBBP_DB_NAME: aibbp
+      AIBBP_DB_USER: aibbp
+      AIBBP_DB_PASSWORD: aibbp_dev
+      AIBBP_NATS_URL: nats://nats:4222
+      AIBBP_ACTIVE_TESTING_REDIS_URL: redis://redis:6379
+    volumes:
+      - reportdata:/data/reports
+      - activedata:/data/active
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+    restart: unless-stopped
+
+  # ── SQLMap API (opt-in via --profile active) ─────────────────────
+  sqlmap-api:
+    image: paolostivanin/sqlmap
+    container_name: aibbp-sqlmap-api
+    profiles: [active]
+    command: ["python", "sqlmapapi.py", "-s", "-H", "0.0.0.0", "-p", "8775"]
+    ports:
+      - "8775:8775"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  natsdata:
+  scandata:
+  reportdata:
+  activedata:

@@ -1,0 +1,144 @@
+# AIBBP - AI Bug Bounty Platform Configuration
+# ─────────────────────────────────────────────
+
+# ── Anthropic API ─────────────────────────────────────────────────────
+api:
+  # API key loaded from ANTHROPIC_API_KEY env var
+  models:
+    routine: "claude-haiku-4-5"        # 80% of calls - classification, triage
+    complex: "claude-sonnet-4-6"       # 18% of calls - vuln analysis, strategy
+    critical: "claude-opus-4-6"        # 2% of calls - chain discovery, reports
+  rate_limits:
+    requests_per_minute: 50            # Anthropic API RPM limit
+    input_tokens_per_minute: 100000    # Anthropic API ITPM limit
+    max_retries: 3
+    base_retry_delay_seconds: 1.0
+  defaults:
+    temperature: 0                     # Deterministic by default
+    wordlist_temperature: 0.2          # Slight creativity for wordlists
+    max_tokens: 4096
+    thinking_type: "adaptive"          # For Opus 4.6
+
+# ── Token Budget ──────────────────────────────────────────────────────
+budget:
+  total_dollars: 15.0                  # Max spend per program run
+  emergency_reserve_pct: 15            # Force reporting when budget < 15%
+  phase_allocation:
+    program_analysis: 5                # % - scope + prioritization
+    recon: 25                          # % - subdomain, JS, API, correlation
+    vuln_detection: 35                 # % - all 9 vuln solvers
+    validation: 15                     # % - false positive filtering
+    chain_discovery: 8                 # % - attack chain analysis
+    reporting: 7                       # % - report generation + CVSS
+    strategy: 5                        # % - continue vs move on
+  per_target_max_dollars: 2.0          # Cap per individual target
+  pricing:                             # $ per 1M tokens
+    haiku_input: 1.0
+    haiku_output: 5.0
+    sonnet_input: 3.0
+    sonnet_output: 15.0
+    opus_input: 5.0
+    opus_output: 25.0
+    cache_read_multiplier: 0.1         # Cache reads cost 10% of input
+
+# ── Scanning ──────────────────────────────────────────────────────────
+scanning:
+  # Per-domain rate limiting
+  target_rate_limit:
+    requests_per_second: 3             # Default RPS per domain
+    burst: 5                           # Burst allowance
+    min_rps: 2                         # Adaptive minimum
+    max_rps: 5                         # Adaptive maximum
+  # Scanner timeouts (seconds)
+  timeouts:
+    subfinder: 600
+    httpx: 300
+    nmap: 900
+    nuclei: 1800
+    masscan: 600
+    ffuf: 600
+    katana: 600
+    dnsx: 300
+    gowitness: 300
+  # Scanner-specific settings
+  nuclei:
+    severity: "medium,high,critical"
+    rate_limit: 150
+    bulk_size: 25
+    templates_dir: "/root/nuclei-templates"
+  ffuf:
+    threads: 40
+    rate: 100
+    wordlist: "/usr/share/wordlists/dirb/common.txt"
+  masscan:
+    rate: 1000
+    ports: "1-65535"
+  nmap:
+    top_ports: 1000
+    scripts: "default,vuln"
+  katana:
+    depth: 3
+    js_crawl: true
+    max_duration: 600
+
+# ── Preprocessor ──────────────────────────────────────────────────────
+preprocessor:
+  max_output_bytes: 51200              # 50KB cap per result
+  simhash_threshold: 3                 # Hamming distance for dedup
+  filter:
+    remove_status_codes: [404, 502, 503]
+    remove_default_pages: true
+    remove_closed_ports: true
+    remove_standard_headers: true
+  array_truncation:
+    max_items: 100                     # Max items in JSON arrays
+
+# ── Infrastructure ────────────────────────────────────────────────────
+database:
+  host: "localhost"
+  port: 5432
+  name: "aibbp"
+  user: "aibbp"
+  password: "aibbp_dev"               # Override via env AIBBP_DB_PASSWORD
+  pool_min: 2
+  pool_max: 10
+  ssl_mode: "disable"
+
+redis:
+  address: "localhost:6379"
+  password: ""
+  db: 0
+  max_memory: "256mb"
+  eviction_policy: "allkeys-lru"
+
+nats:
+  url: "nats://localhost:4222"
+  max_reconnect: 60
+  reconnect_wait_seconds: 2
+  streams:
+    scans:
+      retention: "workqueue"
+      max_msgs: 10000
+    tasks:
+      retention: "workqueue"
+      max_msgs: 50000
+    results:
+      retention: "limits"
+      max_age_days: 7
+    events:
+      retention: "limits"
+      max_age_days: 30
+
+# ── Run Settings ──────────────────────────────────────────────────────
+run:
+  max_duration_hours: 12               # Hard cap on total run time
+  checkpoint_interval_seconds: 30      # LangGraph checkpoint frequency
+  max_targets_per_run: 500
+  concurrent_scanners: 3               # Parallel scanner workers
+  concurrent_solvers: 2                # Parallel AI solver tasks
+
+# ── Logging ───────────────────────────────────────────────────────────
+logging:
+  level: "info"                        # debug, info, warn, error
+  format: "json"                       # json or console
+  file: ""                             # Empty = stdout only

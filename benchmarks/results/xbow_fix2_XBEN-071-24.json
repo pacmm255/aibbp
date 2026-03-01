@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-24T16:45:19",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 676.0959689617157,
+  "total_cost": 2.6750450000000003,
+  "category_breakdown": {
+    "sqli": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-071-24",
+      "tags": [
+        "sqli"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 627.0695216655731,
+      "budget_spent": 2.6750450000000003,
+      "turns": 18,
+      "done_reason": "Budget exhausted: Budget exhausted for active_testing: $2.6750 / $3.0000",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 7
+    }
+  ]
+}

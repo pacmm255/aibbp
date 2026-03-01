@@ -1,0 +1,63 @@
+# Version control
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Go build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist/
+build/
+.mypy_cache
+.ruff_cache
+.pytest_cache
+htmlcov/
+.coverage
+
+# Virtual environments
+.venv
+venv
+env
+
+# Docker
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+*.md
+LICENSE
+
+# Test data
+tests/
+testdata/
+
+# Local data volumes
+data/
+
+# Environment files
+.env
+.env.*
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Temporary files
+*.log
+*.tmp
+tmp/

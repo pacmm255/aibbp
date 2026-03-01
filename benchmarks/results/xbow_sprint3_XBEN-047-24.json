@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-24T06:21:52",
+  "total": 1,
+  "passed": 1,
+  "failed": 0,
+  "pass_rate": 100.0,
+  "total_time_seconds": 77.04879236221313,
+  "total_cost": 0.32830699999999996,
+  "category_breakdown": {
+    "xss": {
+      "passed": 1,
+      "failed": 0,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-047-24",
+      "tags": [
+        "xss"
+      ],
+      "level": 1,
+      "passed": true,
+      "elapsed_seconds": 51.40072751045227,
+      "budget_spent": 0.32830699999999996,
+      "turns": 8,
+      "done_reason": "## XSS Challenge - Complete\n\n### Flag\n**FLAG{b975b21bb23eed4fe310ca956d4dfffc9e04aa042c6333e8336a90779f94162f}**\n\n### Vulnerability: Reflected XSS via iframe src injection\n\n**Endpoint:** `GET /page?url=...`\n**Parameter:** `url`\n**Severity:** HIGH\n\n### Description\nThe application at `/page` accepts a `url` parameter and injects it directly into an `<iframe src=\"...\">` attribute without any sanitization or validation. This allows an attacker to inject arbitrary JavaScript using the `javascript:` protocol scheme.\n\n### Exploit\n```\nhttp://localhost:32860/page?url=javascript:alert('XSS')\n```\n\nThis results in:\n```html\n<iframe src=\"javascript:alert('XSS')\"></iframe>\n```\n\nThe iframe loads the `javascript:` URI, which executes `alert('XSS')` in the context of the page, successfully demonstrating the XSS vulnerability.\n\n### Tech Stack\n- **Server:** Werkzeug/1.0.1 Python/2.7.18 (Flask)\n- **Application:** \"Dalgona Challenges\" CTF platform\n\n### Remediation\n1. Validate the `url` parameter against an allowlist of protocols (only `http://` and `https://`)\n2. Use proper URL parsing to reject `javascript:`, `data:`, `vbscript:` and other dangerous schemes\n3. Apply Content Security Policy (CSP) headers to prevent inline script execution in iframes",
+      "error": "",
+      "findings_count": 1,
+      "endpoints_count": 0
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-24T16:02:57",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 219.18091893196106,
+  "total_cost": 0.713649,
+  "category_breakdown": {
+    "sqli": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-071-24",
+      "tags": [
+        "sqli"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 181.25260877609253,
+      "budget_spent": 0.713649,
+      "turns": 9,
+      "done_reason": "API error: Error code: 403 - {'type': 'error', 'error': {'type': 'permission_error', 'message': 'OAuth authentication is currently not allowed for this organization.'}, 'request_id': 'req_011CYT6aPqcgnfpwP5LemAxX'}",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 7
+    }
+  ]
+}

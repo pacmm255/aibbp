@@ -1,0 +1,64 @@
+Send raw HTTP requests for security testing. Low-level HTTP interface - behaves like programmable proxy/Burp Suite requester.
+
+## USAGE
+
+Send exact HTTP bytes to target, receive raw bytes back. No modification except credential replacement.
+
+Supports:
+- All HTTP methods (GET, POST, PUT, DELETE, etc.)
+- Binary bodies, chunked transfer, arbitrary headers
+- HTTP and HTTPS connections
+- Credential placeholder auto-replacement
+
+## WHEN TO USE
+
+- Test target with single HTTP request
+- Test injection payloads for vulnerabilities
+- Validate security controls with specific requests
+
+## REQUEST FORMAT
+
+```
+METHOD /path?query=value HTTP/1.1\r\n
+Host: target.domain\r\n
+User-Agent: Mozilla/5.0 ...\r\n
+[headers]\r\n
+\r\n
+[body]\r\n
+\r\n
+```
+
+## CREDENTIAL HANDLING
+
+Use credential placeholders that auto-replace during execution:
+- Email: `<dummy_email>`
+- Username: `<dummy_username>`
+- Password: `<dummy_password>`
+
+Example: `username=<dummy_username>&password=<dummy_password>`
+
+No manual credential management needed - replacement happens automatically.
+
+## EXAMPLE
+
+```
+POST /api/login HTTP/1.1\r\n
+Host: target.com\r\n
+Content-Type: application/json\r\n
+\r\n
+{"username":"<dummy_username>","password":"<dummy_password>"}\r\n
+\r\n
+```
+
+## RULES
+
+- Normalize method to UPPERCASE
+- Always include `Host` and `User-Agent` headers
+- If `body_encoding` omitted and body has non-UTF-8 bytes, treat as base64
+- Extract ONLY ONE request most likely to work
+- Return ONLY formatted request, nothing more
+- Find NEW payloads different from previous attempts
+- Start with small payloads, validate, then escalate
+- ONLY use validated endpoints (from tools or context)
+- NEVER repeat request that returned error already in context
+- Test only unharmful and undetectable payloads

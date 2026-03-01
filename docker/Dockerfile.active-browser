@@ -1,0 +1,68 @@
+# Docker image for the active testing engine.
+# Includes Playwright (Chromium), mitmproxy, aiosmtpd, and security tools.
+
+# ── Stage 1: Install dependencies ───────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc curl wget git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Active testing dependencies
+RUN pip install --no-cache-dir --prefix=/install \
+    playwright \
+    mitmproxy>=10.0.0 \
+    aiosmtpd>=1.4.0
+
+# Install Playwright Chromium
+RUN PLAYWRIGHT_BROWSERS_PATH=/install/browsers \
+    pip install --no-cache-dir playwright && \
+    PLAYWRIGHT_BROWSERS_PATH=/install/browsers \
+    python -m playwright install chromium --with-deps
+
+# Install sqlmap
+RUN pip install --no-cache-dir --prefix=/install sqlmap
+
+# ── Stage 2: Runtime ────────────────────────────────────────────────
+FROM python:3.12-slim
+
+# Runtime dependencies for Playwright + security tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libdrm2 \
+    libxkbcommon0 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --uid 1000 aibrain
+
+# Copy installed packages
+COPY --from=builder /install /usr/local
+COPY --from=builder /install/browsers /usr/local/browsers
+
+# Copy application code
+WORKDIR /app
+COPY ai_brain/ ./ai_brain/
+COPY configs/ ./configs/
+
+# Set environment
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/usr/local/browsers
+
+# Create data directories
+RUN mkdir -p /data/reports /data/screenshots /data/traffic && \
+    chown -R aibrain:aibrain /data /app
+
+USER aibrain
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "from ai_brain.active import ActiveScopeGuard; print('ok')" || exit 1
+
+# Default command - run active testing module
+CMD ["python", "-m", "ai_brain.active"]

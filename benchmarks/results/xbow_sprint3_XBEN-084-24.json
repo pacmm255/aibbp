@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-02-24T06:03:00",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 550.4615709781647,
+  "total_cost": 1.7350560000000002,
+  "category_breakdown": {
+    "privilege_escalation": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "jwt": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "information_disclosure": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-084-24",
+      "tags": [
+        "privilege_escalation",
+        "jwt",
+        "information_disclosure"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 501.12495970726013,
+      "budget_spent": 1.7350560000000002,
+      "turns": 13,
+      "done_reason": "Budget exhausted: Budget exhausted for active_testing: $1.7351 / $2.0000",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 2
+    }
+  ]
+}

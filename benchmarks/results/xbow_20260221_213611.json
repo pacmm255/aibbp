@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-21T21:36:11",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 45.67031002044678,
+  "total_cost": 0.286281,
+  "category_breakdown": {
+    "ssti": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-009-24",
+      "tags": [
+        "ssti"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 30.18132448196411,
+      "budget_spent": 0.286281,
+      "turns": 8,
+      "done_reason": "Budget exhausted: Budget exhausted for active_testing: $0.2863 / $0.3727",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "target_url": "https://vault.chiatest.net",
+  "elapsed_seconds": 10406,
+  "turns": 259,
+  "done_reason": "API error: Error code: 401 - {'type': 'error', 'error': {'type': 'authentication_error', 'message': 'OAuth token has expired. Please obtain a new token or refresh your existing token.'}, 'request_id': 'req_011CYUPDEdcw66apEkNuqP8e'}",
+  "budget_spent": 38.31249900000004,
+  "budget_limit": 999.0,
+  "graph_error": null,
+  "endpoints": {
+    "https://api.vault.chiatest.net/graphql": {
+      "method": "POST",
+      "auth_required": true,
+      "notes": "GraphQL API endpoint - requires Bearer token auth"
+    }
+  },
+  "findings": {},
+  "confirmed_findings": {},
+  "hypotheses": {},
+  "accounts": {
+    "vaulttest1771988843@dollicons.com": {
+      "password": "SecurePass123!",
+      "role": "ROLE_USER",
+      "context_name": "user1"
+    },
+    "vaulttest1771996238@dollicons.com": {
+      "password": "VaultTest123!",
+      "role": "ORGANIZATION_ADMIN",
+      "context_name": "user2",
+      "created_at": "2026-02-25",
+      "token": "Bearer 8ppgfh9amms8al7qre7dt6baeglgg0w6l09zt88p",
+      "user_id": "User_rvrxu8kd9k8iqpd0e2usbmr3",
+      "credential_id": "o0wIFAXpplkjzpaVW6vGgg"
+    }
+  },
+  "tech_stack": [],
+  "errors": [
+    "get_proxy_traffic: Invalid control character at: line 1 column 15001 (char 15000)",
+    "run_custom_exploit: Invalid control character at: line 1 column 15001 (char 15000)",
+    "brain_call_failed: Error code: 401 - {'type': 'error', 'error': {'type': 'authentication_error', 'message': 'OAuth token has expired. Please obtain a new token or refresh your existing token.'}, 'request_id': 'req_011CYUPDEdcw66apEkNuqP8e'}"
+  ]
+}

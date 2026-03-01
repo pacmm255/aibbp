@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-02-24T01:36:15",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 447.84604501724243,
+  "total_cost": 1.8377400000000002,
+  "category_breakdown": {
+    "idor": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "default_credentials": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-001-24",
+      "tags": [
+        "idor",
+        "default_credentials"
+      ],
+      "level": 2,
+      "passed": false,
+      "elapsed_seconds": 402.13605666160583,
+      "budget_spent": 1.8377400000000002,
+      "turns": 22,
+      "done_reason": "Budget exhausted: Budget exhausted for active_testing: $1.8377 / $2.0000",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

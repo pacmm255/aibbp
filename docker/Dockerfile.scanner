@@ -1,0 +1,70 @@
+# Multi-stage build for Go scanning engine.
+# Produces scanner worker, preprocessor worker, and CLI binaries.
+
+# ── Stage 1: Build Go binaries ──────────────────────────────────────
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache git gcc musl-dev
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Build all three binaries
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/scanner ./cmd/scanner
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/preprocessor ./cmd/preprocessor
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/cli ./cmd/cli
+
+# ── Stage 2: Install scanning tools ─────────────────────────────────
+FROM golang:1.23-alpine AS tools
+
+RUN apk add --no-cache git
+
+# Install Go-based security tools
+RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
+    go install github.com/projectdiscovery/httpx/cmd/httpx@latest && \
+    go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \
+    go install github.com/projectdiscovery/katana/cmd/katana@latest && \
+    go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest && \
+    go install github.com/ffuf/ffuf/v2@latest && \
+    go install github.com/sensepost/gowitness@latest
+
+# ── Stage 3: Runtime ────────────────────────────────────────────────
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    ca-certificates \
+    nmap \
+    masscan \
+    chromium \
+    && adduser -D -u 1000 scanner
+
+# Copy Go binaries
+COPY --from=builder /out/scanner /usr/local/bin/scanner
+COPY --from=builder /out/preprocessor /usr/local/bin/preprocessor
+COPY --from=builder /out/cli /usr/local/bin/aibbp
+
+# Copy security tools
+COPY --from=tools /root/go/bin/subfinder /usr/local/bin/
+COPY --from=tools /root/go/bin/httpx /usr/local/bin/
+COPY --from=tools /root/go/bin/nuclei /usr/local/bin/
+COPY --from=tools /root/go/bin/katana /usr/local/bin/
+COPY --from=tools /root/go/bin/dnsx /usr/local/bin/
+COPY --from=tools /root/go/bin/ffuf /usr/local/bin/
+COPY --from=tools /root/go/bin/gowitness /usr/local/bin/
+
+# Copy configs and migrations
+COPY configs/ /etc/aibbp/
+COPY migrations/ /etc/aibbp/migrations/
+
+# Create data directories
+RUN mkdir -p /data/scans /data/wordlists /data/screenshots && \
+    chown -R scanner:scanner /data
+
+USER scanner
+WORKDIR /data
+
+# Default entrypoint - override with docker-compose command
+ENTRYPOINT ["scanner"]

@@ -1,0 +1,19 @@
+-- Reverse initial schema migration
+DROP TRIGGER IF EXISTS trg_programs_updated_at ON programs;
+DROP FUNCTION IF EXISTS update_updated_at();
+DROP VIEW IF EXISTS v_asset_stats;
+DROP TABLE IF EXISTS cost_tracking;
+DROP TABLE IF EXISTS monitor_deltas;
+DROP TABLE IF EXISTS vuln_chains;
+DROP TABLE IF EXISTS scans;
+DROP TABLE IF EXISTS vulnerabilities;
+DROP TABLE IF EXISTS js_files;
+DROP TABLE IF EXISTS technologies;
+DROP TABLE IF EXISTS urls;
+DROP TABLE IF EXISTS open_ports;
+DROP TABLE IF EXISTS subdomains;
+DROP TABLE IF EXISTS root_domains;
+DROP TABLE IF EXISTS programs;
+DROP TYPE IF EXISTS severity_level;
+DROP TYPE IF EXISTS vuln_status;
+DROP TYPE IF EXISTS scan_status;

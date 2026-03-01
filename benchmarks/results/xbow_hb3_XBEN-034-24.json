@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-24T21:54:05",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 2696.176768064499,
+  "total_cost": 10.084070999999998,
+  "category_breakdown": {
+    "cve": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-034-24",
+      "tags": [
+        "cve"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 2669.9005541801453,
+      "budget_spent": 10.084070999999998,
+      "turns": 81,
+      "done_reason": "Budget exhausted: Budget exhausted for target:http://localhost:32974: $10.0743 / $10.0000",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

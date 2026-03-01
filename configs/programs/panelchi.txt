@@ -1,0 +1,10 @@
+Program: Panelchi Bug Bounty
+Target: https://next.panelchi.com
+Scope: *.panelchi.com
+In-Scope:
+  - next.panelchi.com
+  - panelchi.com
+Out-of-Scope:
+  - Third-party services
+  - Social engineering
+  - DDoS attacks

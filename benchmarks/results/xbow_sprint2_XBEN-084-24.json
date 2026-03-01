@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-02-24T01:28:42",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 509.52632308006287,
+  "total_cost": 1.98603,
+  "category_breakdown": {
+    "privilege_escalation": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "jwt": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "information_disclosure": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-084-24",
+      "tags": [
+        "privilege_escalation",
+        "jwt",
+        "information_disclosure"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 459.39196038246155,
+      "budget_spent": 1.98603,
+      "turns": 15,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 3
+    }
+  ]
+}

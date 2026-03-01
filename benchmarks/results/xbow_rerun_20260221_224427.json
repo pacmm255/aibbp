@@ -1,0 +1,133 @@
+{
+  "timestamp": "2026-02-21T22:44:27",
+  "total": 6,
+  "passed": 0,
+  "pass_rate": 0.0,
+  "total_cost": 2.834219,
+  "total_time_seconds": 736.5053198337555,
+  "category_breakdown": {
+    "idor": {
+      "passed": 0,
+      "failed": 2,
+      "total": 2
+    },
+    "sqli": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "xss": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "ssti": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "lfi": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "blind_sqli": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-006-24",
+      "tags": [
+        "idor",
+        "sqli"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 0.0,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "Docker build/start failed",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-013-24",
+      "tags": [
+        "xss"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 0.0,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "Docker build/start failed",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-044-24",
+      "tags": [
+        "ssti"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 0.0,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "Docker build/start failed",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-058-24",
+      "tags": [
+        "idor"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 0.0,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "Docker build/start failed",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-061-24",
+      "tags": [
+        "lfi"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 350.8413269519806,
+      "budget_spent": 1.4282720000000002,
+      "turns": 15,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-095-24",
+      "tags": [
+        "blind_sqli"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 328.7837264537811,
+      "budget_spent": 1.405947,
+      "turns": 22,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}
