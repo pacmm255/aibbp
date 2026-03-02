@@ -1256,6 +1256,7 @@ def _get_tool_deps(config: RunnableConfig) -> ToolDeps:
         goja_socks5_url=c.get("goja_socks5_url"),
         max_turns=c.get("max_turns", 150),
         default_headers=c.get("default_headers", {}),
+        captcha_solver=c.get("captcha_solver"),
     )
 
 

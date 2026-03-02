@@ -31,6 +31,7 @@ from typing import Any
 import structlog
 
 from ai_brain.active.browser import BrowserController
+from ai_brain.active.captcha_solver import CaptchaSolver
 from ai_brain.active.email import EmailManager
 from ai_brain.active.goja_manager import GojaManager
 from ai_brain.active.hexstrike_server import HexstrikeServerManager
@@ -152,6 +153,15 @@ def parse_args() -> argparse.Namespace:
         "--header", type=str, nargs="*", default=[],
         help='Custom headers as "Name: Value" pairs (e.g., --header "X-Bug-Bounty: test")',
     )
+    # CAPTCHA solver options
+    parser.add_argument(
+        "--captcha-api-key", type=str, default="",
+        help="2captcha/rucaptcha/capsolver API key for reCAPTCHA/hCaptcha/Turnstile solving",
+    )
+    parser.add_argument(
+        "--captcha-api-url", type=str, default="https://2captcha.com",
+        help="CAPTCHA service API URL (default: https://2captcha.com)",
+    )
     return parser.parse_args()
 
 
@@ -226,6 +236,15 @@ async def main() -> None:
     traffic_intelligence = TrafficIntelligence(scope_guard)
     traffic_analyzer = TrafficAnalyzer(scope_guard)
 
+    # CAPTCHA solver
+    captcha_api_key = args.captcha_api_key or active_cfg.captcha_api_key
+    captcha_api_url = args.captcha_api_url or active_cfg.captcha_api_url
+    captcha_solver = CaptchaSolver(
+        api_key=captcha_api_key,
+        api_url=captcha_api_url,
+        vision_client=client,
+    ) if captcha_api_key else CaptchaSolver(vision_client=client)
+
     # Target memory
     memory = TargetMemory(args.target, args.memory_dir)
     saved_memory: dict[str, Any] | None = None
@@ -257,6 +276,10 @@ async def main() -> None:
     print(f"  Mode:       {mode_str}")
     print(f"  Timeout:    {timeout_str}")
     print(f"  Dry run:    {args.dry_run}")
+    if captcha_solver.has_service:
+        print(f"  CAPTCHA:    2captcha API ({captcha_api_url})")
+    else:
+        print(f"  CAPTCHA:    image-only (Claude Vision) — add --captcha-api-key for reCAPTCHA/hCaptcha/Turnstile")
     if saved_memory:
         print(f"  Memory:     loaded ({saved_memory.get('total_sessions', 0)} prior sessions, "
               f"{len(saved_memory.get('tested_techniques', {}))} techniques)")
@@ -312,6 +335,7 @@ async def main() -> None:
                 "authz_tester": authz_tester,
                 "traffic_intelligence": traffic_intelligence,
                 "traffic_analyzer": traffic_analyzer,
+                "captcha_solver": captcha_solver,
                 "config": active_cfg,
                 "max_turns": args.max_turns,
                 "budget_limit": args.budget,

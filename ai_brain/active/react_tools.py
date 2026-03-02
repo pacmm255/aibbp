@@ -36,6 +36,7 @@ from ai_brain.active.advanced_attacks import (
     BehaviorProfiler,
 )
 from ai_brain.active.chain_discovery import ChainDiscoveryEngine, AdversarialReasoningEngine
+from ai_brain.active.captcha_solver import CaptchaSolver
 
 logger = structlog.get_logger()
 
@@ -60,6 +61,7 @@ class ToolDeps:
     traffic_analyzer: Any  # TrafficAnalyzer
     client: Any  # ClaudeClient (for CAPTCHA solving)
     config: Any  # ActiveTestingConfig
+    captcha_solver: CaptchaSolver | None = None  # Universal CAPTCHA solver
     waf_engine: Any | None = None  # WafBypassEngine
     chain_engine: Any | None = None  # ChainDiscoveryEngine
     reasoning_engine: Any | None = None  # AdversarialReasoningEngine
@@ -1034,6 +1036,32 @@ async def _dispatch(
             "suggestions": suggestions[:10],
         }
 
+    if tool_name == "solve_captcha":
+        ctx = inp.get("context_name", "default")
+        await _ensure_context(deps, ctx)
+        solved = await _try_solve_captcha(deps, ctx)
+        if solved:
+            # Detect what type was solved for informative response
+            captcha_type = "unknown"
+            if deps.captcha_solver:
+                page = deps.browser._get_page(ctx)
+                det = await deps.captcha_solver.detect_captcha(page)
+                if det:
+                    captcha_type = det.captcha_type.value
+            return {
+                "status": "solved",
+                "captcha_type": captcha_type,
+                "message": "CAPTCHA solved and token injected. You can now submit the form.",
+            }
+        return {
+            "status": "failed",
+            "message": (
+                "No CAPTCHA detected or solving failed. "
+                "Check if the page has a visible CAPTCHA. "
+                "For reCAPTCHA/hCaptcha/Turnstile, a --captcha-api-key is required."
+            ),
+        }
+
     if tool_name == "finish_test":
         # In indefinite mode, reject finish and tell brain to keep going
         max_turns = deps.max_turns if hasattr(deps, "max_turns") else 150
@@ -1454,24 +1482,31 @@ def _validate_findings(findings: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _try_solve_captcha(deps: ToolDeps, ctx_name: str) -> bool:
-    """Try to detect and solve a CAPTCHA on the current page."""
-    try:
-        # Check for common CAPTCHA image selectors
-        captcha_selectors = [
-            "img[src*='captcha']",
-            "img.captcha",
-            "#captcha-image",
-            "img[alt*='captcha' i]",
-            ".captcha img",
-        ]
+    """Try to detect and solve a CAPTCHA on the current page.
 
+    Supports reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile (via 2captcha API),
+    and simple image CAPTCHAs (via Claude Vision).
+    """
+    try:
+        page = deps.browser._get_page(ctx_name)
+
+        # Use universal solver if available
+        if deps.captcha_solver:
+            token = await deps.captcha_solver.solve(page)
+            if token:
+                return True
+
+        # Fallback: legacy image CAPTCHA solving via Claude Vision
+        captcha_selectors = [
+            "img[src*='captcha']", "img.captcha", "#captcha-image",
+            "img[alt*='captcha' i]", ".captcha img",
+        ]
         for selector in captcha_selectors:
             exists = await deps.browser.check_element_exists(ctx_name, selector)
             if exists:
                 try:
                     b64_img = await deps.browser.screenshot_element(ctx_name, selector)
                     if b64_img and deps.client:
-                        # Use Claude Vision to solve CAPTCHA
                         result = await deps.client.call_vision(
                             image_base64=b64_img,
                             prompt=(
@@ -1483,7 +1518,6 @@ async def _try_solve_captcha(deps: ToolDeps, ctx_name: str) -> bool:
                         )
                         captcha_text = result.strip().replace(" ", "")
                         if captcha_text:
-                            # Try to fill CAPTCHA input
                             captcha_inputs = [
                                 "input[name*='captcha' i]",
                                 "input#captcha",
@@ -1497,7 +1531,6 @@ async def _try_solve_captcha(deps: ToolDeps, ctx_name: str) -> bool:
                                     continue
                 except Exception as e:
                     logger.debug("captcha_solve_failed", selector=selector, error=str(e))
-
     except Exception:
         pass
     return False

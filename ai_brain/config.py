@@ -98,6 +98,8 @@ class ActiveTestingConfig(BaseSettings):
     screenshot_on_action: bool = False
     email_plus_addressing: bool = False  # Disabled: always use imap_user directly
     redis_url: str = "redis://localhost:6382"
+    captcha_api_key: str = ""  # 2captcha.com API key for reCAPTCHA/hCaptcha/Turnstile
+    captcha_api_url: str = "https://2captcha.com"  # or rucaptcha.com, capsolver.com
 
 
 class AIBrainConfig(BaseSettings):

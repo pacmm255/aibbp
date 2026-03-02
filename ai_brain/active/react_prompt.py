@@ -1774,9 +1774,10 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
         "name": "register_account",
         "description": (
             "Register a new test account on the target application. Navigates to the "
-            "registration page, fills the form, handles CAPTCHA (via Claude Vision), "
-            "and waits for email verification. Creates a new browser context for the "
-            "account. Use this to test authenticated surfaces."
+            "registration page, fills the form, handles CAPTCHA (reCAPTCHA/hCaptcha/Turnstile "
+            "via 2captcha API, or image CAPTCHA via Claude Vision), and waits for email "
+            "verification. Creates a new browser context for the account. Use this to test "
+            "authenticated surfaces."
         ),
         "input_schema": {
             "type": "object",
@@ -1806,7 +1807,8 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
         "name": "login_account",
         "description": (
             "Log in to the target application with existing credentials. Navigates to "
-            "the login page, fills credentials, handles CAPTCHA, submits, and verifies "
+            "the login page, fills credentials, handles CAPTCHA (reCAPTCHA/hCaptcha/Turnstile "
+            "via 2captcha API, or image CAPTCHA via Claude Vision), submits, and verifies "
             "successful authentication. Sets up the browser context with the session."
         ),
         "input_schema": {
@@ -2102,6 +2104,28 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["action", "chain_id"],
+        },
+    },
+    {
+        "name": "solve_captcha",
+        "description": (
+            "Detect and solve a CAPTCHA on the current page. Supports reCAPTCHA v2/v3 "
+            "(via 2captcha API), hCaptcha, Cloudflare Turnstile, and image CAPTCHAs "
+            "(via Claude Vision). Automatically detects the CAPTCHA type, solves it, "
+            "and injects the token into the page. Use this when you encounter a CAPTCHA "
+            "that blocks your testing. The register_account and login_account tools "
+            "already call this automatically, but use this tool for manual CAPTCHA "
+            "solving on other pages."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "context_name": {
+                    "type": "string",
+                    "description": "Browser context name where the CAPTCHA is displayed",
+                    "default": "default",
+                },
+            },
         },
     },
     {
@@ -2431,8 +2455,8 @@ _PHASE_TOOLS: dict[str, set[str]] = {
     },
     "auth": {
         "register_account", "login_account", "navigate_and_extract",
-        "browser_interact", "send_http_request", "update_knowledge",
-        "update_working_memory", "read_working_memory",
+        "browser_interact", "send_http_request", "solve_captcha",
+        "update_knowledge", "update_working_memory", "read_working_memory",
         "manage_chain", "finish_test",
     },
     "exploitation": {
@@ -2443,7 +2467,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "waf_fingerprint", "waf_generate_bypasses",
         "test_http_smuggling", "test_cache_poisoning", "test_ghost_params",
         "test_prototype_pollution", "test_open_redirect",
-        "profile_endpoint_behavior", "discover_chains",
+        "profile_endpoint_behavior", "discover_chains", "solve_captcha",
         "update_knowledge", "update_working_memory", "read_working_memory",
         "get_playbook", "get_proxy_traffic", "manage_chain", "finish_test",
     },
