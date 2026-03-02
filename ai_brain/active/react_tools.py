@@ -1041,11 +1041,10 @@ async def _dispatch(
         await _ensure_context(deps, ctx)
         solved = await _try_solve_captcha(deps, ctx)
         if solved:
-            # Detect what type was solved for informative response
+            # Get detection type from solver's cached result (no re-detection)
             captcha_type = "unknown"
-            if deps.captcha_solver:
-                page = deps.browser._get_page(ctx)
-                det = await deps.captcha_solver.detect_captcha(page)
+            if deps.captcha_solver and hasattr(deps.captcha_solver, "_last_detection"):
+                det = deps.captcha_solver._last_detection
                 if det:
                     captcha_type = det.captcha_type.value
             return {
