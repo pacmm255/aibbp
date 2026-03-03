@@ -170,6 +170,15 @@ def parse_args() -> argparse.Namespace:
         "--proxy-port", type=int, default=0,
         help="Override mitmproxy port (default: 8085). Use different ports for parallel agents.",
     )
+    # Z.ai (free GLM-5) mode
+    parser.add_argument(
+        "--zai", action="store_true", default=False,
+        help="Use Z.ai GLM-5 (free) instead of Claude for the brain. Enables thinking.",
+    )
+    parser.add_argument(
+        "--zai-model", type=str, default="glm-5",
+        help="Z.ai model to use (default: glm-5). Options: glm-5, glm-4.7, glm-4.6v",
+    )
     return parser.parse_args()
 
 
@@ -214,17 +223,40 @@ async def main() -> None:
     budget_cfg = BudgetConfig(total_dollars=args.budget, per_target_max_dollars=args.budget)
     budget = BudgetManager(budget_cfg, active_testing=True)
 
-    # Claude client
-    rate_limiter = DualRateLimiter(
-        target_rps=3.0,
-        api_rpm=config.rate_limits.requests_per_minute,
-        api_itpm=config.rate_limits.input_tokens_per_minute,
-    )
-    circuit_breaker = CircuitBreaker()
-    client = ClaudeClient(
-        config=config, budget=budget,
-        rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
-    )
+    # Brain client — Z.ai (free GLM-5) or Claude
+    if args.zai:
+        from ai_brain.active.zai_client import ZaiClient
+        client = ZaiClient(
+            budget=budget,
+            config=config,
+            model=args.zai_model,
+            enable_thinking=True,
+        )
+        logger.info("using_zai_brain", model=args.zai_model)
+        print(f"[*] Brain: Z.ai {args.zai_model} (free, with thinking)")
+        # Still need a Claude client for compression (Haiku)
+        rate_limiter = DualRateLimiter(
+            target_rps=3.0,
+            api_rpm=config.rate_limits.requests_per_minute,
+            api_itpm=config.rate_limits.input_tokens_per_minute,
+        )
+        circuit_breaker = CircuitBreaker()
+        claude_client = ClaudeClient(
+            config=config, budget=budget,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+    else:
+        rate_limiter = DualRateLimiter(
+            target_rps=3.0,
+            api_rpm=config.rate_limits.requests_per_minute,
+            api_itpm=config.rate_limits.input_tokens_per_minute,
+        )
+        circuit_breaker = CircuitBreaker()
+        client = ClaudeClient(
+            config=config, budget=budget,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+        claude_client = client
 
     # Scope
     scope = ScopeEnforcer(
@@ -344,6 +376,7 @@ async def main() -> None:
             "recursion_limit": 10000,  # ~3333 turns (3 graph steps per turn)
             "configurable": {
                 "client": client,
+                "claude_client": claude_client,  # Always Claude — for compression/vision
                 "scope_guard": scope_guard,
                 "browser": browser,
                 "proxy": proxy,

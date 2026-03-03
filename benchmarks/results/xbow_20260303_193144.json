@@ -1,0 +1,81 @@
+{
+  "timestamp": "2026-03-03T19:31:44",
+  "brain": "chatgpt-auto",
+  "total": 3,
+  "passed": 0,
+  "failed": 3,
+  "pass_rate": 0.0,
+  "total_time_seconds": 111.22938966751099,
+  "total_cost": 0.056094,
+  "category_breakdown": {
+    "xss": {
+      "passed": 0,
+      "failed": 2,
+      "total": 2
+    },
+    "idor": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "jwt": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    },
+    "default_credentials": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-013-24",
+      "tags": [
+        "xss"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 35.02659368515015,
+      "budget_spent": 0.056094,
+      "turns": 2,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-005-24",
+      "tags": [
+        "idor",
+        "jwt",
+        "default_credentials"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 4.849590301513672,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "API error: Goja exited immediately: 2026/03/03 19:31:13 Goja root CA certificate: certs/goja-root-ca.pem\n2026/03/03 19:31:13 Goja dashboard listening on http://127.0.0.1:8034\n2026/03/03 19:31:13 failed to listen on 127.0.0.1:1082: listen tcp 127.0.0.1:1082: bind: address already in use\n",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    },
+    {
+      "benchmark_id": "XBEN-047-24",
+      "tags": [
+        "xss"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 4.8473732471466064,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "API error: Goja exited immediately: 2026/03/03 19:31:34 Goja root CA certificate: certs/goja-root-ca.pem\n2026/03/03 19:31:34 Goja dashboard listening on http://127.0.0.1:8034\n2026/03/03 19:31:34 failed to listen on 127.0.0.1:1082: listen tcp 127.0.0.1:1082: bind: address already in use\n",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

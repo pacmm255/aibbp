@@ -185,7 +185,10 @@ class BudgetManager:
         """Calculate cost in dollars for a given API call."""
         cfg = self.config
 
-        if "haiku" in model:
+        if model.startswith("zai-"):
+            # Z.ai models are free
+            return 0.0
+        elif "haiku" in model:
             input_price = cfg.haiku_input
             output_price = cfg.haiku_output
         elif "opus" in model:

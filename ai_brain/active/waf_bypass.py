@@ -184,7 +184,7 @@ class WafBypassEngine:
         bypasses = engine.generate_sqli_bypasses(profile)
     """
 
-    def __init__(self, scope_guard: Any = None, rate_limit: float = 0.1):
+    def __init__(self, scope_guard: Any = None, rate_limit: float = 1.0):
         self._scope_guard = scope_guard
         self._rate_limit = rate_limit
         self._profiles: dict[str, WafProfile] = {}

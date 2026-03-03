@@ -508,7 +508,8 @@ class ClaudeClient:
         }
 
         if "opus" in model:
-            params["thinking"] = {"type": "adaptive"}
+            params["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+            params["max_tokens"] = max(max_tok, 16384)  # must exceed budget_tokens
 
         # 4. Make the API call with aggressive retry for transient errors
         max_retries = 10
@@ -822,9 +823,8 @@ class ClaudeClient:
         # Temperature (not compatible with thinking on some models)
         is_opus = "opus" in model
         if is_opus:
-            # Opus 4.6 uses adaptive thinking; temperature goes in top-level
-            params["thinking"] = {"type": "adaptive"}
-            # Don't set temperature when thinking is enabled for Opus
+            params["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+            params["max_tokens"] = max(max_tokens, 16384)  # must exceed budget_tokens
         else:
             params["temperature"] = temperature
 

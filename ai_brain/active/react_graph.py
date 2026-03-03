@@ -24,8 +24,8 @@ from langgraph.graph import END, StateGraph
 from ai_brain.active.chain_discovery import ChainDiscoveryEngine, AdversarialReasoningEngine
 from ai_brain.active.react_knowledge_graph import KnowledgeGraph
 from ai_brain.active.react_prompt import (
-    build_static_prompt, build_dynamic_prompt, build_system_prompt,
-    get_tool_schemas, _detect_phase, CHAIN_TEMPLATES,
+    build_static_prompt, build_free_brain_prompt, build_dynamic_prompt,
+    build_system_prompt, get_tool_schemas, _detect_phase, CHAIN_TEMPLATES,
 )
 from ai_brain.active.react_state import PentestState
 from ai_brain.active.react_tools import ToolDeps, dispatch_tool
@@ -104,6 +104,25 @@ def _print_reasoning(text: str) -> None:
                 print(f"  {_CYAN}{line}{_RESET}")
         else:
             print(f"  {_CYAN}{line}{_RESET}")
+
+
+def _print_thinking(text: str) -> None:
+    """Print the brain's extended thinking (Opus/Z.ai)."""
+    if not text.strip():
+        return
+    display = text[:2000]
+    if len(text) > 2000:
+        display += f"\n... [{len(text) - 2000} more chars]"
+    print(f"\n{_BLUE}{_BOLD}\U0001f4ad DEEP THINKING:{_RESET}")
+    for line in display.split("\n"):
+        if len(line) > 120:
+            while len(line) > 120:
+                print(f"  {_BLUE}{line[:120]}{_RESET}")
+                line = line[120:]
+            if line:
+                print(f"  {_BLUE}{line}{_RESET}")
+        else:
+            print(f"  {_BLUE}{line}{_RESET}")
 
 
 def _print_tool_call(name: str, tool_input: dict) -> None:
@@ -191,6 +210,20 @@ def _print_tool_result(name: str, result_str: str, is_error: bool = False) -> No
     print(f"  {color}✓ {name}:{_RESET}")
     for line in lines:
         print(f"  {_DIM}  {line}{_RESET}")
+
+
+def _extract_intended_tool(text: str, tools: list[dict]) -> str | None:
+    """Scan text for mentions of tool names and return the best match.
+
+    Used by the free-brain retry logic to craft specific nudge messages.
+    """
+    text_lower = text.lower()
+    tool_names = [t["name"] for t in tools]
+    # Check for exact tool name mentions (most specific first)
+    for name in sorted(tool_names, key=len, reverse=True):
+        if name in text_lower or name.replace("_", " ") in text_lower:
+            return name
+    return None
 
 
 def _print_finding(finding_id: str, finding: dict) -> None:
@@ -370,12 +403,22 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     state_with_kg["_knowledge_graph"] = kg
     state_with_kg["_default_headers"] = config["configurable"].get("default_headers", {})
 
+    # Detect Z.ai or ChatGPT mode (non-Claude clients use text-based tool calling)
+    is_zai = hasattr(client, "MODEL")  # ZaiClient has MODEL attr
+    is_chatgpt = type(client).__name__ == "ChatGPTClient"
+    is_free_brain = is_zai or is_chatgpt
+
     # Build system prompt as split blocks: static (cached) + dynamic (not cached)
-    static_text = build_static_prompt()
+    # Free brains get few-shot examples appended to static prompt
+    static_text = build_free_brain_prompt() if is_free_brain else build_static_prompt()
     dynamic_text = build_dynamic_prompt(state_with_kg)
 
     # Select model tier: Opus for strategy/validation, Sonnet for routine testing
-    task_tier, tier_reason = _select_brain_tier(state)
+    if is_free_brain:
+        task_tier = "complex"
+        tier_reason = "chatgpt" if is_chatgpt else "zai"
+    else:
+        task_tier, tier_reason = _select_brain_tier(state)
     logger.info("brain_tier_selected", tier=task_tier, reason=tier_reason, turn=turn_count)
 
     # Build system blocks with mode prefix + cached static + dynamic state
@@ -390,11 +433,14 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     ]
 
     if _LIVE:
-        tier_label = (
-            f"{_MAGENTA}OPUS (manager: {tier_reason}){_RESET}"
-            if task_tier == "critical"
-            else f"{_BLUE}SONNET (worker){_RESET}"
-        )
+        if is_chatgpt:
+            tier_label = f"{_GREEN}ChatGPT (free){_RESET}"
+        elif is_zai:
+            tier_label = f"{_GREEN}GLM-5 (Z.ai free){_RESET}"
+        elif task_tier == "critical":
+            tier_label = f"{_MAGENTA}OPUS (manager: {tier_reason}){_RESET}"
+        else:
+            tier_label = f"{_BLUE}SONNET (worker){_RESET}"
         print(f"  {_DIM}Brain: {tier_label}")
 
     # Get tool schemas
@@ -422,6 +468,77 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
                 ),
             }
         ]
+
+    # ── Auto-strategy injection for free brains (every 5 turns) ──
+    if is_free_brain and turn_count > 0 and turn_count % 5 == 0:
+        tested = state.get("tested_techniques", {})
+        endpoints = state.get("endpoints", {})
+        findings = state.get("findings", {})
+        no_prog = state.get("no_progress_count", 0)
+
+        # Identify untested attack categories
+        tested_categories = set()
+        for key in tested:
+            parts = key.split("::")
+            if len(parts) > 1:
+                tested_categories.add(parts[1])
+        all_categories = {
+            "crawl_target", "systematic_fuzz", "test_sqli", "test_xss",
+            "test_auth_bypass", "response_diff_analyze", "test_jwt",
+            "test_file_upload", "test_idor", "blind_sqli_extract",
+            "run_content_discovery", "test_cmdi", "test_ssrf",
+        }
+        untested = sorted(all_categories - tested_categories)
+
+        # Get chain suggestions
+        chain_suggestions = []
+        try:
+            for chain_id, chain_info in state.get("attack_chains", {}).items():
+                if chain_info.get("current_step", 0) < len(chain_info.get("steps", [])):
+                    chain_suggestions.append(
+                        f"Continue chain '{chain_id}': {chain_info.get('goal', '?')}"
+                    )
+        except Exception:
+            pass
+
+        checkpoint_parts = [
+            f"\n\nSTRATEGY CHECKPOINT (Turn {turn_count}):",
+            f"- Tested: {len(tested)} techniques on {len(endpoints)} endpoints",
+            f"- Findings: {len(findings)}",
+            f"- No-progress streak: {no_prog} turns",
+        ]
+        if untested:
+            checkpoint_parts.append(f"- UNTESTED techniques: {', '.join(untested[:6])}")
+        if chain_suggestions:
+            checkpoint_parts.append("\nSUGGESTED NEXT ACTIONS:")
+            for i, sug in enumerate(chain_suggestions[:3], 1):
+                checkpoint_parts.append(f"  {i}. {sug}")
+        if no_prog >= 3:
+            checkpoint_parts.append(
+                "\n⚠ You are STALLED. Try a completely different technique or endpoint."
+            )
+        checkpoint_parts.append(
+            "\nPick ONE action and execute it NOW. Output the JSON tool call."
+        )
+        checkpoint = "\n".join(checkpoint_parts)
+
+        # Inject into last user message or append
+        messages = list(messages)
+        if messages and messages[-1].get("role") == "user":
+            last = dict(messages[-1])
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = content + checkpoint
+            elif isinstance(content, list):
+                last["content"] = content + [{"type": "text", "text": checkpoint}]
+            messages[-1] = last
+        else:
+            messages.append({"role": "user", "content": checkpoint})
+
+        logger.info("free_brain_strategy_injected", turn=turn_count,
+                     untested=len(untested), findings=len(findings))
+        if _LIVE:
+            print(f"  {_MAGENTA}📋 Strategy checkpoint injected (turn {turn_count}){_RESET}")
 
     try:
         response = await client.call_with_tools(
@@ -455,7 +572,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             except Exception:
                 pass
         # For transient errors: DON'T die — wait and let the graph loop retry
-        transient_keywords = ["rate_limit", "429", "500", "502", "503", "504",
+        transient_keywords = ["rate_limit", "405", "429", "500", "502", "503", "504",
                               "timeout", "connection", "OAuth", "expired", "401"]
         is_transient = any(kw.lower() in error_str.lower() for kw in transient_keywords)
         if is_transient:
@@ -480,12 +597,14 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     serialized_content = _serialize_content(content_blocks)
     new_messages = [{"role": "assistant", "content": serialized_content}]
 
-    # Extract tool calls
+    # Extract tool calls and thinking blocks
     tool_calls = [b for b in content_blocks if getattr(b, "type", "") == "tool_use"]
+    thinking_blocks = [b for b in content_blocks if getattr(b, "type", "") == "thinking"]
 
     # ── Sonnet refusal fallback: if Sonnet refuses, retry with Opus ──
+    # (Skip in Z.ai/ChatGPT mode — no Opus fallback available)
     text_blocks = [b for b in content_blocks if getattr(b, "type", "") == "text"]
-    if task_tier == "complex" and not tool_calls and response.stop_reason == "end_turn":
+    if not is_free_brain and task_tier == "complex" and not tool_calls and response.stop_reason == "end_turn":
         all_text = " ".join(b.text for b in text_blocks).lower()
         _refusal_phrases = [
             "i can't", "i cannot", "i'm unable", "i am unable",
@@ -517,6 +636,99 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             except Exception as e:
                 logger.error("opus_fallback_failed", error=str(e))
 
+    # ── Free brain no-tool retry: up to 3 attempts with specific feedback ──
+    if is_free_brain and not tool_calls and response.stop_reason == "end_turn":
+        brain_name = "ChatGPT" if is_chatgpt else "GLM-5"
+        all_text = " ".join(getattr(b, "text", "") for b in text_blocks)
+        target_url = state.get("target_url", "http://localhost")
+
+        for retry_num in range(3):
+            logger.warning("free_brain_no_tool_call_retrying",
+                           brain=brain_name, turn=turn_count, retry=retry_num + 1)
+            if _LIVE:
+                print(f"  {_YELLOW}⚠ {brain_name} no tool call — retry {retry_num + 1}/3{_RESET}")
+
+            # Analyze failure mode and craft specific nudge
+            if "```" in all_text and '"name"' in all_text:
+                nudge = (
+                    "Your tool call was inside a code block (```). "
+                    "Remove the ``` markers. Output ONLY the raw JSON on its own line:\n"
+                    '{"name": "TOOL_NAME", "input": {PARAMS}}'
+                )
+            elif "<executed" in all_text or "[Called tool" in all_text:
+                nudge = (
+                    "You used the wrong format. Do NOT use <executed> or [Called tool] tags. "
+                    "Output a plain JSON object on its own line:\n"
+                    '{"name": "TOOL_NAME", "input": {PARAMS}}'
+                )
+            elif any(p in all_text.lower() for p in [
+                "i would", "i will", "let me", "i'll", "we should",
+                "next step", "i need to", "my plan",
+            ]):
+                # Model described intent but didn't output JSON
+                intended = _extract_intended_tool(all_text, tools)
+                if intended:
+                    nudge = (
+                        f"You described wanting to use {intended} but didn't "
+                        f"output the JSON. Output it now on its own line:\n"
+                        f'{{"name": "{intended}", "input": {{...}}}}'
+                    )
+                else:
+                    nudge = (
+                        "You described what you want to do but didn't output the tool call JSON. "
+                        "You MUST output a JSON object. Pick the most appropriate tool and output:\n"
+                        '{"name": "crawl_target", "input": {"start_url": "' + target_url + '"}}'
+                    )
+            else:
+                nudge = (
+                    "No tool call detected. You MUST output a JSON tool call. "
+                    "Choose from the available tools and output on its own line:\n"
+                    '{"name": "TOOL_NAME", "input": {PARAMS}}\n'
+                    "If unsure, start with:\n"
+                    '{"name": "crawl_target", "input": {"start_url": "' + target_url + '"}}'
+                )
+
+            try:
+                nudge_messages = list(messages) + [
+                    {"role": "assistant", "content": serialized_content},
+                    {"role": "user", "content": nudge},
+                ]
+                response = await client.call_with_tools(
+                    phase="active_testing",
+                    task_tier="complex",
+                    system_blocks=system_blocks,
+                    messages=nudge_messages,
+                    tools=tools,
+                    target=target_url,
+                )
+                content_blocks = response.content
+                serialized_content = _serialize_content(content_blocks)
+                new_messages = [{"role": "assistant", "content": serialized_content}]
+                tool_calls = [b for b in content_blocks if getattr(b, "type", "") == "tool_use"]
+                text_blocks = [b for b in content_blocks if getattr(b, "type", "") == "text"]
+                thinking_blocks = [b for b in content_blocks if getattr(b, "type", "") == "thinking"]
+
+                if tool_calls:
+                    logger.info("free_brain_retry_succeeded",
+                                brain=brain_name, retry=retry_num + 1,
+                                tools=[tc.name for tc in tool_calls])
+                    break  # Success
+                else:
+                    # Update text for next retry's analysis
+                    all_text = " ".join(getattr(b, "text", "") for b in text_blocks)
+                    logger.warning("free_brain_retry_still_no_tools",
+                                   brain=brain_name, retry=retry_num + 1, turn=turn_count)
+            except Exception as e:
+                logger.error("free_brain_retry_failed",
+                             brain=brain_name, retry=retry_num + 1, error=str(e))
+                break  # Don't retry on exceptions
+
+    # Log brain thinking (extended thinking from Opus/Z.ai)
+    if thinking_blocks:
+        tb = thinking_blocks[0]
+        thinking_content = getattr(tb, "thinking", "") or str(tb)
+        logger.info("brain_thinking", preview=thinking_content[:500], full_len=len(thinking_content))
+
     # Log brain reasoning
     if text_blocks:
         reasoning = text_blocks[0].text[:500]
@@ -545,6 +757,10 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     # ── Live display ──
     if _LIVE:
         print(_status_bar(state, budget))
+        if thinking_blocks:
+            tb = thinking_blocks[0]
+            thinking_content = getattr(tb, "thinking", "") or str(tb)
+            _print_thinking(thinking_content)
         if text_blocks:
             full_reasoning = "\n".join(b.text for b in text_blocks)
             _print_reasoning(full_reasoning)
@@ -625,6 +841,100 @@ def _build_technique_key(tool_name: str, tool_input: dict) -> str:
     return f"{url}::{tool_name}"
 
 
+def _summarize_tool_result_for_free_brain(tool_name: str, result_str: str) -> str:
+    """Extract key signals from tool results for free brain models.
+
+    Prepends a structured summary header so GLM-5 focuses on what matters.
+    Only called for Z.ai/ChatGPT — Claude doesn't need this.
+    """
+    try:
+        result = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        return result_str
+
+    if not isinstance(result, dict):
+        return result_str
+
+    signals: list[str] = []
+
+    # HTTP status
+    status = result.get("status_code")
+    if status:
+        signals.append(f"HTTP {status}")
+
+    body = str(result.get("body", result.get("stdout", "")))
+
+    # Flag detection
+    flag_match = re.search(r"FLAG\{[^}]+\}", body, re.IGNORECASE)
+    if flag_match:
+        signals.append(f"*** FLAG FOUND: {flag_match.group(0)} ***")
+
+    # SQL error detection
+    _sql_patterns = ["sql syntax", "mysql", "postgresql", "sqlite", "ORA-",
+                     "unclosed quotation", "unterminated string"]
+    body_lower = body.lower()
+    for pat in _sql_patterns:
+        if pat.lower() in body_lower:
+            signals.append("SQL ERROR DETECTED: likely SQL injection")
+            break
+
+    # XSS reflection
+    if "<script" in body.lower() or "alert(" in body.lower():
+        signals.append("XSS REFLECTION DETECTED in response body")
+
+    # Interesting status codes
+    if status == 403:
+        signals.append("403 Forbidden — resource exists but protected")
+    elif status == 500:
+        signals.append("500 Internal Server Error — input reaches backend code")
+    elif status == 302:
+        location = result.get("headers", {}).get("location", "")
+        if location:
+            signals.append(f"Redirect to: {location}")
+
+    # Fuzz/scan hits
+    hits = result.get("hits", result.get("results", result.get("matches", [])))
+    if isinstance(hits, list) and hits:
+        signals.append(f"{len(hits)} interesting hits found")
+        for hit in hits[:5]:
+            if isinstance(hit, dict):
+                word = hit.get("payload", hit.get("word", hit.get("path", "?")))
+                hit_status = hit.get("status", hit.get("status_code", "?"))
+                signals.append(f"  - {word}: status={hit_status}")
+
+    # Crawl summary
+    if tool_name == "crawl_target":
+        pages = result.get("pages_visited", result.get("urls", []))
+        forms = result.get("forms", [])
+        if isinstance(pages, (list, int)):
+            count = pages if isinstance(pages, int) else len(pages)
+            signals.append(f"Discovered {count} pages")
+        if isinstance(forms, list) and forms:
+            signals.append(f"Found {len(forms)} forms")
+
+    # response_diff_analyze verdicts
+    if tool_name == "response_diff_analyze":
+        diffs = result.get("results", result.get("analysis", []))
+        if isinstance(diffs, list):
+            for d in diffs:
+                if isinstance(d, dict):
+                    label = d.get("label", "?")
+                    verdict = d.get("classification", d.get("verdict",
+                              d.get("interesting", "?")))
+                    signals.append(f"  {label}: {verdict}")
+
+    # Error in result
+    error = result.get("error")
+    if error:
+        signals.append(f"ERROR: {str(error)[:200]}")
+
+    if not signals:
+        return result_str
+
+    header = "KEY SIGNALS:\n" + "\n".join(f"  - {s}" for s in signals)
+    return header + "\n\nFULL RESULT:\n" + result_str
+
+
 async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dict:
     """Execute pending tool calls and return results to the brain.
 
@@ -637,6 +947,10 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
 
     deps = _get_tool_deps(config)
     deps.current_state = dict(state)  # For tools that need state read access
+
+    # Detect free brain for result pre-summarization
+    _client = config["configurable"]["client"]
+    _is_free = hasattr(_client, "MODEL") or type(_client).__name__ == "ChatGPTClient"
 
     tool_results = []
     state_updates: dict[str, Any] = {}
@@ -719,10 +1033,15 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                     "content": json.dumps(result_data, default=str),
                 })
             else:
+                # Pre-summarize for free brains (prepend key signals header)
+                content_for_msg = (
+                    _summarize_tool_result_for_free_brain(tool_name, result_str)
+                    if _is_free else result_str
+                )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "content": result_str,
+                    "content": content_for_msg,
                 })
 
             logger.info("tool_completed", tool=tool_name, result_size=len(result_str))
@@ -874,16 +1193,24 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                     pass
             result["no_progress_count"] = 0
             result["consecutive_failures"] = 0
+            tested_count = len(state.get("tested_techniques", {}))
             reset_msg = {
                 "role": "user",
                 "content": (
-                    "STRATEGY RESET: You've had no progress for "
-                    f"{no_progress} turns. STOP what you're doing and try a "
-                    "completely different approach. Review your failed_approaches "
-                    "and tested_techniques. Consider: (1) different vulnerability "
-                    "classes, (2) different endpoints, (3) different authentication "
-                    "contexts, (4) manual code review via HTTP responses, "
-                    "(5) business logic flaws instead of injection attacks."
+                    f"STRATEGY RESET: {no_progress} turns with no progress. "
+                    f"You have {tested_count} techniques already tested — DO NOT REPEAT THEM. "
+                    "Pick something COMPLETELY NEW from this list:\n"
+                    "1. Create accounts and test authenticated surfaces\n"
+                    "2. Download and grep JS bundles for secrets/API keys/internal URLs\n"
+                    "3. Test business logic: race conditions, negative values, step-skipping\n"
+                    "4. Find new subdomains or API versions (/v1/, /v2/, /internal/, /mobile/)\n"
+                    "5. Test WebSocket endpoints\n"
+                    "6. Chain existing findings into bigger exploits\n"
+                    "7. OAuth/SSO redirect manipulation\n"
+                    "8. Second-order attacks: store payload via one endpoint, trigger via another\n"
+                    "9. Cache poisoning via Host/X-Forwarded-Host headers\n"
+                    "10. Email-based: password reset Host header poisoning\n"
+                    "DO NOT go back to what you were doing. Pick a number above and execute it."
                 ),
             }
             result["messages"] = [reset_msg] + result.get("messages", [])
@@ -899,7 +1226,12 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                 "role": "user",
                 "content": (
                     f"TOOL FAILURE RESET: {consec_fail} consecutive tool failures. "
-                    "Switch to a different testing strategy or different tools."
+                    "The current approach is NOT WORKING. Switch to:\n"
+                    "- Browser-based testing (navigate_and_extract, browser_interact) instead of HTTP\n"
+                    "- Different target subdomains or API endpoints\n"
+                    "- JS bundle analysis (fetch .js files, search for secrets)\n"
+                    "- Account creation and authenticated testing\n"
+                    "DO NOT retry the same endpoint/tool that keeps failing."
                 ),
             }
             result["messages"] = [reset_msg] + result.get("messages", [])
@@ -914,8 +1246,10 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
             reset_msg = {
                 "role": "user",
                 "content": (
-                    "LOOP DETECTED: Same result repeated. You're stuck in a loop. "
-                    "Try a completely different approach or endpoint."
+                    "LOOP DETECTED: You keep getting the same result. You're stuck. "
+                    "You MUST pick a COMPLETELY DIFFERENT attack surface — different "
+                    "subdomain, different API, different vuln class. Read your "
+                    "tested_techniques list and do something NOT on it."
                 ),
             }
             result["messages"] = [reset_msg] + result.get("messages", [])
@@ -1195,7 +1529,8 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
         return {**wm_result, "messages": [{"_replace_all": True}] + compressed}
 
     # Tier 3: Haiku summarization of old messages
-    client = config["configurable"]["client"]
+    # Use claude_client (always Claude/Haiku) for compression, even in Z.ai mode
+    client = config["configurable"].get("claude_client") or config["configurable"]["client"]
     # Adaptive keep_recent: fewer messages when context is very large
     keep_recent = 10 if total_chars > 400_000 else 15
     old_messages = messages[:-keep_recent] if len(messages) > keep_recent else []

@@ -233,6 +233,10 @@ class TrafficInterceptor:
                 pass
             self._master = None
 
+        # Wait for the proxy thread to fully exit (releases the port)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+
         self._running = False
         logger.info("proxy_stopped", captured_entries=len(self._traffic))
 

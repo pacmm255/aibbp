@@ -44,6 +44,24 @@ logger = structlog.get_logger()
 # Larger outputs are written to temp files.
 _MAX_INLINE_SIZE = 15_000
 
+# ── Global HTTP rate limiter ───────────────────────────────────────────
+# Enforces minimum delay between ALL outbound HTTP requests (tools, exploits,
+# fuzzing) to avoid WAF/Cloudflare IP bans on production targets.
+_HTTP_RATE_LIMIT_SECONDS = 1.0  # 1 request per second baseline
+_last_http_request_time: float = 0.0
+_http_rate_lock = asyncio.Lock()
+
+
+async def _http_rate_limit() -> None:
+    """Wait if needed to enforce global HTTP rate limit."""
+    global _last_http_request_time
+    async with _http_rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_http_request_time
+        if elapsed < _HTTP_RATE_LIMIT_SECONDS:
+            await asyncio.sleep(_HTTP_RATE_LIMIT_SECONDS - elapsed)
+        _last_http_request_time = time.monotonic()
+
 
 @dataclass
 class ToolDeps:
@@ -354,6 +372,7 @@ async def _dispatch(
         # Test HTTP verb tampering (no_auth=True: don't inject default auth headers)
         for method in methods:
             try:
+                await _http_rate_limit()  # Global rate limit
                 import httpx
                 async with httpx.AsyncClient(**_httpx_kwargs(deps, no_auth=True, cf_inject_url=url)) as client:
                     resp = await client.request(method, url, headers=headers_extra)
@@ -399,6 +418,7 @@ async def _dispatch(
             for bh in bypass_headers:
                 for test_method in test_methods:
                     try:
+                        await _http_rate_limit()  # Global rate limit
                         merged = {**headers_extra, **bh}
                         if test_method == "POST":
                             resp = await client.post(url, headers=merged, data=body)
@@ -427,6 +447,7 @@ async def _dispatch(
             ]
             for mutation in path_mutations[:12]:  # Cap at 12 to avoid excess
                 try:
+                    await _http_rate_limit()  # Global rate limit
                     test_url = f"{base_url}{mutation}"
                     resp = await client.get(test_url, headers=headers_extra)
                     if resp.status_code != 403:  # Only report non-403 results
@@ -462,6 +483,7 @@ async def _dispatch(
                 new_query = urlencode(params, doseq=True)
                 test_url = urlunparse(parsed._replace(query=new_query))
             try:
+                await _http_rate_limit()  # Global rate limit
                 async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=test_url)) as client:
                     resp = await client.request(method, test_url)
                     results.append({
@@ -551,6 +573,7 @@ async def _dispatch(
             client_kwargs["proxy"] = proxy_url
 
         async def _do_request(req_headers: dict, req_cookies: dict | None = None) -> dict:
+            await _http_rate_limit()  # Global rate limit
             kw = dict(client_kwargs)
             if req_cookies is not None:
                 kw["cookies"] = req_cookies

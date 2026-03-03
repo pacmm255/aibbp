@@ -260,6 +260,10 @@ async def run_challenge(
     flag: str,
     budget: float = 0.50,
     max_turns: int = 40,
+    use_zai: bool = False,
+    zai_model: str = "glm-5",
+    use_chatgpt: bool = False,
+    chatgpt_model: str = "auto",
 ) -> ChallengeResult:
     """Run the AIBBP ReAct agent against one XBOW challenge."""
     meta = load_challenge_metadata(benchmark_id)
@@ -314,6 +318,10 @@ async def run_challenge(
             budget=budget,
             max_turns=max_turns,
             additional_urls=additional_urls,
+            use_zai=use_zai,
+            zai_model=zai_model,
+            use_chatgpt=use_chatgpt,
+            chatgpt_model=chatgpt_model,
         )
         elapsed = time.time() - start_time
 
@@ -348,6 +356,10 @@ async def _run_agent_ctf(
     budget: float,
     max_turns: int,
     additional_urls: list[str] | None = None,
+    use_zai: bool = False,
+    zai_model: str = "glm-5",
+    use_chatgpt: bool = False,
+    chatgpt_model: str = "auto",
 ) -> dict[str, Any]:
     """Run the ReAct agent in CTF mode (flag extraction)."""
     from ai_brain.active.browser import BrowserController
@@ -369,11 +381,12 @@ async def _run_agent_ctf(
 
     config = AIBrainConfig()
 
-    # Check credentials
-    if not config.anthropic_api_key and not config.anthropic_auth_token:
-        from ai_brain.models import _read_claude_credentials
-        if not _read_claude_credentials():
-            return {"error": "No credentials"}
+    # Check credentials (not needed for Z.ai or ChatGPT mode)
+    if not use_zai and not use_chatgpt:
+        if not config.anthropic_api_key and not config.anthropic_auth_token:
+            from ai_brain.models import _read_claude_credentials
+            if not _read_claude_credentials():
+                return {"error": "No credentials"}
 
     active_cfg = ActiveTestingConfig(enabled=True, dry_run=False, browser_headless=True)
     budget_cfg = BudgetConfig(total_dollars=budget, per_target_max_dollars=budget)
@@ -389,10 +402,35 @@ async def _run_agent_ctf(
         api_itpm=config.rate_limits.input_tokens_per_minute,
     )
     circuit_breaker = CircuitBreaker()
-    client = ClaudeClient(
-        config=config, budget=budget_mgr,
-        rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
-    )
+
+    if use_chatgpt:
+        from ai_brain.active.chatgpt_client import ChatGPTClient
+        client = ChatGPTClient(
+            budget=budget_mgr, config=config,
+            model=chatgpt_model, goja_port=1082,
+        )
+        # Claude client for compression (Haiku)
+        claude_client = ClaudeClient(
+            config=config, budget=budget_mgr,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+    elif use_zai:
+        from ai_brain.active.zai_client import ZaiClient
+        client = ZaiClient(
+            budget=budget_mgr, config=config,
+            model=zai_model, enable_thinking=True,
+        )
+        # Claude client for compression (Haiku)
+        claude_client = ClaudeClient(
+            config=config, budget=budget_mgr,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+    else:
+        client = ClaudeClient(
+            config=config, budget=budget_mgr,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+        claude_client = client
     scope = ScopeEnforcer(allowed_domains=["localhost", "127.0.0.1"])
     scope_guard = ActiveScopeGuard(scope)
     browser = BrowserController(scope_guard, active_cfg)
@@ -413,6 +451,7 @@ async def _run_agent_ctf(
             "recursion_limit": 500,
             "configurable": {
                 "client": client,
+                "claude_client": claude_client,
                 "scope_guard": scope_guard,
                 "browser": browser,
                 "proxy": proxy,
@@ -537,6 +576,12 @@ async def _run_agent_ctf(
                 await service.stop()
             except Exception:
                 pass
+        # Clean up ChatGPT client (stops Goja TLS proxy)
+        if use_chatgpt and client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
 
 
 def _extract_flag(agent_output: dict, expected_flag: str) -> str:
@@ -648,6 +693,14 @@ async def main():
     parser.add_argument("--budget", type=float, default=2.00, help="Budget per challenge ($)")
     parser.add_argument("--max-turns", type=int, default=50, help="Max turns per challenge")
     parser.add_argument("--output", type=str, help="Output JSON file path")
+    parser.add_argument("--zai", action="store_true", default=False,
+                        help="Use Z.ai GLM-5 (free) instead of Claude for the brain")
+    parser.add_argument("--zai-model", type=str, default="glm-5",
+                        help="Z.ai model (default: glm-5)")
+    parser.add_argument("--chatgpt", action="store_true", default=False,
+                        help="Use ChatGPT (free anonymous) instead of Claude for the brain")
+    parser.add_argument("--chatgpt-model", type=str, default="auto",
+                        help="ChatGPT model (default: auto, also: gpt-4o-mini)")
     args = parser.parse_args()
 
     # Determine which challenges to run
@@ -668,7 +721,13 @@ async def main():
         print("Use --all, --challenges N, --challenge XBEN-XXX-24, or --filter TAG")
         return
 
-    print(f"\nRunning {len(challenge_ids)} challenges (budget: ${args.budget}/ea, max_turns: {args.max_turns})")
+    if args.chatgpt:
+        brain_label = f"ChatGPT {args.chatgpt_model} (free)"
+    elif args.zai:
+        brain_label = f"Z.ai {args.zai_model} (free)"
+    else:
+        brain_label = "Claude (Opus/Sonnet)"
+    print(f"\nRunning {len(challenge_ids)} challenges (brain: {brain_label}, budget: ${args.budget}/ea, max_turns: {args.max_turns})")
 
     suite = BenchmarkSuite()
     start_time = time.time()
@@ -676,7 +735,9 @@ async def main():
     for i, cid in enumerate(challenge_ids, 1):
         print(f"\n[{i}/{len(challenge_ids)}]", end="")
         flag = generate_flag(cid)
-        result = await run_challenge(cid, flag, args.budget, args.max_turns)
+        result = await run_challenge(cid, flag, args.budget, args.max_turns,
+                                     use_zai=args.zai, zai_model=args.zai_model,
+                                     use_chatgpt=args.chatgpt, chatgpt_model=args.chatgpt_model)
         suite.results.append(result)
         suite.total_cost += result.budget_spent
 
@@ -692,6 +753,7 @@ async def main():
     )
     output_data = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "brain": f"chatgpt-{args.chatgpt_model}" if args.chatgpt else (f"zai-{args.zai_model}" if args.zai else "claude"),
         "total": suite.total,
         "passed": suite.passed,
         "failed": suite.failed,

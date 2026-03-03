@@ -927,7 +927,7 @@ class SystematicFuzzer:
         filter_contains: str | None = None,
         match_length_range: tuple[int, int] | list[int] | None = None,
         max_requests: int = 500,
-        rate_limit: float = 0.05,
+        rate_limit: float = 1.0,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run wordlist-based fuzzing.

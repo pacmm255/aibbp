@@ -87,7 +87,7 @@ class ActiveTestingConfig(BaseSettings):
     imap_user: str = "hunter255@inbox.lt"
     imap_password: str = "7J8PbJbSs6"
     max_accounts: int = 5
-    request_delay_ms: int = 200  # Delay between browser actions
+    request_delay_ms: int = 1000  # Delay between browser actions (1s to avoid WAF)
     max_requests_per_target: int = 5000
     kill_switch_check_interval: int = 10  # seconds
     dry_run: bool = False

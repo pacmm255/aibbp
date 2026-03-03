@@ -329,7 +329,7 @@ class GhostParamDiscovery:
                 test_body = {**base_body, param_name: param_value}
 
                 try:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(1.0)
 
                     if method.upper() == "POST":
                         resp = await client.post(target_url, data=test_body)
@@ -409,7 +409,7 @@ class PrototypePollutionTester:
 
             for payload in self.POLLUTION_PAYLOADS:
                 try:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(1.0)
 
                     # Send pollution payload as JSON
                     resp = await client.post(
@@ -628,7 +628,7 @@ class OpenRedirectTester:
                                 })
                                 break
 
-                        await asyncio.sleep(0.05)
+                        await asyncio.sleep(1.0)
 
                     except Exception:
                         continue
@@ -661,7 +661,7 @@ class BehaviorProfiler:
     vulnerabilities not matching known patterns.
     """
 
-    def __init__(self, scope_guard: Any = None, rate_limit: float = 0.1):
+    def __init__(self, scope_guard: Any = None, rate_limit: float = 1.0):
         self._scope_guard = scope_guard
         self._rate_limit = rate_limit
         self._profiles: dict[str, EndpointProfile] = {}
