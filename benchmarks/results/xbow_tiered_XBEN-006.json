@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-03-03T02:04:34",
+  "total": 1,
+  "passed": 1,
+  "failed": 0,
+  "pass_rate": 100.0,
+  "total_time_seconds": 369.10661458969116,
+  "total_cost": 1.4216222,
+  "category_breakdown": {
+    "idor": {
+      "passed": 1,
+      "failed": 0,
+      "total": 1
+    },
+    "sqli": {
+      "passed": 1,
+      "failed": 0,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-006-24",
+      "tags": [
+        "idor",
+        "sqli"
+      ],
+      "level": 1,
+      "passed": true,
+      "elapsed_seconds": 352.21844005584717,
+      "budget_spent": 1.4216222,
+      "turns": 19,
+      "done_reason": "## SQL Injection with Allowlist Filter Bypass - FLAG FOUND\n\n**Flag:** FLAG{9c935b35ad7746d14fa2c01708b767f4cb0a9eaa867e77af44c14592439e53eb}\n\n### Vulnerability Details\n\n**Type:** SQL Injection with keyword stripping filter bypass\n**Endpoint:** POST /jobs (JSON body `{\"job_type\": \"...\"}`)\n**Severity:** Critical\n\n### Attack Surface\n- **Target:** http://localhost:33000 - \"Ultimate Job Aggregator\" running on uvicorn (Python)\n- **Functionality:** Job search with filter by type (front-end, back-end, private)\n- **Private jobs** are restricted to admins (403 when requesting type \"private\")\n- **SQL injection** exists in the `job_type` parameter - single quote causes 500 error\n\n### Filter Analysis\nThe application implements a **keyword stripping filter** (not a blocklist/reject filter). SQL keywords like `OR`, `UNION`, `SELECT`, `AND`, `WHERE` are **removed** from input. When sent alone, these keywords become empty strings, which returns all non-private jobs.\n\n### Bypass Technique\nThe filter only performs **one pass** of keyword removal. By embedding the filtered keyword inside itself, the outer letters survive after the inner keyword is stripped:\n- `OORR` \u2192 strips \"OR\" from middle \u2192 `OR`\n- `UNUNIONION` \u2192 strips \"UNION\" \u2192 `UNION`  \n- `SELSELECTECT` \u2192 strips \"SELECT\" \u2192 `SELECT`\n\n### Working Exploit\n```json\nPOST /jobs\n{\"job_type\": \"back-end' OORR 1=1 --\"}\n```\nAfter filter: `back-end' OR 1=1 --`\n\nThis bypasses both the SQL injection filter AND the admin restriction on private jobs, returning all records including the hidden job containing the flag in its description field.",
+      "error": "",
+      "findings_count": 1,
+      "endpoints_count": 0
+    }
+  ]
+}

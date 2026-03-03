@@ -97,8 +97,11 @@ def _httpx_kwargs(deps: ToolDeps, **extra: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"verify": False, "timeout": extra.pop("timeout", 15)}
     if deps.goja_socks5_url:
         kwargs["proxy"] = deps.goja_socks5_url
-    # Merge default headers (bug bounty program headers)
-    if deps.default_headers:
+    elif getattr(deps.config, "upstream_proxy", ""):
+        kwargs["proxy"] = deps.config.upstream_proxy
+    # Merge default headers (bug bounty program headers) — skip if no_auth
+    no_auth = extra.pop("no_auth", False)
+    if deps.default_headers and not no_auth:
         headers = dict(deps.default_headers)
         headers.update(extra.pop("headers", {}))
         kwargs["headers"] = headers
@@ -348,11 +351,11 @@ async def _dispatch(
         headers_extra = inp.get("headers", {})
         results = []
 
-        # Test HTTP verb tampering
+        # Test HTTP verb tampering (no_auth=True: don't inject default auth headers)
         for method in methods:
             try:
                 import httpx
-                async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=url)) as client:
+                async with httpx.AsyncClient(**_httpx_kwargs(deps, no_auth=True, cf_inject_url=url)) as client:
                     resp = await client.request(method, url, headers=headers_extra)
                     results.append({
                         "method": method,
@@ -392,7 +395,7 @@ async def _dispatch(
             test_methods.append("POST")
 
         import httpx
-        async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=url)) as client:
+        async with httpx.AsyncClient(**_httpx_kwargs(deps, no_auth=True, cf_inject_url=url)) as client:
             for bh in bypass_headers:
                 for test_method in test_methods:
                     try:
@@ -528,8 +531,16 @@ async def _dispatch(
         else:
             merged_cookies = cookies
 
+        # Merge default headers (e.g. Authorization from --header CLI arg)
+        # Skip if no_auth=true (for genuine unauthenticated testing)
+        no_auth = inp.get("no_auth", False)
+        if deps.default_headers and not no_auth:
+            merged_headers = dict(deps.default_headers)
+            merged_headers.update(headers)
+            headers = merged_headers
+
         # Route through Goja SOCKS5 proxy for Chrome TLS fingerprinting
-        proxy_url = deps.goja_socks5_url
+        proxy_url = deps.goja_socks5_url or getattr(deps.config, "upstream_proxy", "") or None
         client_kwargs: dict[str, Any] = {
             "verify": False,
             "timeout": 30,

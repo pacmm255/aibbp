@@ -1,9 +1,12 @@
 """System prompt and tool schemas for the single-brain ReAct pentesting agent.
 
 Defines:
-- SYSTEM_PROMPT_TEMPLATE: The pentester brain persona + state injection
+- STATIC_SYSTEM_PROMPT: Cached methodology prompt (~8K tokens, never changes)
+- DYNAMIC_STATE_TEMPLATE: Per-turn state template (endpoints, findings, etc.)
+- build_static_prompt(): Returns cached methodology
+- build_dynamic_prompt(state): Returns formatted dynamic state
+- build_system_prompt(state): Returns combined prompt (backward compat)
 - get_tool_schemas(): Returns 41 meta-tool definitions in Anthropic tool-use format (phase-filtered)
-- build_system_prompt(): Renders the template with current state
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from urllib.parse import urlparse
 
 # ── System Prompt ────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT_TEMPLATE = """\
+STATIC_SYSTEM_PROMPT = """\
 You are an elite penetration tester with 15+ years of experience in web application \
 security. You think like a $100K bug bounty hunter — methodical, creative, persistent. \
 You have a single brain that observes, hypothesizes, tests, evaluates, and chains \
@@ -23,14 +26,20 @@ findings dynamically. You are NOT a scanner — you are a strategic reasoner.
 
 ## Your Methodology
 
-1. **RECON** — Map the full attack surface before testing anything. Understand the \
-technology stack, endpoints, authentication mechanisms, and data flows.
-2. **HYPOTHESIZE** — Form specific, testable hypotheses about what's vulnerable and why. \
+1. **RECON** — Map the full attack surface. Understand tech stack, endpoints, auth mechanisms.
+2. **AUTHENTICATE EARLY** — Within the first 5 turns, actively search for login/register \
+pages. Check: /login, /signin, /register, /signup, /account, /auth, /api/auth, and \
+navigation links. If ANY registration form exists, create an account IMMEDIATELY using \
+`register_account` (use the email system for verification). If login exists, log in. \
+Share the authenticated session with ALL subsequent testing. 80% of bounty-worthy bugs \
+are behind authentication. If login fails or session expires later, RE-LOGIN or \
+RE-REGISTER before continuing. NEVER stay unauthenticated when auth is available.
+3. **HYPOTHESIZE** — Form specific, testable hypotheses about what's vulnerable and why. \
 Example: "The /api/users/{{id}} endpoint likely has IDOR because it uses sequential IDs \
 and the response includes PII without role checks."
-3. **TEST** — Execute targeted tests to confirm or reject each hypothesis. Use the \
+4. **TEST** — Execute targeted tests to confirm or reject each hypothesis. Use the \
 right tool for the job: browser for complex interactions, HTTP tools for fast fuzzing.
-4. **CHAIN** — When you find something, ask "what can I do with THIS?" Chain \
+5. **CHAIN** — When you find something, ask "what can I do with THIS?" Chain \
 vulnerabilities: IDOR → data leak → account takeover is ONE chain, not 3 findings.
 5. **VALIDATE** — Prove exploitability with a working PoC before reporting. False \
 positives waste everyone's time.
@@ -411,7 +420,10 @@ sqli-filter-bypass, nosqli-payloads, xxe-payloads, 403-bypass-paths, open-redire
 s3-buckets, \
 header-bypass, deserialization-payloads
 - These tools run hundreds of requests without consuming LLM budget — USE THEM FREELY
+"""
 
+# ── Dynamic State Template (changes every turn, NOT cached) ──────
+DYNAMIC_STATE_TEMPLATE = """\
 {situational_hints}
 
 {attack_chains_display}
@@ -647,8 +659,35 @@ def _get_available_tools() -> str:
     return _cached_tools
 
 
+def build_static_prompt() -> str:
+    """Return the static methodology portion of the system prompt.
+
+    This never changes between turns (~8K tokens). Should be cached
+    via cache_control in the system blocks.
+    """
+    return STATIC_SYSTEM_PROMPT
+
+
+def build_dynamic_prompt(state: dict[str, Any]) -> str:
+    """Return the dynamic state portion of the system prompt.
+
+    Changes every turn: current state, findings, endpoints, hints, etc.
+    Should NOT be cached.
+    """
+    # Delegate to the shared builder, but only return the dynamic part
+    return _build_dynamic_state(state)
+
+
 def build_system_prompt(state: dict[str, Any]) -> str:
-    """Render the system prompt with current state."""
+    """Render the full system prompt (backward compatibility).
+
+    Returns static + dynamic concatenated.
+    """
+    return STATIC_SYSTEM_PROMPT + "\n\n" + _build_dynamic_state(state)
+
+
+def _build_dynamic_state(state: dict[str, Any]) -> str:
+    """Build the dynamic state portion of the system prompt."""
 
     # Endpoints snapshot
     endpoints = state.get("endpoints", {})
@@ -893,7 +932,7 @@ def build_system_prompt(state: dict[str, Any]) -> str:
     else:
         attack_chains_display = ""
 
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    dynamic = DYNAMIC_STATE_TEMPLATE.format(
         target_url=state.get("target_url", "?"),
         tech_stack=", ".join(state.get("tech_stack", [])) or "(unknown)",
         phase=state.get("phase", "running"),
@@ -920,6 +959,7 @@ def build_system_prompt(state: dict[str, Any]) -> str:
         situational_hints=situational_hints,
         attack_chains_display=attack_chains_display,
     )
+    return dynamic
 
 
 # ── Tool Schemas ─────────────────────────────────────────────────────────
@@ -1339,6 +1379,17 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
                 "follow_redirects": {
                     "type": "boolean",
                     "description": "Whether to follow redirects (default: false)",
+                    "default": False,
+                },
+                "no_auth": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, send WITHOUT default Authorization/session headers. "
+                        "Use this to test if endpoints are truly accessible without auth. "
+                        "CRITICAL: By default, ALL requests include your session's default "
+                        "headers (e.g. Authorization: Bearer token). Set no_auth=true to "
+                        "make a genuinely unauthenticated request for auth bypass testing."
+                    ),
                     "default": False,
                 },
             },
@@ -2372,9 +2423,31 @@ def _generate_situational_hints(state: dict) -> str:
             "4) Then login with extracted password to get the flag."
         )
 
+    # Hint: No accounts created yet — urge registration/login
+    accounts = state.get("accounts", {})
+    turn = state.get("turn_count", 0)
+    if not accounts and turn >= 4:
+        register_tested = any("register_account" in k for k in tested)
+        login_tested = any("login_account" in k for k in tested)
+        if not register_tested and not login_tested:
+            hints.append(
+                "⚠️ CRITICAL: NO ACCOUNTS CREATED YET. You MUST search for login/register pages "
+                "NOW. Check: navigate to the target root and look for Sign Up / Login / Register "
+                "links. Also try direct URLs: /login, /signin, /register, /signup, /account/register, "
+                "/api/auth/register, /auth/signup. If you find ANY registration form, use "
+                "`register_account` immediately. If login-only (no public registration), try "
+                "default credentials. Authenticated testing surfaces 80% of bounty-worthy bugs."
+            )
+        elif register_tested and not accounts:
+            hints.append(
+                "Registration was attempted but no accounts exist. Check if registration failed "
+                "(CAPTCHA? email verification? invitation-only?). Try: different registration URL, "
+                "API-based registration via send_http_request, or look for invitation/referral codes "
+                "in JS bundles. If truly invitation-only, note it and focus on unauthenticated surface."
+            )
+
     # Hint: Authenticated but haven't tried admin paths
     credentials = working_memory.get("credentials", {})
-    accounts = state.get("accounts", {})
     has_creds = bool(credentials) or bool(accounts) or any(
         "token" in str(v).lower() or "jwt" in str(v).lower() or "eyJ" in str(v)
         for v in {**attack_surface, **vuln_findings}.values()
@@ -2396,6 +2469,14 @@ def _generate_situational_hints(state: dict) -> str:
             "Admin pages may render flags only in HTML!"
         )
 
+    # Hint: Session may have expired — re-login needed
+    if accounts and turn > 20:
+        hints.append(
+            "You have accounts. If you encounter 401/403 'unauthenticated' errors, your session "
+            "may have expired. Use `login_account` to re-authenticate, or `register_account` to "
+            "create a fresh account. Don't waste turns testing unauthenticated when you should be authenticated."
+        )
+
     # Hint: Chain opportunity detection — match findings/memory to chain templates
     chains = state.get("attack_chains", {})
     if not chains:
@@ -2415,6 +2496,19 @@ def _generate_situational_hints(state: dict) -> str:
                     )
                     break  # One hint per template
 
+    # Hint: Default headers are injected — agent must use no_auth=true for bypass testing
+    default_headers = state.get("_default_headers", {})
+    if default_headers:
+        header_names = ", ".join(default_headers.keys())
+        hints.insert(0,
+            f"⚠️ DEFAULT HEADERS ACTIVE: ALL send_http_request/test_auth_bypass calls "
+            f"automatically include these headers: [{header_names}]. This means your requests "
+            f"are AUTHENTICATED even if you don't set headers explicitly. To test TRUE "
+            f"unauthenticated access (auth bypass), you MUST use `no_auth: true` in "
+            f"send_http_request. Without no_auth=true, any 'auth bypass' you find is FAKE "
+            f"because the default Authorization header is still being sent."
+        )
+
     if not hints:
         return ""
     return "### Situational Hints\n" + "\n".join(f"- {h}" for h in hints)
@@ -2433,8 +2527,11 @@ def _detect_phase(state: dict) -> str:
 
     if turn <= 3 and len(endpoints) < 5:
         return "recon"
-    if not accounts and any(
-        ep.get("auth_required") for ep in endpoints.values()
+    # Switch to auth phase if: no accounts AND (auth endpoints found OR early turns)
+    # This ensures the agent proactively looks for login/register within first ~10 turns
+    if not accounts and (
+        any(ep.get("auth_required") for ep in endpoints.values())
+        or (4 <= turn <= 12)
     ):
         return "auth"
     if findings:

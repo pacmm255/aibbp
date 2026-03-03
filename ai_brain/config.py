@@ -9,9 +9,9 @@ from pydantic_settings import BaseSettings
 class ModelConfig(BaseSettings):
     """Claude model IDs for each tier."""
 
-    routine: str = "claude-haiku-4-5"  # 80% of calls
-    complex: str = "claude-opus-4-6"  # complex tasks use Opus
-    critical: str = "claude-opus-4-6"  # 2% of calls
+    routine: str = "claude-haiku-4-5"  # compression, vision
+    complex: str = "claude-sonnet-4-5"  # worker brain (routine pentesting turns)
+    critical: str = "claude-opus-4-6"  # manager brain (strategy, validation, pivots)
 
 
 class APIRateLimits(BaseSettings):
@@ -100,6 +100,7 @@ class ActiveTestingConfig(BaseSettings):
     redis_url: str = "redis://localhost:6382"
     captcha_api_key: str = ""  # 2captcha.com API key for reCAPTCHA/hCaptcha/Turnstile
     captcha_api_url: str = "https://2captcha.com"  # or rucaptcha.com, capsolver.com
+    upstream_proxy: str = ""  # External SOCKS5/HTTP proxy (e.g. socks5://127.0.0.1:9054)
 
 
 class AIBrainConfig(BaseSettings):

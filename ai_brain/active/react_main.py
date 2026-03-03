@@ -162,6 +162,14 @@ def parse_args() -> argparse.Namespace:
         "--captcha-api-url", type=str, default="https://2captcha.com",
         help="CAPTCHA service API URL (default: https://2captcha.com)",
     )
+    parser.add_argument(
+        "--upstream-proxy", type=str, default="",
+        help="External SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:9054)",
+    )
+    parser.add_argument(
+        "--proxy-port", type=int, default=0,
+        help="Override mitmproxy port (default: 8085). Use different ports for parallel agents.",
+    )
     return parser.parse_args()
 
 
@@ -196,6 +204,10 @@ async def main() -> None:
         val = getattr(args, attr, None)
         if val is not None:
             active_overrides[attr] = val
+    if args.upstream_proxy:
+        active_overrides["upstream_proxy"] = args.upstream_proxy
+    if args.proxy_port:
+        active_overrides["proxy_port"] = args.proxy_port
     active_cfg = ActiveTestingConfig(**active_overrides)
 
     # Budget — set per_target_max_dollars to match total so it doesn't cap early
@@ -276,6 +288,8 @@ async def main() -> None:
     print(f"  Mode:       {mode_str}")
     print(f"  Timeout:    {timeout_str}")
     print(f"  Dry run:    {args.dry_run}")
+    if active_cfg.upstream_proxy:
+        print(f"  Proxy:      {active_cfg.upstream_proxy}")
     if captcha_solver.has_service:
         print(f"  CAPTCHA:    2captcha API ({captcha_api_url})")
     else:
@@ -292,6 +306,13 @@ async def main() -> None:
     print(f"{'='*60}\n")
 
     try:
+        # Set upstream proxy env vars for subprocess tools (run_custom_exploit, etc.)
+        if active_cfg.upstream_proxy:
+            import os
+            os.environ["ALL_PROXY"] = active_cfg.upstream_proxy
+            os.environ["HTTPS_PROXY"] = active_cfg.upstream_proxy
+            os.environ["HTTP_PROXY"] = active_cfg.upstream_proxy
+
         # Start infrastructure
         if not active_cfg.dry_run:
             await browser.start()

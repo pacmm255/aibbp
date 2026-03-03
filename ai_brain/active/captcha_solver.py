@@ -266,12 +266,18 @@ class CaptchaSolver:
         if detection.captcha_type == CaptchaType.IMAGE:
             token = await self._solve_image_captcha(page)
         elif not self.has_service:
-            logger.warning(
-                "captcha_no_service",
-                type=detection.captcha_type.value,
-                note="No 2captcha API key — cannot solve reCAPTCHA/hCaptcha/Turnstile",
-            )
-            return ""
+            # No 2captcha API key — try browser-native audio challenge for reCAPTCHA v2
+            if detection.captcha_type == CaptchaType.RECAPTCHA_V2:
+                logger.info("captcha_trying_audio", type="recaptcha_v2",
+                            note="No API key — attempting audio challenge fallback")
+                token = await self._solve_recaptcha_audio(page, detection)
+            else:
+                logger.warning(
+                    "captcha_no_service",
+                    type=detection.captcha_type.value,
+                    note="No 2captcha API key — cannot solve this CAPTCHA type",
+                )
+                return ""
         elif detection.captcha_type == CaptchaType.RECAPTCHA_V2:
             token = await self._solve_recaptcha_v2(detection)
         elif detection.captcha_type == CaptchaType.RECAPTCHA_V3:
@@ -530,6 +536,185 @@ class CaptchaSolver:
         except Exception as e:
             logger.error("turnstile_error", error=str(e))
             return ""
+
+    async def _solve_recaptcha_audio(self, page: Any, det: CaptchaDetection) -> str:
+        """Solve reCAPTCHA v2 via browser audio challenge + speech recognition.
+
+        Works without any external API key. Steps:
+        1. Find/trigger the reCAPTCHA challenge iframe
+        2. Switch to audio challenge
+        3. Download the audio MP3
+        4. Transcribe with Google's free speech recognition API
+        5. Submit the transcription
+        """
+        try:
+            import speech_recognition as sr
+        except ImportError:
+            logger.warning("speech_recognition_not_installed",
+                           note="pip install SpeechRecognition for audio CAPTCHA solving")
+            return ""
+
+        try:
+            # Step 1: Trigger the challenge
+            if det.is_invisible:
+                # For invisible reCAPTCHA, trigger by clicking the submit button
+                await page.evaluate("""() => {
+                    const form = document.querySelector('form');
+                    if (form) {
+                        const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+                        if (btn) btn.click();
+                    }
+                }""")
+                await asyncio.sleep(3)
+            else:
+                # For checkbox v2, click the checkbox first
+                for frame in page.frames:
+                    if "recaptcha" in frame.url and "anchor" in frame.url:
+                        try:
+                            checkbox = frame.locator("#recaptcha-anchor")
+                            if await checkbox.count() > 0:
+                                await checkbox.click()
+                                await asyncio.sleep(3)
+                                # Check if solved immediately (no challenge)
+                                token = await page.evaluate("""() => {
+                                    const ta = document.querySelector('textarea[name="g-recaptcha-response"]');
+                                    return ta ? ta.value : '';
+                                }""")
+                                if token:
+                                    logger.info("recaptcha_checkbox_passed",
+                                                note="Passed without challenge")
+                                    return token
+                        except Exception:
+                            pass
+                        break
+
+            # Step 2: Find the challenge bframe
+            bframe = None
+            for attempt in range(15):
+                for frame in page.frames:
+                    if "recaptcha" in frame.url and "bframe" in frame.url:
+                        bframe = frame
+                        break
+                if bframe:
+                    break
+                await asyncio.sleep(1)
+
+            if not bframe:
+                logger.warning("recaptcha_no_challenge_frame", note="Challenge iframe not found")
+                return ""
+
+            # Step 3: Click the audio challenge button (wait for it to be clickable)
+            for attempt in range(5):
+                audio_btn = bframe.locator("#recaptcha-audio-button")
+                if await audio_btn.count() > 0:
+                    try:
+                        await audio_btn.click(timeout=5000)
+                        await asyncio.sleep(2)
+                        break
+                    except Exception:
+                        await asyncio.sleep(1)
+            else:
+                logger.warning("recaptcha_no_audio_button")
+                return ""
+
+            # Check for "Try again later" error
+            error_msg = bframe.locator(".rc-audiochallenge-error-message")
+            if await error_msg.count() > 0:
+                text = await error_msg.text_content()
+                if text and "try again later" in text.lower():
+                    logger.warning("recaptcha_audio_blocked", note="Google blocked audio challenge")
+                    return ""
+
+            # Get the audio URL
+            audio_src = await bframe.evaluate("""() => {
+                const audio = document.querySelector('#audio-source');
+                return audio ? audio.src : '';
+            }""")
+
+            if not audio_src:
+                logger.warning("recaptcha_no_audio_src")
+                return ""
+
+            logger.info("recaptcha_audio_downloading", url=audio_src[:80])
+
+            # Download the audio
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(audio_src)
+                if resp.status_code != 200:
+                    logger.warning("recaptcha_audio_download_failed", status=resp.status_code)
+                    return ""
+                audio_data = resp.content
+
+            # Convert MP3 to WAV for speech recognition
+            import tempfile
+            import os
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3f:
+                mp3f.write(audio_data)
+                mp3_path = mp3f.name
+
+            wav_path = mp3_path.replace(".mp3", ".wav")
+
+            try:
+                # Use ffmpeg to convert MP3 -> WAV
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-i", mp3_path, "-ar", "16000", "-ac", "1", "-y", wav_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+
+                # Transcribe using Google's free speech recognition
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(wav_path) as source:
+                    audio = recognizer.record(source)
+
+                # Use Google's free web API (no key needed, limited usage)
+                transcript = recognizer.recognize_google(audio)
+                transcript = transcript.strip().lower()
+                logger.info("recaptcha_audio_transcribed", text=transcript)
+
+                if not transcript:
+                    return ""
+
+                # Type the answer into the response field
+                response_input = bframe.locator("#audio-response")
+                if await response_input.count() > 0:
+                    await response_input.fill(transcript)
+                    await asyncio.sleep(0.5)
+
+                    # Click verify button
+                    verify_btn = bframe.locator("#recaptcha-verify-button")
+                    if await verify_btn.count() > 0:
+                        await verify_btn.click()
+                        await asyncio.sleep(3)
+
+                    # Check if solved — get the token from the parent page
+                    token = await page.evaluate("""() => {
+                        const ta = document.querySelector('textarea[name="g-recaptcha-response"]');
+                        return ta ? ta.value : '';
+                    }""")
+
+                    if token:
+                        logger.info("recaptcha_audio_solved", token_length=len(token))
+                        return token
+                    else:
+                        logger.warning("recaptcha_audio_verify_failed",
+                                       note="Verify clicked but no token received")
+                        return ""
+
+            finally:
+                # Cleanup temp files
+                for f in (mp3_path, wav_path):
+                    try:
+                        os.unlink(f)
+                    except OSError:
+                        pass
+
+        except Exception as e:
+            logger.error("recaptcha_audio_error", error=str(e))
+
+        return ""
 
     async def _solve_image_captcha(self, page: Any) -> str:
         """Solve image CAPTCHA using Claude Vision."""

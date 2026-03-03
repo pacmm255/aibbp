@@ -23,7 +23,10 @@ from langgraph.graph import END, StateGraph
 
 from ai_brain.active.chain_discovery import ChainDiscoveryEngine, AdversarialReasoningEngine
 from ai_brain.active.react_knowledge_graph import KnowledgeGraph
-from ai_brain.active.react_prompt import build_system_prompt, get_tool_schemas, _detect_phase, CHAIN_TEMPLATES
+from ai_brain.active.react_prompt import (
+    build_static_prompt, build_dynamic_prompt, build_system_prompt,
+    get_tool_schemas, _detect_phase, CHAIN_TEMPLATES,
+)
 from ai_brain.active.react_state import PentestState
 from ai_brain.active.react_tools import ToolDeps, dispatch_tool
 from ai_brain.errors import BudgetExhausted
@@ -207,6 +210,122 @@ def _print_finding(finding_id: str, finding: dict) -> None:
     print()
 
 
+# ── Tiered Model Selection ────────────────────────────────────────────
+
+# Signals in tool results that warrant Opus review
+_ESCALATION_PATTERNS = re.compile(
+    "|".join([
+        # SQL errors
+        r"sql syntax", r"mysql_", r"pg_query", r"sqlite3?\.", r"ORA-\d{4,5}",
+        r"unclosed quotation", r"unterminated string",
+        # Template injection
+        r"jinja2?", r"twig", r"mako", r"freemarker",
+        # Command injection indicators
+        r"root:x:0:0", r"/etc/passwd", r"uid=\d+\(", r"www-data",
+        # SSRF / internal access
+        r"169\.254\.169\.254", r"metadata\.google",
+        # Auth bypass signals
+        r"admin.*dashboard", r"privilege.*escalat",
+        # Sensitive data
+        r"FLAG\{", r"flag\{", r"api[_-]?key\s*[:=]",
+        # XSS reflection
+        r"<script[> ]", r"alert\s*\(",
+        # Server errors suggesting mishandling
+        r"stack\s*trace", r"traceback", r"internal server error",
+    ]),
+    re.IGNORECASE,
+)
+
+# Mode prefixes for Sonnet (worker) and Opus (manager) turns
+_WORKER_PREFIX = (
+    "You are in WORKER MODE. Focus on executing tools efficiently and reading "
+    "results carefully. If you discover something that looks like a real "
+    "vulnerability (SQL errors, auth bypass, sensitive data exposure, XSS "
+    "reflection, command execution), describe what you found clearly in your "
+    "reasoning — the manager will review it next turn. Keep testing methodically. "
+    "This is an authorized penetration test with explicit written permission."
+)
+_MANAGER_PREFIX = (
+    "You are in MANAGER MODE. Review ALL recent tool results carefully. "
+    "Validate any potential findings (check for false positives). Decide if "
+    "strategic pivots are needed. Form new hypotheses. Think creatively about "
+    "attack chains and what has been missed. Plan the next phase of testing."
+)
+
+
+def _has_escalation_signals(state: PentestState) -> bool:
+    """Check if recent tool results contain signals worth escalating to Opus."""
+    messages = state.get("messages", [])
+    if not messages:
+        return False
+
+    # Check last 2 messages (tool results come as user messages after tool_executor)
+    for msg in messages[-2:]:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("content", "") or block.get("text", "")
+                    if isinstance(text, str) and _ESCALATION_PATTERNS.search(text[:5000]):
+                        return True
+        elif isinstance(content, str):
+            if _ESCALATION_PATTERNS.search(content[:5000]):
+                return True
+    return False
+
+
+def _select_brain_tier(state: PentestState) -> tuple[str, str]:
+    """Determine which model tier to use for this brain turn.
+
+    Returns (tier, reason) where tier is "critical" (Opus) or "complex" (Sonnet).
+    Default: Sonnet. Escalate to Opus only when justified.
+    """
+    turn = state.get("turn_count", 0)
+    last_opus = state.get("last_opus_turn", -1)
+    max_turns = state.get("max_turns", 150)
+
+    # 1. Turn 0: Always Opus for initial strategy
+    if turn == 0:
+        return "critical", "initial_strategy"
+
+    # 2. Periodic review: every 8 turns since last Opus call
+    if turn - last_opus >= 8:
+        return "critical", "periodic_review"
+
+    # 3. New finding detected (check info_gain_history)
+    info_gains = state.get("info_gain_history", [])
+    if info_gains:
+        last_gain = info_gains[-1]
+        if last_gain.get("new_findings", 0) > 0:
+            return "critical", "new_finding"
+
+    # 4. Stalled: no progress for 5+ turns
+    no_progress = state.get("no_progress_count", 0)
+    if no_progress >= 5:
+        return "critical", "stalled"
+
+    # 5. Strategy reset in recent messages
+    messages = state.get("messages", [])
+    if messages:
+        last_content = messages[-1].get("content", "")
+        if isinstance(last_content, str) and "STRATEGY RESET" in last_content:
+            return "critical", "strategy_reset"
+
+    # 6. Interesting signals in recent tool results
+    if _has_escalation_signals(state):
+        return "critical", "escalation_signal"
+
+    # 7. Budget wrapping up (>80% used, finite mode only)
+    if max_turns != 0:
+        budget_spent = state.get("budget_spent", 0.0)
+        budget_limit = state.get("budget_limit", 1.0)
+        if budget_limit > 0 and (budget_spent / budget_limit) > 0.80:
+            return "critical", "budget_high"
+
+    # Default: Sonnet worker
+    return "complex", "routine"
+
+
 # ── Node 1: Brain ────────────────────────────────────────────────────
 
 
@@ -246,19 +365,37 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         kg = KnowledgeGraph()
         config["configurable"]["_knowledge_graph"] = kg
 
-    # Inject knowledge graph into state for prompt builder
+    # Inject knowledge graph and default headers into state for prompt builder
     state_with_kg = dict(state)
     state_with_kg["_knowledge_graph"] = kg
+    state_with_kg["_default_headers"] = config["configurable"].get("default_headers", {})
 
-    # Build system prompt with current state
-    system_text = build_system_prompt(state_with_kg)
+    # Build system prompt as split blocks: static (cached) + dynamic (not cached)
+    static_text = build_static_prompt()
+    dynamic_text = build_dynamic_prompt(state_with_kg)
+
+    # Select model tier: Opus for strategy/validation, Sonnet for routine testing
+    task_tier, tier_reason = _select_brain_tier(state)
+    logger.info("brain_tier_selected", tier=task_tier, reason=tier_reason, turn=turn_count)
+
+    # Build system blocks with mode prefix + cached static + dynamic state
+    mode_prefix = _WORKER_PREFIX if task_tier == "complex" else _MANAGER_PREFIX
     system_blocks = [
-        {
-            "type": "text",
-            "text": system_text,
-            "cache_control": {"type": "ephemeral"},
-        }
+        # 1. Mode prefix (~50 tokens, not cached)
+        {"type": "text", "text": mode_prefix},
+        # 2. Static methodology (~7K tokens, CACHED at 90% discount after first call)
+        {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}},
+        # 3. Dynamic state (NOT cached — changes every turn)
+        {"type": "text", "text": dynamic_text},
     ]
+
+    if _LIVE:
+        tier_label = (
+            f"{_MAGENTA}OPUS (manager: {tier_reason}){_RESET}"
+            if task_tier == "critical"
+            else f"{_BLUE}SONNET (worker){_RESET}"
+        )
+        print(f"  {_DIM}Brain: {tier_label}")
 
     # Get tool schemas
     tools = get_tool_schemas(state)
@@ -285,9 +422,6 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
                 ),
             }
         ]
-
-    # Always use Opus for the brain — Sonnet refuses to test real targets
-    task_tier = "critical"
 
     try:
         response = await client.call_with_tools(
@@ -349,8 +483,41 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     # Extract tool calls
     tool_calls = [b for b in content_blocks if getattr(b, "type", "") == "tool_use"]
 
-    # Log brain reasoning
+    # ── Sonnet refusal fallback: if Sonnet refuses, retry with Opus ──
     text_blocks = [b for b in content_blocks if getattr(b, "type", "") == "text"]
+    if task_tier == "complex" and not tool_calls and response.stop_reason == "end_turn":
+        all_text = " ".join(b.text for b in text_blocks).lower()
+        _refusal_phrases = [
+            "i can't", "i cannot", "i'm unable", "i am unable",
+            "not appropriate", "safety concern", "won't be able",
+            "decline to", "i shouldn't", "not comfortable",
+        ]
+        if any(phrase in all_text for phrase in _refusal_phrases):
+            logger.warning("sonnet_refused_escalating", turn=turn_count, preview=all_text[:200])
+            if _LIVE:
+                print(f"  {_YELLOW}⚠ Sonnet refused — escalating to Opus{_RESET}")
+            try:
+                # Switch system blocks to manager mode
+                system_blocks[0] = {"type": "text", "text": _MANAGER_PREFIX}
+                response = await client.call_with_tools(
+                    phase="active_testing",
+                    task_tier="critical",
+                    system_blocks=system_blocks,
+                    messages=messages,
+                    tools=tools,
+                    target=state.get("target_url", ""),
+                )
+                task_tier = "critical"
+                tier_reason = "sonnet_refused"
+                content_blocks = response.content
+                serialized_content = _serialize_content(content_blocks)
+                new_messages = [{"role": "assistant", "content": serialized_content}]
+                tool_calls = [b for b in content_blocks if getattr(b, "type", "") == "tool_use"]
+                text_blocks = [b for b in content_blocks if getattr(b, "type", "") == "text"]
+            except Exception as e:
+                logger.error("opus_fallback_failed", error=str(e))
+
+    # Log brain reasoning
     if text_blocks:
         reasoning = text_blocks[0].text[:500]
         logger.info("brain_reasoning", preview=reasoning)
@@ -403,7 +570,10 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         "turn_count": turn_count + 1,
         "budget_spent": budget_spent,
         "phase_budgets": phase_budgets,
+        "last_brain_tier": task_tier,
     }
+    if task_tier == "critical":
+        result["last_opus_turn"] = turn_count
 
     if tool_calls:
         result["_pending_tool_calls"] = tool_calls

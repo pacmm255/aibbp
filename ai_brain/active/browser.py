@@ -75,15 +75,23 @@ class BrowserController:
                 "server": f"http://127.0.0.1:{self._config.proxy_port}"
             }
 
+        # If upstream proxy is set, apply it at browser level so ALL contexts use it
+        launch_proxy = None
+        upstream = getattr(self._config, "upstream_proxy", "")
+        if upstream:
+            launch_proxy = {"server": upstream}
+
         self._browser = await self._playwright.chromium.launch(
             headless=self._config.browser_headless,
             args=launch_args,
+            proxy=launch_proxy,
         )
         self._started = True
         logger.info(
             "browser_started",
             headless=self._config.browser_headless,
             proxy=proxy_settings,
+            upstream_proxy=upstream or None,
         )
 
     async def stop(self) -> None:

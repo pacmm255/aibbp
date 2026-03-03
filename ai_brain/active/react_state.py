@@ -110,6 +110,12 @@ class PentestState(TypedDict, total=False):
     # Path to memory.json for auto-save in compress node
     memory_path: str
 
+    # ── Tiered Model Control ─────────────────────────────────────────
+    # Which tier was used last turn ("complex" = Sonnet, "critical" = Opus)
+    last_brain_tier: str
+    # Turn number of last Opus call (for periodic review scheduling)
+    last_opus_turn: int
+
     # ── Internal (not for brain consumption) ────────────────────────
     # Pending tool calls from brain_node → tool_executor_node
     _pending_tool_calls: list[Any]
