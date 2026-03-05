@@ -2629,7 +2629,11 @@ def _generate_situational_hints(state: dict) -> str:
 
 
 def _detect_phase(state: dict) -> str:
-    """Auto-detect current testing phase from state."""
+    """Auto-detect current testing phase from state.
+
+    Includes periodic recon cycling to prevent agents from getting stuck
+    in exploitation/post_exploit forever after many turns.
+    """
     explicit = state.get("phase", "")
     if explicit in ("recon", "auth", "exploitation", "post_exploit"):
         return explicit
@@ -2648,6 +2652,15 @@ def _detect_phase(state: dict) -> str:
         or (4 <= turn <= 12)
     ):
         return "auth"
+
+    # ── Periodic recon cycling ──
+    # Every 50 turns, force a recon phase to discover new attack surface.
+    # This prevents agents from being stuck in exploitation for 24+ hours
+    # without finding new endpoints, subdomains, or JS-embedded secrets.
+    # The recon window lasts 5 turns (e.g., turns 50-54, 100-104, 150-154).
+    if turn >= 50 and (turn % 50) < 5:
+        return "recon"
+
     if findings:
         return "post_exploit"  # Have findings, validate/chain
     return "exploitation"

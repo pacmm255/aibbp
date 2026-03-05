@@ -875,110 +875,120 @@ class ZaiClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                async with self._http.stream(
-                    "POST", url, params=query_params,
-                    headers=headers, json=body,
-                ) as stream:
-                    if stream.status_code in (400, 403, 405, 429):
-                        error_body = ""
-                        async for chunk in stream.aiter_text():
-                            error_body += chunk
-                        logger.warning("zai_http_error", status=stream.status_code,
-                                       body=error_body[:300], attempt=attempt)
-                        if attempt < max_retries - 1:
-                            # Short backoff for 400/403/429; fail fast on 405
-                            # (brain_node handles long 405 cooldown)
-                            backoff = 5 if stream.status_code == 405 else min(10 * (3 ** attempt), 120)
-                            logger.info("zai_rate_limit_backoff", wait=backoff,
-                                        attempt=attempt, status=stream.status_code)
-                            import asyncio as _aio_inner
-                            await _aio_inner.sleep(backoff)
-                            self._rotate_session()
-                            await self._ensure_session()
-                            # Rebuild auth headers + signature
-                            headers["Authorization"] = f"Bearer {self._token}"
-                            cookie_parts = [f"token={self._token}"]
-                            for k, v in self._cookies.items():
-                                if k != "token":
-                                    cookie_parts.append(f"{k}={v}")
-                            headers["Cookie"] = "; ".join(cookie_parts)
-                            request_id = str(uuid.uuid4())
-                            timestamp_ms = int(time.time() * 1000)
-                            query_params["requestId"] = request_id
-                            query_params["user_id"] = self._user_id or ""
-                            query_params["timestamp"] = str(timestamp_ms)
-                            query_params["signature_timestamp"] = str(timestamp_ms)
-                            signature = self._generate_signature(
-                                prompt_text, self._user_id or "",
-                                request_id, timestamp_ms,
-                            )
-                            headers["X-Signature"] = signature
-                            continue
-                        raise RuntimeError(f"Z.ai {stream.status_code}: {error_body[:300]}")
+                async def _stream_direct() -> bool:
+                    """Stream Z.ai response directly. Returns True on success, False to retry."""
+                    nonlocal doc_buffer, output_tokens, estimated_input_tokens
+                    nonlocal headers, query_params
 
-                    if stream.status_code != 200:
-                        error_body = ""
-                        async for chunk in stream.aiter_text():
-                            error_body += chunk
-                        raise RuntimeError(f"Z.ai {stream.status_code}: {error_body[:300]}")
+                    async with self._http.stream(
+                        "POST", url, params=query_params,
+                        headers=headers, json=body,
+                    ) as stream:
+                        if stream.status_code in (400, 403, 405, 429):
+                            error_body = ""
+                            async for chunk in stream.aiter_text():
+                                error_body += chunk
+                            logger.warning("zai_http_error", status=stream.status_code,
+                                           body=error_body[:300], attempt=attempt)
+                            if attempt < max_retries - 1:
+                                backoff = 5 if stream.status_code == 405 else min(10 * (3 ** attempt), 120)
+                                logger.info("zai_rate_limit_backoff", wait=backoff,
+                                            attempt=attempt, status=stream.status_code)
+                                await asyncio.sleep(backoff)
+                                self._rotate_session()
+                                await self._ensure_session()
+                                headers["Authorization"] = f"Bearer {self._token}"
+                                cookie_parts = [f"token={self._token}"]
+                                for k, v in self._cookies.items():
+                                    if k != "token":
+                                        cookie_parts.append(f"{k}={v}")
+                                headers["Cookie"] = "; ".join(cookie_parts)
+                                request_id = str(uuid.uuid4())
+                                timestamp_ms = int(time.time() * 1000)
+                                query_params["requestId"] = request_id
+                                query_params["user_id"] = self._user_id or ""
+                                query_params["timestamp"] = str(timestamp_ms)
+                                query_params["signature_timestamp"] = str(timestamp_ms)
+                                signature = self._generate_signature(
+                                    prompt_text, self._user_id or "",
+                                    request_id, timestamp_ms,
+                                )
+                                headers["X-Signature"] = signature
+                                return False  # Retry
+                            raise RuntimeError(f"Z.ai {stream.status_code}: {error_body[:300]}")
 
-                    # Parse SSE stream into document buffer
-                    async for line in stream.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:].strip()
+                        if stream.status_code != 200:
+                            error_body = ""
+                            async for chunk in stream.aiter_text():
+                                error_body += chunk
+                            raise RuntimeError(f"Z.ai {stream.status_code}: {error_body[:300]}")
 
-                        if data_str == "[DONE]" or data_str == '{"data":"[DONE]"}':
-                            break
+                        # Parse SSE stream into document buffer
+                        async for line in stream.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
 
-                        try:
-                            event = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-
-                        event_data = event.get("data", event)
-                        if isinstance(event_data, str):
-                            if event_data == "[DONE]":
+                            if data_str == "[DONE]" or data_str == '{"data":"[DONE]"}':
                                 break
-                            continue
 
-                        phase_val = event_data.get("phase", "")
-                        delta = event_data.get("delta_content", "")
-                        edit = event_data.get("edit_content", "")
-                        edit_idx = event_data.get("edit_index")
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                        # ── Native tool call detection ──
-                        # GLM-5 emits phase=tool_call with <glm_block> in edit_content.
-                        # Collect the edit_content into a buffer for later parsing
-                        # (the glm_block may span multiple events).
-                        if phase_val == "tool_call" and edit:
-                            doc_buffer.append(edit)  # Add to buffer for parsing later
-                            output_tokens += 1
+                            event_data = event.get("data", event)
+                            if isinstance(event_data, str):
+                                if event_data == "[DONE]":
+                                    break
+                                continue
 
-                        # Append delta_content to end of buffer
-                        if delta:
-                            doc_buffer.append(delta)
-                            output_tokens += 1
+                            phase_val = event_data.get("phase", "")
+                            delta = event_data.get("delta_content", "")
+                            edit = event_data.get("edit_content", "")
+                            edit_idx = event_data.get("edit_index")
 
-                        # Splice edit_content at position
-                        if edit and edit_idx is not None and phase_val != "tool_call":
-                            current_doc = "".join(doc_buffer)
-                            if edit_idx >= len(current_doc):
+                            # ── Native tool call detection ──
+                            if phase_val == "tool_call" and edit:
                                 doc_buffer.append(edit)
-                            else:
-                                new_doc = current_doc[:edit_idx] + edit
-                                doc_buffer = [new_doc]
-                            output_tokens += 1
+                                output_tokens += 1
 
-                        if event_data.get("done"):
-                            break
+                            if delta:
+                                doc_buffer.append(delta)
+                                output_tokens += 1
 
-                        usage_data = event_data.get("usage", {})
-                        if usage_data:
-                            estimated_input_tokens = usage_data.get("prompt_tokens", estimated_input_tokens)
-                            output_tokens = max(output_tokens, usage_data.get("completion_tokens", output_tokens))
+                            if edit and edit_idx is not None and phase_val != "tool_call":
+                                current_doc = "".join(doc_buffer)
+                                if edit_idx >= len(current_doc):
+                                    doc_buffer.append(edit)
+                                else:
+                                    new_doc = current_doc[:edit_idx] + edit
+                                    doc_buffer = [new_doc]
+                                output_tokens += 1
 
-                break  # Success — exit retry loop
+                            if event_data.get("done"):
+                                break
+
+                            usage_data = event_data.get("usage", {})
+                            if usage_data:
+                                estimated_input_tokens = usage_data.get("prompt_tokens", estimated_input_tokens)
+                                output_tokens = max(output_tokens, usage_data.get("completion_tokens", output_tokens))
+
+                    return True  # Success
+
+                # Wrap stream in 180s timeout to prevent infinite hangs
+                try:
+                    success = await asyncio.wait_for(_stream_direct(), timeout=180.0)
+                except asyncio.TimeoutError:
+                    logger.warning("zai_stream_timeout", attempt=attempt,
+                                   msg="Stream hung (180s timeout)")
+                    if attempt < max_retries - 1:
+                        continue
+                    raise RuntimeError("Z.ai stream timed out after 180s")
+
+                if success:
+                    break  # Exit retry loop
+                continue  # Retry (returned False)
 
             except httpx.ReadTimeout:
                 if attempt < max_retries - 1:
@@ -1185,8 +1195,14 @@ class ZaiClient:
 
         max_retries = 5
         last_error: Exception | None = None
+        _call_start = time.time()
+        _max_total_time = 600.0  # 10 min max for entire proxy call (all retries)
 
         for attempt in range(max_retries):
+            # Hard time limit across all retries
+            if time.time() - _call_start > _max_total_time:
+                logger.error("zai_proxy_total_timeout", elapsed=time.time() - _call_start)
+                break
             try:
                 proxy = await self.proxy_pool.acquire()
             except RuntimeError as e:
@@ -1196,7 +1212,16 @@ class ZaiClient:
                 continue
             try:
                 # Ensure this proxy has a Z.ai guest session
-                await self.proxy_pool.ensure_proxy_session(proxy)
+                # Wrap in 30s timeout to prevent hanging on dead proxies
+                try:
+                    await asyncio.wait_for(
+                        self.proxy_pool.ensure_proxy_session(proxy), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    self.proxy_pool.release(proxy, success=False)
+                    logger.warning("zai_proxy_session_timeout", proxy=proxy.url[:30])
+                    last_error = RuntimeError(f"Session setup timeout via {proxy.url[:30]}")
+                    continue
 
                 # Override auth with proxy's session
                 p_headers = dict(headers)
@@ -1228,103 +1253,124 @@ class ZaiClient:
                 native_tool_calls: list[ZaiToolUseBlock] = []
                 output_tokens = 0
 
-                async with client.stream(
-                    "POST", url, params=p_params,
-                    headers=p_headers, json=body,
-                ) as stream:
-                    if stream.status_code in (400, 403, 405, 429):
-                        error_body = ""
-                        async for chunk in stream.aiter_text():
-                            error_body += chunk
-                        logger.warning(
-                            "zai_proxy_http_error",
-                            status=stream.status_code,
-                            proxy=proxy.url[:30],
-                            body=error_body[:300],
-                            attempt=attempt,
-                        )
-                        # Rotate session on auth errors
-                        if stream.status_code in (403, 405):
-                            self.proxy_pool.invalidate_proxy_session(proxy)
-                        self.proxy_pool.release(proxy, success=False)
-                        last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}")
-                        continue
+                async def _stream_via_proxy() -> ZaiResponse | None:
+                    """Stream Z.ai response via proxy, returns None on retriable error."""
+                    nonlocal doc_buffer, native_tool_calls, output_tokens
+                    nonlocal estimated_input_tokens, last_error
 
-                    if stream.status_code != 200:
-                        error_body = ""
-                        async for chunk in stream.aiter_text():
-                            error_body += chunk
-                        self.proxy_pool.release(proxy, success=False)
-                        last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}: {error_body[:300]}")
-                        continue
+                    async with client.stream(
+                        "POST", url, params=p_params,
+                        headers=p_headers, json=body,
+                    ) as stream:
+                        if stream.status_code in (400, 403, 405, 429):
+                            error_body = ""
+                            async for chunk in stream.aiter_text():
+                                error_body += chunk
+                            logger.warning(
+                                "zai_proxy_http_error",
+                                status=stream.status_code,
+                                proxy=proxy.url[:30],
+                                body=error_body[:300],
+                                attempt=attempt,
+                            )
+                            if stream.status_code in (403, 405):
+                                self.proxy_pool.invalidate_proxy_session(proxy)
+                            self.proxy_pool.release(proxy, success=False)
+                            last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}")
+                            return None
 
-                    # Parse SSE stream
-                    async for line in stream.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:].strip()
+                        if stream.status_code != 200:
+                            error_body = ""
+                            async for chunk in stream.aiter_text():
+                                error_body += chunk
+                            self.proxy_pool.release(proxy, success=False)
+                            last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}: {error_body[:300]}")
+                            return None
 
-                        if data_str == "[DONE]" or data_str == '{"data":"[DONE]"}':
-                            break
+                        # Parse SSE stream
+                        async for line in stream.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
 
-                        try:
-                            event = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-
-                        event_data = event.get("data", event)
-                        if isinstance(event_data, str):
-                            if event_data == "[DONE]":
+                            if data_str == "[DONE]" or data_str == '{"data":"[DONE]"}':
                                 break
-                            continue
 
-                        phase_val = event_data.get("phase", "")
-                        delta = event_data.get("delta_content", "")
-                        edit = event_data.get("edit_content", "")
-                        edit_idx = event_data.get("edit_index")
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                        if phase_val == "tool_call" and edit:
-                            doc_buffer.append(edit)
-                            output_tokens += 1
+                            event_data = event.get("data", event)
+                            if isinstance(event_data, str):
+                                if event_data == "[DONE]":
+                                    break
+                                continue
 
-                        if delta:
-                            doc_buffer.append(delta)
-                            output_tokens += 1
+                            phase_val = event_data.get("phase", "")
+                            delta = event_data.get("delta_content", "")
+                            edit = event_data.get("edit_content", "")
+                            edit_idx = event_data.get("edit_index")
 
-                        if edit and edit_idx is not None and phase_val != "tool_call":
-                            current_doc = "".join(doc_buffer)
-                            if edit_idx >= len(current_doc):
+                            if phase_val == "tool_call" and edit:
                                 doc_buffer.append(edit)
-                            else:
-                                new_doc = current_doc[:edit_idx] + edit
-                                doc_buffer = [new_doc]
-                            output_tokens += 1
+                                output_tokens += 1
 
-                        if event_data.get("done"):
-                            break
+                            if delta:
+                                doc_buffer.append(delta)
+                                output_tokens += 1
 
-                        usage_data = event_data.get("usage", {})
-                        if usage_data:
-                            estimated_input_tokens = usage_data.get(
-                                "prompt_tokens", estimated_input_tokens,
-                            )
-                            output_tokens = max(
-                                output_tokens,
-                                usage_data.get("completion_tokens", output_tokens),
-                            )
+                            if edit and edit_idx is not None and phase_val != "tool_call":
+                                current_doc = "".join(doc_buffer)
+                                if edit_idx >= len(current_doc):
+                                    doc_buffer.append(edit)
+                                else:
+                                    new_doc = current_doc[:edit_idx] + edit
+                                    doc_buffer = [new_doc]
+                                output_tokens += 1
 
-                self.proxy_pool.release(proxy, success=True)
+                            if event_data.get("done"):
+                                break
 
-                # Parse the response (same logic as direct path)
-                return self._parse_streamed_response(
-                    doc_buffer=doc_buffer,
-                    native_tool_calls=native_tool_calls,
-                    output_tokens=output_tokens,
-                    estimated_input_tokens=estimated_input_tokens,
-                    phase=phase,
-                    target=target,
-                    tools=tools,
-                )
+                            usage_data = event_data.get("usage", {})
+                            if usage_data:
+                                estimated_input_tokens = usage_data.get(
+                                    "prompt_tokens", estimated_input_tokens,
+                                )
+                                output_tokens = max(
+                                    output_tokens,
+                                    usage_data.get("completion_tokens", output_tokens),
+                                )
+
+                    self.proxy_pool.release(proxy, success=True)
+                    return self._parse_streamed_response(
+                        doc_buffer=doc_buffer,
+                        native_tool_calls=native_tool_calls,
+                        output_tokens=output_tokens,
+                        estimated_input_tokens=estimated_input_tokens,
+                        phase=phase,
+                        target=target,
+                        tools=tools,
+                    )
+
+                # Wrap entire stream in a 120s timeout to prevent infinite hangs
+                # when proxy dies mid-stream after sending HTTP 200
+                try:
+                    result = await asyncio.wait_for(_stream_via_proxy(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    self.proxy_pool.release(proxy, success=False)
+                    logger.warning(
+                        "zai_proxy_stream_timeout",
+                        proxy=proxy.url[:30],
+                        attempt=attempt,
+                        msg="Proxy hung mid-stream (180s timeout)",
+                    )
+                    last_error = RuntimeError(f"Stream timeout via {proxy.url[:30]}")
+                    continue
+
+                if result is not None:
+                    return result
+                # result is None → retriable error, continue to next attempt
 
             except Exception as e:
                 self.proxy_pool.release(proxy, success=False)

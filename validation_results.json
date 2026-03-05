@@ -1,0 +1,3553 @@
+{
+  "timestamp": 1772737308.51407,
+  "elapsed": 22.047932147979736,
+  "total": 509,
+  "summary": {
+    "FALSE_POSITIVE": 147,
+    "UNREACHABLE": 8,
+    "SKIP": 56,
+    "NEEDS_MANUAL": 239,
+    "CONFIRMED": 12,
+    "LIKELY_REAL": 31,
+    "BLOCKED": 3,
+    "LOW_VALUE": 5,
+    "UNKNOWN": 8
+  },
+  "confirmed": [
+    {
+      "domain": "explorer.immutable.com",
+      "target_url": "https://explorer.immutable.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://rpc.immutable.com/",
+      "severity": "critical",
+      "finding_ids": [
+        "rpc_exposed_account",
+        "rpc_tx_allowed"
+      ],
+      "fid_primary": "rpc_exposed_account",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "eth_accounts: 0x8a68f4cd3726d39414fc965f6cfa841464a0b670",
+      "http_status": 200,
+      "response_size": 81
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "sqs_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "severity": "critical",
+      "finding_ids": [
+        "sqs_message_injection",
+        "unauthenticated_sqs_injection",
+        "critical_sqs_message_injection",
+        "critical_sqs_injection_final",
+        "critical_sqs_injection_verified",
+        "sqs_injection_endpoint_1",
+        "sqs_injection_final",
+        "cross_queue_injection",
+        "sqs_universal_injection",
+        "sqs_critical_comprehensive"
+      ],
+      "fid_primary": "sqs_message_injection",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "SQS XML with MessageId returned",
+      "http_status": 200,
+      "response_size": 459
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "sqs_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7 and /events",
+      "severity": "critical",
+      "finding_ids": [
+        "sqs_injection_critical",
+        "comprehensive_sqs_injection",
+        "sqs_injection_complete",
+        "sqs_injection_complete_v2",
+        "sqs_injection_comprehensive",
+        "sqs_injection_verified"
+      ],
+      "fid_primary": "sqs_injection_critical",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "SQS XML with MessageId returned",
+      "http_status": 200,
+      "response_size": 459
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "sqs_injection",
+      "endpoint": "https://ingress.linktr.ee/events",
+      "severity": "critical",
+      "finding_ids": [
+        "sqs_injection_endpoint_2"
+      ],
+      "fid_primary": "sqs_injection_endpoint_2",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "SQS XML with MessageId returned",
+      "http_status": 200,
+      "response_size": 459
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "sqs_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7 AND https://ingress.linktr.ee/events",
+      "severity": "critical",
+      "finding_ids": [
+        "sqs_dual_endpoints",
+        "sqs_critical_final",
+        "CRITICAL_SQS_FINAL",
+        "sqs_injection_confirmed",
+        "sqs_critical_complete"
+      ],
+      "fid_primary": "sqs_dual_endpoints",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "SQS XML with MessageId returned",
+      "http_status": 200,
+      "response_size": 459
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "message_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "severity": "high",
+      "finding_ids": [
+        "ingress_sqs_injection",
+        "message_injection",
+        "sqs_unauth_message_injection",
+        "message_injection_sq",
+        "sqs_message_injection_critical",
+        "summary_critical",
+        "final_critical_sqs",
+        "comprehensive_pentest"
+      ],
+      "fid_primary": "ingress_sqs_injection",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "SQS XML with MessageId returned",
+      "http_status": 200,
+      "response_size": 459
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "target_url": "https://rpc.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://rpc.immutable.com",
+      "severity": "medium",
+      "finding_ids": [
+        "exposed_account",
+        "eth_accounts_exposure",
+        "pending_tx_surveillance",
+        "mempool_surveillance",
+        "final_eth_accounts"
+      ],
+      "fid_primary": "exposed_account",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "eth_accounts: 0x8a68f4cd3726d39414fc965f6cfa841464a0b670",
+      "http_status": 200,
+      "response_size": 81
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "target_url": "https://rpc.immutable.com",
+      "vuln_type": "dos",
+      "endpoint": "https://rpc.immutable.com",
+      "severity": "medium",
+      "finding_ids": [
+        "batch_rate_limit_bypass",
+        "filter_exhaustion",
+        "batch_dos_amplification",
+        "large_response_dos",
+        "batch_dos_amplification_verified",
+        "final_batch_dos",
+        "final_unlimited_filters",
+        "batch_dos_verified"
+      ],
+      "fid_primary": "batch_rate_limit_bypass",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "eth_accounts: 0x8a68f4cd3726d39414fc965f6cfa841464a0b670",
+      "http_status": 200,
+      "response_size": 81
+    },
+    {
+      "domain": "websitecheckout.rapyd.net",
+      "target_url": "https://websitecheckout.rapyd.net",
+      "vuln_type": "cors",
+      "endpoint": "https://dashboard.rapyd.net/v1/login",
+      "severity": "medium",
+      "finding_ids": [
+        "cors_dashboard_api",
+        "cors_dashboard"
+      ],
+      "fid_primary": "cors_dashboard_api",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "CORS reflects origin with credentials",
+      "http_status": 204,
+      "response_size": null
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "target_url": "https://explorer.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "rpc.immutable.com",
+      "severity": "low",
+      "finding_ids": [
+        "rpc_eth_accounts_exposure"
+      ],
+      "fid_primary": "rpc_eth_accounts_exposure",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "eth_accounts: 0x8a68f4cd3726d39414fc965f6cfa841464a0b670",
+      "http_status": 200,
+      "response_size": 81
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "target_url": "https://explorer.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://rpc.immutable.com/",
+      "severity": "low",
+      "finding_ids": [
+        "rpc_version_disclosure",
+        "rpc_accounts_exposed",
+        "unlocked_account_exposure",
+        "eth_accounts_exposure",
+        "batch_rpc_allowed"
+      ],
+      "fid_primary": "rpc_version_disclosure",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "eth_accounts: 0x8a68f4cd3726d39414fc965f6cfa841464a0b670",
+      "http_status": 200,
+      "response_size": 81
+    },
+    {
+      "domain": "websiteverify.rapyd.net",
+      "target_url": "https://websiteverify.rapyd.net",
+      "vuln_type": "cors_misconfiguration",
+      "endpoint": "https://gw.rapyd.net",
+      "severity": "low",
+      "finding_ids": [
+        "cors_gw_rapyd",
+        "cors_gw_rapyd_detailed"
+      ],
+      "fid_primary": "cors_gw_rapyd",
+      "validation_status": "CONFIRMED",
+      "validation_detail": "CORS reflects origin with credentials",
+      "http_status": 200,
+      "response_size": null
+    }
+  ],
+  "likely_real": [
+    {
+      "domain": "testnet.bitmex.com",
+      "target_url": "https://testnet.bitmex.com",
+      "vuln_type": "stored_xss",
+      "endpoint": "/api/v1/chat",
+      "severity": "critical",
+      "finding_ids": [
+        "stored_xss_chat_channel4",
+        "stored_xss_chat_no_csp",
+        "stored_xss_chat_final",
+        "critical_stored_xss_verified",
+        "stored_xss_final",
+        "stored_xss_chat",
+        "stored_xss_payloads",
+        "final_stored_xss",
+        "xss_stored_chat",
+        "final_critical_xss",
+        "FINAL_CRITICAL_1",
+        "VALIDATED_CRITICAL_XSS",
+        "CRITICAL_1_STORED_XSS",
+        "stored_xss_critical"
+      ],
+      "fid_primary": "stored_xss_chat_channel4",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>",
+      "http_status": 200,
+      "response_size": 20316
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "target_url": "https://link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://link.x.immutable.com/config.json",
+      "severity": "high",
+      "finding_ids": [
+        "moonpay_api_key_leak",
+        "alchemy_key_exposed",
+        "magic_link_keys_exposed",
+        "segment_api_key_verified",
+        "config_json_api_keys",
+        "exposed_credentials_comprehensive",
+        "api_keys_exposed_config"
+      ],
+      "fid_primary": "moonpay_api_key_leak",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey",
+      "http_status": 200,
+      "response_size": 2118
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "target_url": "https://link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://link.sandbox.x.immutable.com/config.json",
+      "severity": "high",
+      "finding_ids": [
+        "sandbox_config_exposure"
+      ],
+      "fid_primary": "sandbox_config_exposure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey",
+      "http_status": 200,
+      "response_size": 2164
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "target_url": "https://testnet.bitmex.com",
+      "vuln_type": "stored_xss",
+      "endpoint": "/api/v1/guild",
+      "severity": "high",
+      "finding_ids": [
+        "stored_xss_guild_socials",
+        "high_stored_xss_guild"
+      ],
+      "fid_primary": "stored_xss_guild_socials",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>, onerror=, alert(",
+      "http_status": 200,
+      "response_size": 36053
+    },
+    {
+      "domain": "app.ens.domains",
+      "target_url": "https://app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://delegate.ens.domains/assets/index-BETJNLwA.js",
+      "severity": "medium",
+      "finding_ids": [
+        "rainbow_api_key_exposed",
+        "thegraph_api_key_exposure",
+        "drpc_api_key_exposure",
+        "rainbow_api_key_exposure",
+        "tenderly_api_exposure",
+        "drpc_api_exposure",
+        "tenderly_critical",
+        "drpc_api"
+      ],
+      "fid_primary": "rainbow_api_key_exposed",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key, secret, password",
+      "http_status": 200,
+      "response_size": 1045491
+    },
+    {
+      "domain": "builder.immutable.com",
+      "target_url": "https://builder.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://builder.immutable.com/config.env.e7dce1d122c88dd6.js",
+      "severity": "medium",
+      "finding_ids": [
+        "exposed_api_keys",
+        "exposed_api_keys_config",
+        "exposed_credentials_config",
+        "sensitive_data_exposure_config"
+      ],
+      "fid_primary": "exposed_api_keys",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key",
+      "http_status": 200,
+      "response_size": 1438
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "Credential Enumeration",
+      "endpoint": "POST /authenticate/admin-auth",
+      "severity": "medium",
+      "finding_ids": [
+        "admin_cred_enum"
+      ],
+      "fid_primary": "admin_cred_enum",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: password",
+      "http_status": 200,
+      "response_size": 387305
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "xss",
+      "endpoint": "/authenticate/admin-auth",
+      "severity": "medium",
+      "finding_ids": [
+        "xss_reflection_admin_auth",
+        "xss_admin_auth",
+        "xss_reflection"
+      ],
+      "fid_primary": "xss_reflection_admin_auth",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <svg",
+      "http_status": 200,
+      "response_size": 387305
+    },
+    {
+      "domain": "crypto.com",
+      "target_url": "https://crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "crypto.com/nft/static/js/main.2e5ddba1.js",
+      "severity": "medium",
+      "finding_ids": [
+        "exposed_api_key",
+        "braze_api_key_exposed",
+        "braze_api_key_valid",
+        "multiple_api_keys_exposed"
+      ],
+      "fid_primary": "exposed_api_key",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key, secret, password",
+      "http_status": 200,
+      "response_size": 3186352
+    },
+    {
+      "domain": "crypto.com",
+      "target_url": "https://crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://crypto.com/nft/static/js/main.2e5ddba1.js",
+      "severity": "medium",
+      "finding_ids": [
+        "api_key_exposure"
+      ],
+      "fid_primary": "api_key_exposure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key, secret, password",
+      "http_status": 200,
+      "response_size": 3186352
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "target_url": "https://dashboard.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/config.json",
+      "severity": "medium",
+      "finding_ids": [
+        "config_exposure"
+      ],
+      "fid_primary": "config_exposure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey, password",
+      "http_status": 200,
+      "response_size": 10164
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "target_url": "https://link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://link.x.immutable.com/main.501a5fe8c3b69b03533b.js.map",
+      "severity": "medium",
+      "finding_ids": [
+        "source_map_exposure",
+        "ipstack_api_key_exposure"
+      ],
+      "fid_primary": "source_map_exposure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key, apikey, secret",
+      "http_status": 200,
+      "response_size": 12610837
+    },
+    {
+      "domain": "linktr.ee",
+      "target_url": "https://linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "Multiple",
+      "severity": "medium",
+      "finding_ids": [
+        "aws_disclosure"
+      ],
+      "fid_primary": "aws_disclosure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key",
+      "http_status": 200,
+      "response_size": 116388
+    },
+    {
+      "domain": "robinhood.com",
+      "target_url": "https://robinhood.com",
+      "vuln_type": "xss",
+      "endpoint": "https://share.robinhood.com",
+      "severity": "medium",
+      "finding_ids": [
+        "xss_share_robinhood"
+      ],
+      "fid_primary": "xss_share_robinhood",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <svg",
+      "http_status": 200,
+      "response_size": 7919
+    },
+    {
+      "domain": "robinhood.com",
+      "target_url": "https://robinhood.com",
+      "vuln_type": "xss",
+      "endpoint": "https://join.robinhood.com/out/",
+      "severity": "medium",
+      "finding_ids": [
+        "xss_reflection_join_robinhood",
+        "xss_redirect"
+      ],
+      "fid_primary": "xss_reflection_join_robinhood",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>, <svg",
+      "http_status": 200,
+      "response_size": 63662
+    },
+    {
+      "domain": "robinhood.com",
+      "target_url": "https://robinhood.com",
+      "vuln_type": "xss",
+      "endpoint": "join.robinhood.com/out/",
+      "severity": "medium",
+      "finding_ids": [
+        "xss_join_robinhood"
+      ],
+      "fid_primary": "xss_join_robinhood",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>, <svg",
+      "http_status": 200,
+      "response_size": 63662
+    },
+    {
+      "domain": "robinhood.com",
+      "target_url": "https://robinhood.com",
+      "vuln_type": "xss",
+      "endpoint": "https://share.robinhood.com/out",
+      "severity": "medium",
+      "finding_ids": [
+        "xss_via_redirect_share_robinhood"
+      ],
+      "fid_primary": "xss_via_redirect_share_robinhood",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>, <svg",
+      "http_status": 200,
+      "response_size": 63662
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "target_url": "https://testnet.bitmex.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/app/register, /app/login",
+      "severity": "medium",
+      "finding_ids": [
+        "SARDINE_SESSION_KEY"
+      ],
+      "fid_primary": "SARDINE_SESSION_KEY",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey",
+      "http_status": 200,
+      "response_size": 71661
+    },
+    {
+      "domain": "www.1debit.com",
+      "target_url": "https://www.1debit.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "github.com/1debit/sql_enum",
+      "severity": "medium",
+      "finding_ids": [
+        "github_exposed_credentials",
+        "sensitive_data_exposure",
+        "github_secrets_sql_enum",
+        "github_sql_enum_env_exposed",
+        "github_mysql_creds_detailed"
+      ],
+      "fid_primary": "github_exposed_credentials",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: secret",
+      "http_status": 200,
+      "response_size": 310356
+    },
+    {
+      "domain": "www.chime.com",
+      "target_url": "https://www.chime.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://app-qa.chime.com/login",
+      "severity": "medium",
+      "finding_ids": [
+        "exposed_api_key"
+      ],
+      "fid_primary": "exposed_api_key",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey, password",
+      "http_status": 200,
+      "response_size": 16256
+    },
+    {
+      "domain": "www.chimepayments.com",
+      "target_url": "https://www.chimepayments.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://developer.chime.com/",
+      "severity": "medium",
+      "finding_ids": [
+        "exposed_readme_api_key",
+        "readme_api_key_exposure"
+      ],
+      "fid_primary": "exposed_readme_api_key",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey, secret, password",
+      "http_status": 200,
+      "response_size": 142337
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/partner/..;/admin/",
+      "severity": "low",
+      "finding_ids": [
+        "info_disclosure_config"
+      ],
+      "fid_primary": "info_disclosure_config",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: password",
+      "http_status": 200,
+      "response_size": 387305
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "target_url": "https://checkout-api.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/config",
+      "severity": "low",
+      "finding_ids": [
+        "public_config"
+      ],
+      "fid_primary": "public_config",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey",
+      "http_status": 200,
+      "response_size": 9332
+    },
+    {
+      "domain": "docs.immutable.com",
+      "target_url": "https://docs.immutable.com",
+      "vuln_type": "xss",
+      "endpoint": "https://hub.immutable.com/login?returnTo=",
+      "severity": "low",
+      "finding_ids": [
+        "xss_reflection_returnto"
+      ],
+      "fid_primary": "xss_reflection_returnto",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "XSS indicators: <script>, <svg",
+      "http_status": 200,
+      "response_size": 102357
+    },
+    {
+      "domain": "hackerone.com",
+      "target_url": "https://hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.hackerone.com",
+      "severity": "low",
+      "finding_ids": [
+        "algolia_api_key"
+      ],
+      "fid_primary": "algolia_api_key",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey",
+      "http_status": 200,
+      "response_size": 9126
+    },
+    {
+      "domain": "hackerone.com",
+      "target_url": "https://hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://webclient.pullrequest.com/assets/index-c_T54myN.js",
+      "severity": "low",
+      "finding_ids": [
+        "datadog_api_key_exposure",
+        "segment_api_key_exposure",
+        "segment_api_data_injection",
+        "segment_api_unauthorized_access"
+      ],
+      "fid_primary": "datadog_api_key_exposure",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: api_key, secret, password",
+      "http_status": 200,
+      "response_size": 2235682
+    },
+    {
+      "domain": "www.1debit.com",
+      "target_url": "https://www.1debit.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "github.com/1debit/berater_rb",
+      "severity": "low",
+      "finding_ids": [
+        "codecov_token_leak"
+      ],
+      "fid_primary": "codecov_token_leak",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: secret",
+      "http_status": 200,
+      "response_size": 267482
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "False Positive - Credential Enumeration",
+      "endpoint": "POST /authenticate/admin-auth",
+      "severity": "info",
+      "finding_ids": [
+        "admin_cred_enum_false_positive"
+      ],
+      "fid_primary": "admin_cred_enum_false_positive",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: password",
+      "http_status": 200,
+      "response_size": 387305
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/authenticate/check-unique",
+      "severity": "info",
+      "finding_ids": [
+        "credential_enumeration_check_unique",
+        "username_enumeration",
+        "user_enumeration"
+      ],
+      "fid_primary": "credential_enumeration_check_unique",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: password",
+      "http_status": 200,
+      "response_size": 387305
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "cx-partner-prod.cellxpert.com/assets/index.js",
+      "severity": "info",
+      "finding_ids": [
+        "js_bundle_analysis"
+      ],
+      "fid_primary": "js_bundle_analysis",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: apikey, secret, password",
+      "http_status": 200,
+      "response_size": 3485006
+    },
+    {
+      "domain": "capital.com",
+      "target_url": "https://capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://cx-new-ui.cellxpert.com",
+      "severity": "info",
+      "finding_ids": [
+        "new_subdomain"
+      ],
+      "fid_primary": "new_subdomain",
+      "validation_status": "LIKELY_REAL",
+      "validation_detail": "Sensitive: password",
+      "http_status": 200,
+      "response_size": 34447
+    }
+  ],
+  "false_positives": [
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://frensday.ens.domains/admin",
+      "detail": "Static Next.js export"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://frensday.ens.domains/admin/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.titan.crypto.com/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "rce",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "k8s_service_account",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "k8s_cluster_access",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "rce",
+      "endpoint": "api.titan.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.titan.crypto.com/exchange/*/private/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "jwt_manipulation",
+      "endpoint": "api.titan.crypto.com/exchange/v1/private/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "deserialization",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "rce",
+      "endpoint": "api.titan.crypto.com/exchange/v1/actuator/jolokia",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "https://rh-demo-cdn.robinhood.com",
+      "detail": "Unreachable, no CNAME"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "rh-demo-cdn.robinhood.com",
+      "detail": "Unreachable, no CNAME"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v2/chains/{chainId}/notifications/devices/{deviceUuid}/safes/{safeAddress}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "POST /v2/register/notifications",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "multiple_idor",
+      "endpoint": "/v2/register/notifications",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "DELETE /v2/chains/{chainId}/notifications/devices/{deviceUuid}/safes/{safeAddress}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "DELETE /v2/chains/13371/notifications/devices/{deviceUuid}/safes/{safeAddress}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "stored_xss",
+      "endpoint": "/api/v1/chat (channels 2,4,5,6,7) and /api/v1/guild",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "stored_xss",
+      "endpoint": "/api/v1/chat (channels 2,4,5,6,7)",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "stored_xss",
+      "endpoint": "/api/v1/chat, /api/v1/guild",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "vulnerability_chain",
+      "endpoint": "/api/v1/chat + WebSocket",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "credential_exposure",
+      "endpoint": "/api/v1/user/getTemporaryToken + /app/register",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover",
+      "endpoint": "/api/v1/chat + api.segment.io",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover",
+      "endpoint": "/api/v1/chat + api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover",
+      "endpoint": "api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "credential_exposure",
+      "endpoint": "api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover",
+      "endpoint": "/api/v1/chat + api.segment.io/v1/alias",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover_chain",
+      "endpoint": "/api/v1/chat + api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://frensday.ens.domains/admin/tickets",
+      "detail": "Static Next.js export"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://mainnet.gateway.tenderly.co/4imxc4hQfRjxrVB2kWKvTo",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "Multiple",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://mainnet.gateway.tenderly.co/4imxc4hQfRjxrVB2kWKvTo AND https://lb.drpc.org/ethereum/AnmpasF2",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "Subdomain Takeover",
+      "endpoint": "ads.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/private/get-account-summary",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "ssrf",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/auth",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.titan.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://api.titan.crypto.com/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "ssti",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "ablink.new.crypto.com",
+      "detail": "DNS doesn't resolve"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.titan.crypto.com/exchange/v1/private/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "nosqli",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "mass_assignment",
+      "endpoint": "api.titan.crypto.com/exchange/v1/private/create-order",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "ssti",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "spel_injection",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "race_condition",
+      "endpoint": "api.titan.crypto.com/exchange/v1/private/create-order",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "prototype_pollution",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "header_injection",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "ssrf",
+      "endpoint": "api.titan.crypto.com/exchange/v1/webhook",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "race_condition",
+      "endpoint": "https://hackerone.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "ssrf",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "xxe",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "second_order_xss",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "nosql_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "stored_xss",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "deserialization",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "log4j_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "ldap_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "ssti",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "prototype_pollution",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "email_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "lfi",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "account_takeover",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "mass_assignment",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "Broken Access Control",
+      "endpoint": "https://pay-api.crypto.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "broken_access_control",
+      "endpoint": "https://pay-api.crypto.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.immutable.com/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v2/register/notifications",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/export/chains/{chainId}/{safeAddress}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/chains/{chainId}/about/backbone",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/chains/{chainId}/about/backbone/",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "POST /v1/export/chains/{chainId}/{safeAddress}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/api/v1/about/ on transaction.safe.immutable.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "credential_exposure",
+      "endpoint": "/healthcheck + api.segment.io",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "api_abuse",
+      "endpoint": "api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "api_key_exposure",
+      "endpoint": "api.segment.io",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "api_key_exposure",
+      "endpoint": "api.segment.io/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "cors",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "detail": "CORS safe: ACAO=none"
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "cors",
+      "endpoint": "/graphql",
+      "detail": "404"
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "api.immutable.com/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "api.immutable.com/v1/users/{address}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "api.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/config.json",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://gateway-arbitrum.network.thegraph.com/api/f601b4681b4fab88f07c3933fcbcc5b0",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.immutable.com/v1/mints, /v1/withdrawals, /v1/deposits",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "api.x.immutable.com/v1/assets, /v1/transfers",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "Subdomain Takeover",
+      "endpoint": "Multiple dev/staging subdomains",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "Multiple dev/staging subdomains",
+      "detail": "No CNAME, not claimable"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "nosqli",
+      "endpoint": "https://api.titan.crypto.com/exchange/v1/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "ssrf",
+      "endpoint": "api.titan.crypto.com/exchange/v1/public/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "idor",
+      "endpoint": "https://hackerone.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "idor",
+      "endpoint": "/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://mta-sts.forwarding.hackerone.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://api.x.immutable.com/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://api.moonpay.com/v3/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "csv_injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "race_condition",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "type_juggling",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "dos",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "injection",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://ingress.linktr.ee/uLZfGRmpj7",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://merchant.crypto.com/static/js/main.fb24c707.js",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "https://advertising.crypto.com",
+      "detail": "DNS doesn't resolve"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "waf_bypass",
+      "endpoint": "api.titan.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "api.titan.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.titan.crypto.com/api",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.titan.crypto.com/v2/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.titan.crypto.com/v2/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://fusionapi.tradepmr.com/users/{username}",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "dos",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "missing_controls",
+      "endpoint": "/v2/register/notifications",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/community/campaigns/",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "race_condition",
+      "endpoint": "POST /v2/register/notifications",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "csp_bypass",
+      "endpoint": "/ (all pages)",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "security_misconfiguration",
+      "endpoint": "/api/v1/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "www.1debit.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "github.com/1debit/sql_enum repository",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.chime.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "multiple",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info",
+      "endpoint": "https://frensday.ens.domains/admin/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "informational",
+      "endpoint": "Multiple dev/staging subdomains",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "api.rapyd.net",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://webclient.pullrequest.com/staging/assets/index-BKookVar.js",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "xss",
+      "endpoint": "/graphql user query",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "missing_controls",
+      "endpoint": "https://hackerone.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://pay-api.crypto.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.titan.crypto.com/api/v1/chat",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://ai-agent-api.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.titan.crypto.com/api",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "media-cdn.robinhood.com",
+      "detail": "Unreachable, no CNAME"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "upload-cdn.robinhood.com",
+      "detail": "Unreachable, no CNAME"
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "none",
+      "endpoint": "https://api.robinhood.com/user/",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/orders/cancel",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/leaderboard and /api/v1/trade",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/realtime (WebSocket)",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "api.x.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "api.x.immutable.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "api.x.immutable.com",
+      "vuln_type": "input_validation",
+      "endpoint": "https://api.x.immutable.com/v1/collections, /v1/assets, /v1/transfers, /v1/tokens",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "assessment",
+      "endpoint": "all",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://hackerone.com/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "informational",
+      "endpoint": "api.crypto.com/v2/public/*",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "waf_bypass_failed",
+      "endpoint": "api.titan.crypto.com",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "cache_poisoning",
+      "endpoint": "https://api.titan.crypto.com/v2/public/get-ticker",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "auth_bypass",
+      "endpoint": "/graphql",
+      "detail": "Endpoint returns 404"
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "info",
+      "endpoint": "/graphql",
+      "detail": "Endpoint returns 404"
+    }
+  ],
+  "needs_manual": [
+    {
+      "domain": "capital.com",
+      "vuln_type": "host_header_injection",
+      "endpoint": "/authenticate/admin-auth/request-password-reset",
+      "severity": "critical",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "jwt_algorithm_confusion",
+      "endpoint": "/authenticate",
+      "severity": "critical",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "jwt_kid_injection",
+      "endpoint": "/authenticate",
+      "severity": "critical",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "comprehensive",
+      "endpoint": "crypto.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (192357 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://rpc.cronos.org/",
+      "severity": "critical",
+      "detail": "RPC exists: Method not found",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://rpc.cronos.org/ and https://evm.cronos.org/",
+      "severity": "critical",
+      "detail": "RPC exists: Method not found",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "https://staging-cdn.robinhood.com",
+      "severity": "critical",
+      "detail": "CNAME=d2mke8jq2oeuoj.cloudfront.net., HTTP 403",
+      "http": 403
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "dos",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "critical",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "multiple_critical",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (606482 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "credential_exposure",
+      "endpoint": "/api/v1/user/getTemporaryToken",
+      "severity": "critical",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "multiple_critical_confirmed",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (605955 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "penetration_test_complete",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (606482 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "complete_assessment",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (605955 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "penetration_test_complete_verified",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (606482 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "/api/v1/user/getTemporaryToken",
+      "severity": "critical",
+      "detail": "200 (98 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "complete_penetration_test",
+      "endpoint": "testnet.bitmex.com",
+      "severity": "critical",
+      "detail": "HTTP 200 (605955 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "WebAuthn Passkey Bypass",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "critical",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "critical",
+      "detail": "200 (89 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "www.chimecard.com",
+      "vuln_type": "ssrf",
+      "endpoint": "https://app-dev1.chime.com/enroll/account and /enroll/webhook",
+      "severity": "critical",
+      "detail": "HTTP 200 (71874 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "api.rapyd.net",
+      "vuln_type": "ssrf",
+      "endpoint": "/v1/merchants-portal/webhooks",
+      "severity": "high",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "api.x.immutable.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.immutable.com/v1/collections",
+      "severity": "high",
+      "detail": "HTTP 200 (209486 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://lb.drpc.org/ogrpc",
+      "severity": "high",
+      "detail": "RPC exists: Your token is invalid or expired",
+      "http": 403
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://lb.drpc.org/ethereum/AnmpasF2C0JBqeAEzxVO8aT-H7vOim8R8IowqhnKxixj",
+      "severity": "high",
+      "detail": "RPC exists: []",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "SQL Injection",
+      "endpoint": "POST /v2/registeraffiliate/",
+      "severity": "high",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "sqli",
+      "endpoint": "/v2/registeraffiliate/",
+      "severity": "high",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "nosqli",
+      "endpoint": "/authenticate/admin-auth",
+      "severity": "high",
+      "detail": "HTTP 200 (387403 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/ and /partner/..;/administrator/",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/ and variants",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/, /partner/..;/administrator/, /partner/..;/v2/adminv2/",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/ and /partner/..;/v2/adminv2/",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/, /partner/..;/v2/adminv2/",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://googleauth.cellxpert.com/google/auth",
+      "severity": "high",
+      "detail": "HTTP 400",
+      "http": 400
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/admin/",
+      "severity": "high",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://googleauth.cellxpert.com/callback",
+      "severity": "high",
+      "detail": "HTTP 400",
+      "http": 400
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "ads.crypto.com",
+      "severity": "high",
+      "detail": "CNAME=secure.pageserve.co., HTTP 404",
+      "http": 404
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "help.rapyd.net",
+      "severity": "high",
+      "detail": "CNAME=d2se10qphirwr8.cloudfront.net., unreachable",
+      "http": null
+    },
+    {
+      "domain": "explorer.testnet.immutable.com",
+      "vuln_type": "sqli",
+      "endpoint": "/api/v2/search/quick",
+      "severity": "high",
+      "detail": "HTTP 400 (13 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "hub.immutable.com",
+      "vuln_type": "ssti",
+      "endpoint": "/login",
+      "severity": "high",
+      "detail": "HTTP 200 (102299 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "security_assessment",
+      "endpoint": "multiple",
+      "severity": "high",
+      "detail": "HTTP 200 (9782 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://evm-t3.cronos.org/",
+      "severity": "high",
+      "detail": "HTTP 405 (0 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Broken Authentication / Missing Auth Check on Password Reset",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "high",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Broken Authentication / Missing Auth Check on 2FA Setup",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "high",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Broken Authentication / 2FA Validation Without Auth",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "high",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "SSRF/Path Traversal via GraphQL",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "high",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Broken Authentication / Exit Emulation Without Auth",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "high",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://fusion.tradepmr.com/assets/index-ntuyGhrT.js",
+      "severity": "high",
+      "detail": "HTTP 200 (6194457 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://data-cdn.s3.amazonaws.com/",
+      "severity": "high",
+      "detail": "HTTP 200 (24467 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "data-cdn.s3.amazonaws.com",
+      "severity": "high",
+      "detail": "HTTP 200 (24467 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "dos",
+      "endpoint": "https://rpc.testnet.immutable.com",
+      "severity": "high",
+      "detail": "RPC exists: []",
+      "http": 200
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "transaction.safe.immutable.com/api/v1/safes/{safeAddress}",
+      "severity": "high",
+      "detail": "HTTP 422 (87 bytes)",
+      "http": 422
+    },
+    {
+      "domain": "safe.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "transaction.safe.immutable.com/api/v1/safes/{safeAddress}/incoming-transfers/",
+      "severity": "high",
+      "detail": "HTTP 422 (87 bytes)",
+      "http": 422
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "ssrf",
+      "endpoint": "/api/v1/guild",
+      "severity": "high",
+      "detail": "HTTP 200 (36050 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "ssrf",
+      "endpoint": "static.bitmex.com/fetch",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "credential_exposure",
+      "endpoint": "/healthcheck",
+      "severity": "high",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/api/v1/guild",
+      "severity": "high",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "account_takeover",
+      "endpoint": "/api/v1/chat",
+      "severity": "high",
+      "detail": "HTTP 200 (20210 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "api_abuse",
+      "endpoint": "api.segment.io/v1/alias",
+      "severity": "high",
+      "detail": "HTTP 400 (82 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/withdrawals",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/users/{address}",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/balances/{address}",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/users/{address}",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/transfers",
+      "severity": "high",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "api.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/merchants-portal/users/invite/resend-email-pending-user",
+      "severity": "medium",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "dos",
+      "endpoint": "https://api.thegraph.com/subgraphs/name/ensdomains/ens",
+      "severity": "medium",
+      "detail": "HTTP 405 (33 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "ssrf",
+      "endpoint": "https://ens-og-image.ens-cf.workers.dev/name/{input}",
+      "severity": "medium",
+      "detail": "HTTP 400 (12 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "ssrf",
+      "endpoint": "https://metadata.ens.domains/queryNFT?url=",
+      "severity": "medium",
+      "detail": "HTTP 503 (95 bytes)",
+      "http": 503
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://ens-app.pages.dev",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "ssrf",
+      "endpoint": "https://metadata.ens.domains/queryNFT",
+      "severity": "medium",
+      "detail": "HTTP 502 (1069 bytes)",
+      "http": 502
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "injection",
+      "endpoint": "https://ens-og-image.ens-cf.workers.dev/name/{input}",
+      "severity": "medium",
+      "detail": "HTTP 400 (12 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://discuss.ens.domains/latest.json",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://ens-app.pages.dev/",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://o1010257.ingest.sentry.io/api/5974691/store/",
+      "severity": "medium",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://delegate.ens.domains/admin, https://claim.ens.domains/admin, https://reclaim.ens.domains/adm",
+      "severity": "medium",
+      "detail": "200 (1918 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://primary.ens.domains/admin, https://sepolia.primary.ens.domains/admin",
+      "severity": "medium",
+      "detail": "200 (1982 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://discuss.ens.domains/latest.json",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "mass_assignment",
+      "endpoint": "/v2/registeraffiliate/",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "mass_assignment",
+      "endpoint": "POST /v2/registeraffiliate/",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "host_header_injection",
+      "endpoint": "/authenticate/request-password-reset",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "email_header_injection",
+      "endpoint": "/v2/verification/send-verification-code",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "cache_poisoning",
+      "endpoint": "/partner/",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "nosqli",
+      "endpoint": "/authenticate",
+      "severity": "medium",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/assets?user={address}",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/transfers",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/mints, /v1/withdrawals, /v1/deposits",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "https://api.immutable.com/v1/assets",
+      "severity": "medium",
+      "detail": "HTTP 200 (80959 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/balances/{address}",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "https://api.immutable.com/v1/transfers",
+      "severity": "medium",
+      "detail": "HTTP 200 (35884 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "https://api.immutable.com/v1/balances/{address}",
+      "severity": "medium",
+      "detail": "HTTP 200 (57 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/transfers?user={address}",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/transfers, /v1/assets, /v1/balances/{address}",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/transfers, /v1/assets, /v1/balances, /v1/users",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/withdrawals, /v1/deposits",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "checkout-preview.rapyd.net/config.json",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/assets/js/*.js.map",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "web_cache_deception",
+      "endpoint": "/config.json/*.js",
+      "severity": "medium",
+      "detail": "HTTP 200 (1262 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "dashboard.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "bo.rapyd.net",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain_name}/accounts/{account_address}/nfts",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain_name}/accounts/{account_address}/nfts and related endpoints",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/imtbl-zkevm-testnet/accounts/{address}/nfts",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain_name}/accounts/{account_address}/collections",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain_name}/nft-owners",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain_name}/collections/{contract_address}/owners",
+      "severity": "medium",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "potential_injection",
+      "endpoint": "/api/v2/proxy/3rdparty/noves-fi/transaction-descriptions",
+      "severity": "medium",
+      "detail": "HTTP 500 (23 bytes)",
+      "http": 500
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://app.pullrequest.com/api/v1/account",
+      "severity": "medium",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://eth-mainnet.g.alchemy.com/v2/eW-yJLiOZayxy1nHp0Y4cEqPiDyT7AXF",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "link.x.immutable.com",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://backstage.platform.linktr.ee/",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://assets.production.linktr.ee/",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://backstage.platform.linktr.ee/admin",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://backstage.platform.linktr.ee/api/auth/.well-known/jwks.json",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "sqli_filter",
+      "endpoint": "https://graph.linktr.ee/graphql",
+      "severity": "medium",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://evm.cronos.org",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://evm.cronos.org",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://explorer.cronos.org/block/[blockId]",
+      "severity": "medium",
+      "detail": "HTTP 500, check content",
+      "http": 500
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://evm.cronos.org and https://evm-t3.cronos.org",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://evm.cronos.org/ and https://evm-t3.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://evm.cronos.org/ and https://evm-t3.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405 (0 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://evm.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405 (0 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "race_condition",
+      "endpoint": "https://evm.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405 (0 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://evm.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://evm.cronos.org/",
+      "severity": "medium",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "sqli",
+      "endpoint": "https://explorer.cronos.org/api/search?q=",
+      "severity": "medium",
+      "detail": "HTTP 500 (35 bytes)",
+      "http": 500
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Information Disclosure - Internal API URL",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Rate Limiting Bypass via GraphQL Aliases",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Information Disclosure - Internal API URL with Path Traversal",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "Broken Authentication / Client Error Reporting Without Auth",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://rpc.testnet.chain.robinhood.com",
+      "severity": "medium",
+      "detail": "RPC exists: []",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "ssrf",
+      "endpoint": "https://graphql.tradepmr.com/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (406 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://share.robinhood.com/out",
+      "severity": "medium",
+      "detail": "Redirect to https://bnc.lt/m/Vz4K980LmA?_p=c71d29c39b057af2e21e90ffe9b5",
+      "http": 307
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "ssti",
+      "endpoint": "https://explorer.testnet.chain.robinhood.com/api/v2/search",
+      "severity": "medium",
+      "detail": "HTTP 400 (13 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://insight2.tradepmr.com/_hcms/mem/saml",
+      "severity": "medium",
+      "detail": "HTTP 200",
+      "http": 200
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/orders/listings",
+      "severity": "medium",
+      "detail": "200 (151560 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/orders/listings",
+      "severity": "medium",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/activities",
+      "severity": "medium",
+      "detail": "HTTP 200 (77530 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "ssti",
+      "endpoint": "/v1/chains/imtbl-zkevm-mainnet/orders/listings",
+      "severity": "medium",
+      "detail": "RPC exists: []",
+      "http": 404
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/chains/imtbl-zkevm-mainnet/orders/listings",
+      "severity": "medium",
+      "detail": "RPC exists: []",
+      "http": 404
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "security_misconfiguration",
+      "endpoint": "/",
+      "severity": "medium",
+      "detail": "HTTP 200 (606482 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "ssti",
+      "endpoint": "/api/v1/guild",
+      "severity": "medium",
+      "detail": "HTTP 200 (36050 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "api_abuse",
+      "endpoint": "/api/v1/user/getTemporaryToken",
+      "severity": "medium",
+      "detail": "HTTP 200 (98 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "sqli",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "medium",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "race_condition",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "medium",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "potential_integer_overflow",
+      "endpoint": "/v1/assets",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "api.immutable.com/v1/balances/{address}",
+      "severity": "medium",
+      "detail": "HTTP 200 (57 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "api.immutable.com/v1/assets",
+      "severity": "medium",
+      "detail": "HTTP 200 (80959 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "input_validation",
+      "endpoint": "/v1/assets and /v1/transfers",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/projects/imx",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "input_validation",
+      "endpoint": "/v1/assets, /v1/transfers, /v1/withdrawals, /v1/mints, /v1/tokens",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/mints",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "/v1/withdrawals/{id} and /v1/transfers/{id}",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "wallets.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "explorer.immutable.com/api/v1/graphql",
+      "severity": "medium",
+      "detail": "HTTP 400 (53 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "www.chime.com",
+      "vuln_type": "xss",
+      "endpoint": "https://app-qa.chime.com/event-router/v2/track",
+      "severity": "medium",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "www.chime.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://app-qa.chime.com/login",
+      "severity": "medium",
+      "detail": "200 (16250 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "www.chimepayments.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "m.chime.com",
+      "severity": "medium",
+      "detail": "CNAME=origin.us06.brz.ai., HTTP 404",
+      "http": 404
+    },
+    {
+      "domain": "api.rapyd.net",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/merchants-portal/users/login",
+      "severity": "low",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.thegraph.com/subgraphs/name/ensdomains/ens",
+      "severity": "low",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info",
+      "endpoint": "https://frensday.ens.domains/admin",
+      "severity": "low",
+      "detail": "HTTP 200 (9122 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://frensday.ens.domains/admin",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "access_control_bypass",
+      "endpoint": "/partner/..;/admin/",
+      "severity": "low",
+      "detail": "200 (387203 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "race_condition",
+      "endpoint": "/v2/registeraffiliate/",
+      "severity": "low",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/v1/transfers?page_size=-1",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "input_validation",
+      "endpoint": "/v1/transfers?page_size=-1",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "crypto.com",
+      "vuln_type": "informational",
+      "endpoint": "ai-agent-sdk-docs.crypto.com/~gitbook/mcp",
+      "severity": "low",
+      "detail": "HTTP 405 (83 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "docs.immutable.com",
+      "vuln_type": "idor",
+      "endpoint": "/v1/chains/{chain}/accounts/{address}/nfts",
+      "severity": "low",
+      "detail": "HTTP 200 (330129 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "/api/account/v2/siwe_message",
+      "severity": "low",
+      "detail": "HTTP 400 (13 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/api/v1/graphql",
+      "severity": "low",
+      "detail": "HTTP 400, check content",
+      "http": 400
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "/assets/envs.js",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://immutable-backups.s3.amazonaws.com/",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://webclient.pullrequest.com",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://hackerone.com/redirect",
+      "severity": "low",
+      "detail": "HTTP 500",
+      "http": 500
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://webclient.pullrequest.com/",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "hub.immutable.com",
+      "vuln_type": "oauth_validation",
+      "endpoint": "https://auth.immutable.com/authorize",
+      "severity": "low",
+      "detail": "HTTP 400 (3093 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "hub.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "/login",
+      "severity": "low",
+      "detail": "HTTP 200 (102299 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "hub.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "https://auth.immutable.com/authorize",
+      "severity": "low",
+      "detail": "HTTP 400 (3093 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "hub.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "/_next/static/chunks/*",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "sensitive_data_exposure",
+      "endpoint": "https://api.segment.io/v1/track",
+      "severity": "low",
+      "detail": "HTTP 400, check content",
+      "http": 400
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://eth-mainnet.g.alchemy.com/v2/eW-yJLiOZayxy1nHp0Y4cEqPiDyT7AXF",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "link.x.immutable.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://link.x.immutable.com/oauth/authorize",
+      "severity": "low",
+      "detail": "HTTP 200 (3607 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://graph.linktr.ee/graphql",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://argocd.platform.linktr.ee/, https://grafana.platform.linktr.ee/",
+      "severity": "low",
+      "detail": "HTTP 400, check content",
+      "http": 400
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://linktr.ee/api/graphql",
+      "severity": "low",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "linktr.ee",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://backstage.platform.linktr.ee/api/auth/.well-known/openid-configuration",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "denial_of_service",
+      "endpoint": "https://evm.cronos.org",
+      "severity": "low",
+      "detail": "HTTP 405 (0 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "ssti",
+      "endpoint": "https://explorer.cronos.org/address/{{payload}}",
+      "severity": "low",
+      "detail": "HTTP 500 (50411 bytes)",
+      "http": 500
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "broken_access_control",
+      "endpoint": "https://explorer.cronos.org/user and /user/apikeys",
+      "severity": "low",
+      "detail": "200 (61970 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://evm.cronos.org/ and https://evm-t3.cronos.org/",
+      "severity": "low",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "broken_access_control",
+      "endpoint": "https://explorer.cronos.org/user/apikeys",
+      "severity": "low",
+      "detail": "200 (65026 bytes), verify real data",
+      "http": 200
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://explorer.cronos.org/redirect",
+      "severity": "low",
+      "detail": "Redirect to https://explorer.cronos.org/404?url=%2Fredirect",
+      "http": 301
+    },
+    {
+      "domain": "pay.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://graph-v2.cronoslabs.com/subgraphs/name/vvs/farm-auto-harvest-testnet",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://explorer.testnet.chain.robinhood.com/api/v2/smart-contracts/verification/config",
+      "severity": "low",
+      "detail": "HTTP 200 (72404 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "none",
+      "endpoint": "https://explorer.testnet.chain.robinhood.com/api/v2/search",
+      "severity": "low",
+      "detail": "HTTP 400 (13 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://api.robinhood.com/instruments/",
+      "severity": "low",
+      "detail": "HTTP 200 (189966 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "open_redirect",
+      "endpoint": "https://share.robinhood.com/out?url=",
+      "severity": "low",
+      "detail": "Redirect to https://bnc.lt/m/Vz4K980LmA?url=&_p=c71d29c39b057af2e21e90ff",
+      "http": 307
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "none",
+      "endpoint": "https://share.robinhood.com/out?url=",
+      "severity": "low",
+      "detail": "HTTP 200 (63654 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "none",
+      "endpoint": "https://api.robinhood.com/password_reset/request/",
+      "severity": "low",
+      "detail": "HTTP 405 (40 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "robinhood.com",
+      "vuln_type": "subdomain_takeover",
+      "endpoint": "staging-cdn.robinhood.com",
+      "severity": "low",
+      "detail": "CNAME=d2mke8jq2oeuoj.cloudfront.net., HTTP 403",
+      "http": 403
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "auth_bypass",
+      "endpoint": "https://rpc.dev.immutable.com",
+      "severity": "low",
+      "detail": "RPC exists: []",
+      "http": 403
+    },
+    {
+      "domain": "rpc.immutable.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://api.immutable.com/v1/chains/imtbl-zkevm-mainnet/nft-owners",
+      "severity": "low",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "Information Disclosure (Low)",
+      "endpoint": "/api/v1/porl/snapshots",
+      "severity": "low",
+      "detail": "HTTP 500 (78 bytes)",
+      "http": 500
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "Information Disclosure",
+      "endpoint": "/api/v1/chat",
+      "severity": "low",
+      "detail": "HTTP 200 (20210 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/chat",
+      "severity": "low",
+      "detail": "HTTP 200 (20210 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/trade",
+      "severity": "low",
+      "detail": "HTTP 200 (17001 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/porl/snapshots",
+      "severity": "low",
+      "detail": "HTTP 500 (78 bytes)",
+      "http": 500
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/leaderboard",
+      "severity": "low",
+      "detail": "HTTP 200 (1673 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/realtime",
+      "severity": "low",
+      "detail": "HTTP 426 (0 bytes)",
+      "http": 426
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/",
+      "severity": "low",
+      "detail": "HTTP 200 (605955 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "bitlive.leagueoftraders.io",
+      "severity": "low",
+      "detail": "HTTP 200 (4877 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "parameter_pollution",
+      "endpoint": "/api/v1/trade",
+      "severity": "low",
+      "detail": "HTTP 200 (17001 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "parameter_pollution",
+      "endpoint": "/api/v1/instrument",
+      "severity": "low",
+      "detail": "HTTP 200 (138253 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/guild",
+      "severity": "low",
+      "detail": "HTTP 200 (36050 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "testnet.bitmex.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v1/user/getTemporaryToken",
+      "severity": "low",
+      "detail": "HTTP 200 (98 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "websiteverify.rapyd.net",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://checkout-preview.rapyd.net/config.json",
+      "severity": "low",
+      "detail": "HTTP 200 (1620 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "websiteverify.rapyd.net",
+      "vuln_type": "information_disclosure",
+      "endpoint": "https://checkout.rapyd.net/config.json",
+      "severity": "low",
+      "detail": "HTTP 200 (1568 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "www.chime.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://enrollment-web-app-assets.prod-ext.chmfin.com/_next/static/chunks/layout-20d933be7ca54e18.js",
+      "severity": "low",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "www.chime.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://app-qa.chime.com/enroll/api/fetchEnvVars",
+      "severity": "low",
+      "detail": "HTTP 405, check content",
+      "http": 405
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "SSRF",
+      "endpoint": "https://ens-og-image.ens-cf.workers.dev/name/{name}",
+      "severity": "info",
+      "detail": "HTTP 400 (12 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "app.ens.domains",
+      "vuln_type": "info",
+      "endpoint": "https://api.thegraph.com/subgraphs/name/ensdomains/ens",
+      "severity": "info",
+      "detail": "HTTP 405 (33 bytes)",
+      "http": 405
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "info",
+      "endpoint": "/v2/registeraffiliate/",
+      "severity": "info",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "testing_summary",
+      "endpoint": "multiple",
+      "severity": "info",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "testing_progress",
+      "endpoint": "multiple",
+      "severity": "info",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "testing_complete",
+      "endpoint": "multiple",
+      "severity": "info",
+      "detail": "HTTP 200 (387203 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "assessment",
+      "endpoint": "capital.com",
+      "severity": "info",
+      "detail": "HTTP 200 (387403 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "static.capital.com",
+      "severity": "info",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "test.capital.com",
+      "severity": "info",
+      "detail": "401 - auth required",
+      "http": 401
+    },
+    {
+      "domain": "capital.com",
+      "vuln_type": "potential_cmdi",
+      "endpoint": "https://cx-new-ui.cellxpert.com/api/",
+      "severity": "info",
+      "detail": "HTTP 200 (18 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "checkout-api.immutable.com",
+      "vuln_type": "none_found",
+      "endpoint": "all",
+      "severity": "info",
+      "detail": "403 - may be auth or WAF",
+      "http": 403
+    },
+    {
+      "domain": "explorer.immutable.com",
+      "vuln_type": "info",
+      "endpoint": "/api/v2/search",
+      "severity": "info",
+      "detail": "HTTP 400 (13 bytes)",
+      "http": 400
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://hackerone.com/metrics",
+      "severity": "info",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://hackerone.com",
+      "severity": "info",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://hackerone.com/redirect",
+      "severity": "info",
+      "detail": "HTTP 500, check content",
+      "http": 500
+    },
+    {
+      "domain": "hackerone.com",
+      "vuln_type": "xss",
+      "endpoint": "https://hackerone.com/redirect",
+      "severity": "info",
+      "detail": "HTTP 500, no XSS indicators",
+      "http": 500
+    },
+    {
+      "domain": "merchant.crypto.com",
+      "vuln_type": "info_disclosure",
+      "endpoint": "https://status.crypto.com/api/v2/",
+      "severity": "info",
+      "detail": "HTTP 200, check content",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "info",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "info",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "Information Disclosure",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "info",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "Security Misconfiguration",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "info",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "Hardening Measure",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "info",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "Potential Information Disclosure",
+      "endpoint": "https://api.vault.chiatest.net/graphql",
+      "severity": "info",
+      "detail": "HTTP 200 (89 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "vault.chiatest.net",
+      "vuln_type": "assessment",
+      "endpoint": "vault.chiatest.net",
+      "severity": "info",
+      "detail": "HTTP 200 (17645 bytes)",
+      "http": 200
+    },
+    {
+      "domain": "www.zendesk.com",
+      "vuln_type": "FALSE_POSITIVE",
+      "endpoint": "https://partner.zendesk.com/default.aspx",
+      "severity": "info",
+      "detail": "HTTP 200 (94272 bytes)",
+      "http": 200
+    }
+  ]
+}

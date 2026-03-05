@@ -116,6 +116,10 @@ class PentestState(TypedDict, total=False):
     # Turn number of last Opus call (for periodic review scheduling)
     last_opus_turn: int
 
+    # ── Tool Diversity Tracking ──────────────────────────────────────
+    # Last N tool names called (ring buffer, max 20)
+    recent_tool_names: list[str]
+
     # ── Internal (not for brain consumption) ────────────────────────
     # Pending tool calls from brain_node → tool_executor_node
     _pending_tool_calls: list[Any]

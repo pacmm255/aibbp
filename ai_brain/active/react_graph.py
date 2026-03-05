@@ -490,6 +490,16 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         }
         untested = sorted(all_categories - tested_categories)
 
+        # Count duplicate findings (same vuln_type+endpoint)
+        seen_dedup = set()
+        dup_count = 0
+        for _fid, fdata in findings.items():
+            if isinstance(fdata, dict):
+                dk = (fdata.get("vuln_type", ""), fdata.get("endpoint", ""))
+                if dk in seen_dedup:
+                    dup_count += 1
+                seen_dedup.add(dk)
+
         # Get chain suggestions
         chain_suggestions = []
         try:
@@ -504,7 +514,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         checkpoint_parts = [
             f"\n\nSTRATEGY CHECKPOINT (Turn {turn_count}):",
             f"- Tested: {len(tested)} techniques on {len(endpoints)} endpoints",
-            f"- Findings: {len(findings)}",
+            f"- Findings: {len(findings)} ({dup_count} duplicates)",
             f"- No-progress streak: {no_prog} turns",
         ]
         if untested:
@@ -517,6 +527,85 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             checkpoint_parts.append(
                 "\n⚠ You are STALLED. Try a completely different technique or endpoint."
             )
+
+        # ── Deep recon directives after high turn counts ──
+        if turn_count >= 100 and turn_count % 50 < 5:
+            checkpoint_parts.append(
+                "\n🔄 DEEP RECON RESET — You've been testing for 100+ turns. "
+                "STOP exploiting known endpoints. Do ALL of these:\n"
+                "1. enumerate_subdomains — find NEW subdomains you haven't seen\n"
+                "2. crawl_target with depth 3+ on any new subdomain\n"
+                "3. Fetch /.well-known/openapi.json, /swagger.json, /api-docs on each host\n"
+                "4. Download main JS bundles and grep for API keys, internal URLs, secrets\n"
+                "5. Check /robots.txt, /sitemap.xml for hidden paths\n"
+                "6. Try API version prefixes: /v2/, /v3/, /internal/, /admin/, /graphql\n"
+                "7. Test any new endpoints found with fresh techniques\n"
+                "DO NOT repeat any vulnerability test you've already run."
+            )
+        elif turn_count >= 50 and turn_count % 25 == 0:
+            # Lighter creative nudge every 25 turns after 50
+            checkpoint_parts.append(
+                "\n💡 CREATIVITY NUDGE — Try techniques you haven't used:\n"
+                "- GraphQL introspection (__schema, __type)\n"
+                "- WebSocket endpoints (wss://)\n"
+                "- HTTP request smuggling (CL.TE / TE.CL)\n"
+                "- Cache poisoning via Host/X-Forwarded-Host\n"
+                "- Race conditions (concurrent requests to same endpoint)\n"
+                "- Second-order injection (store in one place, trigger in another)\n"
+                "- Password reset Host header poisoning\n"
+                "Pick something NEW. Do NOT repeat tested techniques."
+            )
+
+        # ── Duplicate warning ──
+        if dup_count > 3:
+            checkpoint_parts.append(
+                f"\n⚠ WARNING: {dup_count} DUPLICATE findings detected! "
+                "You are re-finding the same vulnerabilities. "
+                "Switch to a COMPLETELY different endpoint or vulnerability class."
+            )
+
+        # ── Tool diversity enforcement ──
+        # Detect overuse of run_custom_exploit/send_http_request
+        recent_tools = state.get("recent_tool_names", [])
+        if len(recent_tools) >= 6:
+            last_6 = recent_tools[-6:]
+            _exploit_tools = {"run_custom_exploit", "send_http_request"}
+            exploit_count = sum(1 for t in last_6 if t in _exploit_tools)
+            if exploit_count >= 4:
+                # Agent is stuck in script-writing loop
+                checkpoint_parts.append(
+                    "\n🚫 TOOL DIVERSITY ALERT: You used run_custom_exploit/send_http_request "
+                    f"{exploit_count}/6 of your last calls. STOP writing custom scripts. "
+                    "You MUST use SPECIALIZED tools instead:\n"
+                    "- crawl_target — discover new pages and endpoints\n"
+                    "- systematic_fuzz — find hidden dirs/files/params\n"
+                    "- test_sqli / blind_sqli_extract — SQL injection testing\n"
+                    "- test_xss — XSS testing with Dalfox\n"
+                    "- test_ssrf — SSRF testing\n"
+                    "- test_cmdi — command injection\n"
+                    "- test_auth_bypass — authentication bypass\n"
+                    "- test_idor — IDOR testing\n"
+                    "- test_jwt — JWT attacks\n"
+                    "- response_diff_analyze — parameter behavior analysis\n"
+                    "- enumerate_subdomains — find new subdomains\n"
+                    "- run_content_discovery — discover hidden content\n"
+                    "These tools are MORE EFFECTIVE than custom scripts. "
+                    "Your next call MUST be one of these specialized tools."
+                )
+                if _LIVE:
+                    print(f"  {_RED}🚫 Tool diversity alert: {exploit_count}/6 exploit tools{_RESET}")
+
+        # ── Generic tool usage diversity check ──
+        if len(recent_tools) >= 10:
+            from collections import Counter as _Counter
+            tool_counts = _Counter(recent_tools[-10:])
+            most_common_tool, most_common_count = tool_counts.most_common(1)[0]
+            if most_common_count >= 7:
+                checkpoint_parts.append(
+                    f"\n⚠ MONOTONY WARNING: You called '{most_common_tool}' "
+                    f"{most_common_count}/10 times. Diversify! Try a different tool."
+                )
+
         checkpoint_parts.append(
             "\nPick ONE action and execute it NOW. Output the JSON tool call."
         )
@@ -962,10 +1051,45 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     failure_count = 0
     had_progress = False
 
+    # ── Pre-compute consecutive exploit tool count for hard blocking ──
+    recent_tools = list(state.get("recent_tool_names", []))
+    _EXPLOIT_TOOLS = {"run_custom_exploit", "send_http_request"}
+    _consec_exploit = 0
+    for _rt in reversed(recent_tools):
+        if _rt in _EXPLOIT_TOOLS:
+            _consec_exploit += 1
+        else:
+            break
+
     for tc in tool_calls:
         tool_name = tc.name
         tool_input = tc.input if hasattr(tc, "input") else {}
         tool_id = tc.id if hasattr(tc, "id") else "unknown"
+
+        # ── Hard block: reject run_custom_exploit/send_http_request if called 5+ times in a row ──
+        if tool_name in _EXPLOIT_TOOLS and _consec_exploit >= 5:
+            _block_msg = (
+                f"BLOCKED: {tool_name} rejected — you have used exploit/HTTP tools "
+                f"{_consec_exploit} times in a row. You MUST use a specialized tool. "
+                "Choose one: crawl_target, systematic_fuzz, test_sqli, test_xss, "
+                "test_ssrf, test_cmdi, test_auth_bypass, test_idor, test_jwt, "
+                "response_diff_analyze, enumerate_subdomains, run_content_discovery. "
+                "These are purpose-built and more effective than custom scripts."
+            )
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": json.dumps({"error": _block_msg}),
+            })
+            failure_count += 1
+            logger.warning("tool_diversity_blocked", tool=tool_name, consec=_consec_exploit)
+            if _LIVE:
+                print(f"  {_RED}🚫 BLOCKED {tool_name} — {_consec_exploit} consecutive exploit calls{_RESET}")
+            continue
+        elif tool_name in _EXPLOIT_TOOLS:
+            _consec_exploit += 1
+        else:
+            _consec_exploit = 0
 
         # Build a technique key for dedup tracking
         technique_key = _build_technique_key(tool_name, tool_input)
@@ -1159,6 +1283,14 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     else:
         result["no_progress_count"] = 0
 
+    # ── Tool diversity tracking ──────────────────────────────────
+    called_tool_names = [tc.name for tc in tool_calls]
+    prev_recent = list(state.get("recent_tool_names", []))
+    prev_recent.extend(called_tool_names)
+    result["recent_tool_names"] = prev_recent[-20:]  # Ring buffer of last 20
+    logger.info("tool_diversity_tracking", recent=result["recent_tool_names"][-6:],
+                consec_exploit=_consec_exploit)
+
     # Same-result detection via hash
     result_hash = str(hash(json.dumps(tool_results, default=str, sort_keys=True)))
     prev_hashes = list(state.get("last_result_hashes", []))
@@ -1196,12 +1328,11 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
             result["no_progress_count"] = 0
             result["consecutive_failures"] = 0
             tested_count = len(state.get("tested_techniques", {}))
-            reset_msg = {
-                "role": "user",
-                "content": (
-                    f"STRATEGY RESET: {no_progress} turns with no progress. "
-                    f"You have {tested_count} techniques already tested — DO NOT REPEAT THEM. "
-                    "Pick something COMPLETELY NEW from this list:\n"
+            # Count how many resets have happened (infer from turn count)
+            _reset_round = (no_progress // no_progress_limit) + 1
+            # Rotate through different strategy sets to avoid repetition
+            _strategy_sets = [
+                (  # Set 1: Account & auth surface
                     "1. Create accounts and test authenticated surfaces\n"
                     "2. Download and grep JS bundles for secrets/API keys/internal URLs\n"
                     "3. Test business logic: race conditions, negative values, step-skipping\n"
@@ -1211,7 +1342,41 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                     "7. OAuth/SSO redirect manipulation\n"
                     "8. Second-order attacks: store payload via one endpoint, trigger via another\n"
                     "9. Cache poisoning via Host/X-Forwarded-Host headers\n"
-                    "10. Email-based: password reset Host header poisoning\n"
+                    "10. Email-based: password reset Host header poisoning"
+                ),
+                (  # Set 2: Deep recon & infrastructure
+                    "1. enumerate_subdomains — find NEW subdomains\n"
+                    "2. Crawl all discovered subdomains at depth=3+\n"
+                    "3. Check /.git/HEAD, /.env, /backup.zip, /db.sql on each host\n"
+                    "4. GraphQL introspection: POST {\"query\":\"{__schema{types{name,fields{name}}}}\"}\n"
+                    "5. S3 bucket enumeration from JS bundles\n"
+                    "6. DNS zone transfer attempt (AXFR)\n"
+                    "7. Test CORS on every API endpoint (Origin: null, Origin: attacker.com)\n"
+                    "8. Check /actuator/*, /debug/*, /metrics, /_debug, /server-status\n"
+                    "9. HTTP request smuggling (CL.TE and TE.CL on every host)\n"
+                    "10. Mass parameter discovery with systematic_fuzz (params wordlist)"
+                ),
+                (  # Set 3: Advanced exploitation
+                    "1. Blind SSRF via webhook/callback URL parameters\n"
+                    "2. SSTI: test {{7*7}} and ${7*7} in every input field\n"
+                    "3. XXE: test XML payloads on any endpoint accepting XML/SOAP\n"
+                    "4. Prototype pollution in JSON APIs: {\"__proto__\":{\"admin\":true}}\n"
+                    "5. JWT none algorithm bypass on any JWT-protected endpoint\n"
+                    "6. Path traversal: ../../etc/passwd in every file/path parameter\n"
+                    "7. Open redirect on login/callback/return URLs\n"
+                    "8. CRLF injection in headers (%0d%0a in URLs/params)\n"
+                    "9. Test all forms with NoSQL injection: {\"$gt\":\"\"}\n"
+                    "10. Race condition: 50 concurrent requests to state-changing endpoints"
+                ),
+            ]
+            _strategy_text = _strategy_sets[(_reset_round - 1) % len(_strategy_sets)]
+            reset_msg = {
+                "role": "user",
+                "content": (
+                    f"STRATEGY RESET #{_reset_round}: {no_progress} turns with no progress. "
+                    f"You have {tested_count} techniques already tested — DO NOT REPEAT THEM. "
+                    "Pick something COMPLETELY NEW from this list:\n"
+                    f"{_strategy_text}\n"
                     "DO NOT go back to what you were doing. Pick a number above and execute it."
                 ),
             }
@@ -1270,7 +1435,47 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
         for key, value in state_updates.items():
             if key in ("endpoints", "findings", "hypotheses", "accounts"):
                 existing = dict(state.get(key, {}))
-                existing.update(value)
+                # ── Finding deduplication at merge time ──
+                if key == "findings":
+                    # Build dedup index of existing findings: (vuln_type, endpoint) → fid
+                    existing_dedup: dict[tuple[str, str], str] = {}
+                    for efid, edata in existing.items():
+                        if isinstance(edata, dict):
+                            dk = (
+                                edata.get("vuln_type", "").lower(),
+                                edata.get("endpoint", "").lower(),
+                            )
+                            existing_dedup[dk] = efid
+                    # Filter out duplicates from new findings
+                    deduped_value = {}
+                    for fid, fdata in value.items():
+                        if fid in existing:
+                            # Same key — update is OK (enriching existing finding)
+                            deduped_value[fid] = fdata
+                            continue
+                        if isinstance(fdata, dict):
+                            dk = (
+                                fdata.get("vuln_type", "").lower(),
+                                fdata.get("endpoint", "").lower(),
+                            )
+                            if dk in existing_dedup:
+                                logger.info(
+                                    "finding_deduped",
+                                    new_id=fid,
+                                    existing_id=existing_dedup[dk],
+                                    vuln_type=dk[0],
+                                    endpoint=dk[1],
+                                )
+                                if _LIVE:
+                                    print(
+                                        f"  {_YELLOW}⊘ Deduped finding: {fid} "
+                                        f"(same {dk[0]} on {dk[1]}){_RESET}"
+                                    )
+                                continue  # Skip duplicate
+                        deduped_value[fid] = fdata
+                    existing.update(deduped_value)
+                else:
+                    existing.update(value)
                 result[key] = existing
             elif key == "tech_stack":
                 existing = list(state.get("tech_stack", []))
@@ -1310,12 +1515,46 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
             pass
 
     # ── Live display: new findings ──
+    newly_added_ids: list[str] = []
     if _LIVE and state_updates:
         new_f = state_updates.get("findings", {})
         existing_f = state.get("findings", {})
         for fid, fdata in new_f.items():
             if fid not in existing_f:
                 _print_finding(fid, fdata)
+                newly_added_ids.append(fid)
+
+    # ── Self-validation: inject re-verification directive for new findings ──
+    # When new unconfirmed findings are added, inject a message requiring
+    # the agent to re-test the finding 2-3 times before trusting it.
+    if newly_added_ids and state_updates.get("findings"):
+        unconfirmed_new = []
+        for fid in newly_added_ids:
+            fdata = state_updates["findings"].get(fid, {})
+            if isinstance(fdata, dict) and not fdata.get("confirmed"):
+                unconfirmed_new.append(
+                    f"  - {fid}: {fdata.get('vuln_type', '?')} on {fdata.get('endpoint', '?')}"
+                )
+        if unconfirmed_new:
+            verify_msg = {
+                "role": "user",
+                "content": (
+                    "🔍 SELF-VALIDATION REQUIRED — You just saved new finding(s):\n"
+                    + "\n".join(unconfirmed_new[:5])
+                    + "\n\nBEFORE moving on, you MUST re-verify each finding:\n"
+                    "1. Send the EXACT same request again and confirm you get the same result\n"
+                    "2. Vary the payload slightly — does a benign version also trigger? (→ false positive)\n"
+                    "3. Check if the response is a generic error page or actual exploitation evidence\n"
+                    "If ANY finding fails re-verification, update_knowledge to remove it. "
+                    "Only keep findings with SOLID proof of exploitability."
+                ),
+            }
+            result["messages"] = result.get("messages", []) + [verify_msg]
+            if _LIVE:
+                print(
+                    f"  {_MAGENTA}🔍 Self-validation injected for "
+                    f"{len(unconfirmed_new)} new finding(s){_RESET}"
+                )
 
     # ── Push new findings to DB ──
     if state_updates and state_updates.get("findings"):

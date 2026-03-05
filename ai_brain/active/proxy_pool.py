@@ -27,15 +27,25 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 import structlog
 
 logger = structlog.get_logger("proxy_pool")
+
+# ── Shared proxy cache (cross-process) ──────────────────────────────
+_PROXY_CACHE_DIR = Path.home() / ".aibbp" / "proxy_cache"
+_PROXY_CACHE_FILE = _PROXY_CACHE_DIR / "validated_proxies.json"
+_PROXY_CACHE_LOCK = _PROXY_CACHE_DIR / ".lock"
+_PROXY_CACHE_MAX_AGE = 300  # 5 minutes — proxies older than this are re-validated
 
 # ── Proxy sources (HTTP GET only — NO port scanning) ─────────────────
 
@@ -198,6 +208,77 @@ class ProxyPool:
         self._candidate_queue: list[ProxyEntry] = []
         self._closed = False
 
+    # ── Shared proxy cache (cross-process) ────────────────────────
+
+    def _load_cached_proxies(self) -> list[ProxyEntry]:
+        """Load validated proxies from shared disk cache.
+
+        Returns proxies that were validated less than _PROXY_CACHE_MAX_AGE ago.
+        Uses file locking for safe concurrent access from multiple agents.
+        """
+        try:
+            _PROXY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            if not _PROXY_CACHE_FILE.exists():
+                return []
+            with open(_PROXY_CACHE_LOCK, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_SH)
+                try:
+                    data = json.loads(_PROXY_CACHE_FILE.read_text())
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+
+            now = time.time()
+            cached_at = data.get("cached_at", 0)
+            if now - cached_at > _PROXY_CACHE_MAX_AGE:
+                return []  # Cache too old
+
+            entries = []
+            for p in data.get("proxies", []):
+                entry = ProxyEntry(url=p["url"], protocol=p["protocol"])
+                entry.zai_token = p.get("zai_token")
+                entry.zai_user_id = p.get("zai_user_id")
+                entry.zai_cookies = p.get("zai_cookies", {})
+                entries.append(entry)
+            logger.info("proxy_cache_loaded", count=len(entries),
+                         age_s=int(now - cached_at))
+            return entries
+        except Exception as e:
+            logger.debug("proxy_cache_load_failed", error=str(e))
+            return []
+
+    def _save_cached_proxies(self) -> None:
+        """Save current validated proxies to shared disk cache.
+
+        Other agents starting up can immediately use these instead of
+        re-validating 100K+ proxies against Z.ai.
+        """
+        try:
+            _PROXY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            healthy = [p for p in self._proxies if p.is_healthy]
+            data = {
+                "cached_at": time.time(),
+                "count": len(healthy),
+                "proxies": [
+                    {
+                        "url": p.url,
+                        "protocol": p.protocol,
+                        "zai_token": p.zai_token,
+                        "zai_user_id": p.zai_user_id,
+                        "zai_cookies": p.zai_cookies,
+                    }
+                    for p in healthy
+                ],
+            }
+            with open(_PROXY_CACHE_LOCK, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    _PROXY_CACHE_FILE.write_text(json.dumps(data))
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+            logger.info("proxy_cache_saved", count=len(healthy))
+        except Exception as e:
+            logger.debug("proxy_cache_save_failed", error=str(e))
+
     # ── Proxy fetching ─────────────────────────────────────────────
 
     async def _fetch_from_source(self, source: dict[str, str]) -> list[tuple[str, str]]:
@@ -348,6 +429,11 @@ class ProxyPool:
     async def warm(self, min_proxies: int | None = None, max_proxies: int | None = None) -> None:
         """Fetch and validate proxies using interleaved pipeline.
 
+        1. Try shared disk cache first (instant startup if another agent validated recently)
+        2. Stagger Phase 2 validation with random delay to avoid thundering herd
+        3. Retry up to 3 times with exponential backoff instead of hard crash
+        4. Save validated proxies to cache for other agents
+
         Runs Phase 1 (CONNECT) in waves of ~10K, then immediately runs
         Phase 2 (HTTPS+Z.ai) on survivors. Stops as soon as min_proxies
         are validated. Remaining candidates go to background growth.
@@ -357,9 +443,75 @@ class ProxyPool:
         if max_proxies is not None:
             self.max_proxies = max_proxies
 
+        # ── Step 0: Try shared proxy cache first ──
+        cached = self._load_cached_proxies()
+        if len(cached) >= self.min_proxies:
+            async with self._lock:
+                existing_urls = {p.url for p in self._proxies}
+                for p in cached:
+                    if p.url not in existing_urls:
+                        self._proxies.append(p)
+                if len(self._proxies) > self.max_proxies:
+                    self._proxies = self._proxies[:self.max_proxies]
+            logger.info("proxy_pool_warmed_from_cache", **self.stats())
+            self._ensure_background_tasks()
+            return
+
+        # ── Step 1: Stagger Phase 2 to avoid thundering herd ──
+        # Random delay 0-10s prevents 29 agents from all hitting Z.ai at once
+        stagger_delay = random.uniform(0.5, 10.0)
+        logger.info("warm_stagger_delay", delay_s=round(stagger_delay, 1))
+        await asyncio.sleep(stagger_delay)
+
+        # ── Step 2: Validate with retries ──
+        max_retries = 3
+        for attempt in range(max_retries):
+            validated_total = await self._do_validate_proxies()
+
+            if validated_total or self._proxies:
+                break  # Got some proxies
+
+            if attempt < max_retries - 1:
+                # Before retrying, check cache again (another agent may have finished)
+                cached = self._load_cached_proxies()
+                if len(cached) >= self.min_proxies:
+                    async with self._lock:
+                        existing_urls = {p.url for p in self._proxies}
+                        for p in cached:
+                            if p.url not in existing_urls:
+                                self._proxies.append(p)
+                    logger.info("proxy_pool_warmed_from_cache_retry", **self.stats())
+                    self._ensure_background_tasks()
+                    return
+
+                backoff = (2 ** attempt) * 5 + random.uniform(0, 5)
+                logger.warning("warm_retry", attempt=attempt + 1, backoff_s=round(backoff, 1))
+                await asyncio.sleep(backoff)
+                self._tried_urls.clear()  # Reset tried URLs for retry
+
+        if not self._proxies:
+            raise RuntimeError(
+                "No proxies passed validation after 3 attempts. "
+                "Check network connectivity or try again later."
+            )
+
+        # Accept partial results — start with what we have, background growth will find more
+        if len(self._proxies) < self.min_proxies:
+            logger.warning("warm_partial_result",
+                           validated=len(self._proxies), target=self.min_proxies,
+                           msg="Starting with fewer proxies; background growth will find more")
+
+        logger.info("proxy_pool_warmed", **self.stats())
+
+        # ── Step 3: Save to cache for other agents ──
+        self._save_cached_proxies()
+        self._ensure_background_tasks()
+
+    async def _do_validate_proxies(self) -> list[ProxyEntry]:
+        """Core validation logic — extracted from warm() for retry support."""
         raw = await self._fetch_all()
         if not raw:
-            raise RuntimeError("No proxies fetched from any source")
+            return []
 
         # Skip already-in-pool and already-tried
         existing_urls = {p.url for p in self._proxies}
@@ -422,30 +574,17 @@ class ProxyPool:
                          validated=len(wave_validated), total_validated=len(validated_total),
                          target=target)
 
-        if not validated_total and not self._proxies:
-            raise RuntimeError(
-                f"No proxies passed validation (tried {total_p1_tested} candidates). "
-                "Check network connectivity or try again later."
-            )
+        if validated_total:
+            async with self._lock:
+                existing_urls = {p.url for p in self._proxies}
+                for proxy in validated_total:
+                    if proxy.url not in existing_urls:
+                        self._proxies.append(proxy)
+                self._proxies = [p for p in self._proxies if p.is_healthy]
+                if len(self._proxies) > self.max_proxies:
+                    self._proxies = self._proxies[:self.max_proxies]
 
-        # Accept partial results — start with what we have, background growth will find more
-        if len(validated_total) < target:
-            logger.warning("warm_partial_result",
-                           validated=len(validated_total), target=target,
-                           tested=total_p1_tested,
-                           msg="Starting with fewer proxies; background growth will find more")
-
-        async with self._lock:
-            existing_urls = {p.url for p in self._proxies}
-            for proxy in validated_total:
-                if proxy.url not in existing_urls:
-                    self._proxies.append(proxy)
-            self._proxies = [p for p in self._proxies if p.is_healthy]
-            if len(self._proxies) > self.max_proxies:
-                self._proxies = self._proxies[:self.max_proxies]
-
-        logger.info("proxy_pool_warmed", **self.stats())
-        self._ensure_background_tasks()
+        return validated_total
 
     def _ensure_background_tasks(self) -> None:
         """Start background tasks if not already running."""
@@ -459,7 +598,7 @@ class ProxyPool:
             self._growth_task = asyncio.create_task(self._background_growth())
 
     async def _background_refresh(self) -> None:
-        """Re-fetch proxy lists every 10 minutes."""
+        """Re-fetch proxy lists every 10 minutes and update shared cache."""
         while not self._closed:
             await asyncio.sleep(10 * 60)
             try:
@@ -470,6 +609,8 @@ class ProxyPool:
                 random.shuffle(new)
                 self._candidate_queue.extend(new)
                 logger.info("candidates_refreshed", new_candidates=len(new))
+                # Update shared cache
+                self._save_cached_proxies()
             except Exception as e:
                 logger.warning("proxy_refresh_failed", error=str(e))
 
@@ -598,6 +739,10 @@ class ProxyPool:
                         logger.info("candidate_queue_refilled", count=len(new))
                     except Exception:
                         pass
+
+                # Save to shared cache periodically (every ~60s of bg growth)
+                if added > 0:
+                    self._save_cached_proxies()
 
             except Exception as e:
                 logger.warning("bg_growth_error", error=str(e))
