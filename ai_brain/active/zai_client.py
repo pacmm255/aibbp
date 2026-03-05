@@ -10,6 +10,7 @@ works without modification.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -27,6 +28,13 @@ logger = structlog.get_logger("zai_client")
 # ── HMAC signing key (extracted from Open WebUI JS bundle) ──────────────
 _HMAC_SECRET_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 _BUCKET_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
+
+# ── Global rate limiter (shared across all ZaiClient instances) ─────────
+# Z.ai CDN blocks IPs with concurrent streams. Use a global semaphore to
+# ensure at most 1 concurrent Z.ai API call, plus minimum interval between calls.
+_ZAI_SEMAPHORE = asyncio.Semaphore(1)
+_ZAI_LAST_CALL_TIME: float = 0.0
+_ZAI_MIN_INTERVAL: float = 8.0  # seconds between calls (safe: ~7.5 calls/min)
 
 
 # ── Mock Anthropic-compatible response objects ──────────────────────────
@@ -81,6 +89,15 @@ _TOOL_CALL_PATTERN = re.compile(
 # GLM-5 sometimes mimics the history format: [Called tool: name({...})]
 _CALLED_TOOL_PATTERN = re.compile(
     r'\[Called tool:\s*(\w+)\((\{.*?\})\)\]',
+    re.DOTALL,
+)
+
+# GLM-5 mimics multi-line history format:
+# [Called tool: name]
+# Arguments: {...}
+# [End tool call]   (end tag optional)
+_CALLED_TOOL_MULTILINE_PATTERN = re.compile(
+    r'\[Called tool:\s*(\w+)\]\s*\n\s*Arguments:\s*(\{.*?\})\s*(?:\n\s*\[End tool call\])?',
     re.DOTALL,
 )
 
@@ -229,7 +246,7 @@ def _extract_tool_calls(text: str) -> tuple[str, list[ZaiToolUseBlock]]:
             except json.JSONDecodeError:
                 continue
 
-    # Format 2b: [Called tool: name({...})] — GLM-5 mimics history format
+    # Format 2b: [Called tool: name({...})] — GLM-5 mimics history format (inline)
     if not tool_calls:
         for match in _CALLED_TOOL_PATTERN.finditer(text):
             tool_name = match.group(1)
@@ -243,6 +260,30 @@ def _extract_tool_calls(text: str) -> tuple[str, list[ZaiToolUseBlock]]:
                 lines_to_remove.append(match.group(0))
             except json.JSONDecodeError:
                 continue
+
+    # Format 2b2: [Called tool: name]\nArguments: {...}\n[End tool call] — GLM-5 multiline history format
+    if not tool_calls:
+        for match in _CALLED_TOOL_MULTILINE_PATTERN.finditer(text):
+            tool_name = match.group(1)
+            try:
+                args = json.loads(match.group(2))
+                tool_calls.append(ZaiToolUseBlock(
+                    id=f"toolu_{uuid.uuid4().hex[:24]}",
+                    name=tool_name,
+                    input=args if isinstance(args, dict) else {},
+                ))
+                lines_to_remove.append(match.group(0))
+            except json.JSONDecodeError:
+                # Try brace-balanced extraction for nested JSON
+                raw = match.group(2)
+                parsed = _try_parse_tool_json(raw)
+                if parsed:
+                    tool_calls.append(ZaiToolUseBlock(
+                        id=f"toolu_{uuid.uuid4().hex[:24]}",
+                        name=tool_name,
+                        input=parsed.get("input", parsed) if "name" in parsed else parsed,
+                    ))
+                    lines_to_remove.append(match.group(0))
 
     # Format 2c: <executed tool="name" args={...} /> — GLM-5 mimics history XML format
     # Uses brace-balanced extraction since args contain nested JSON
@@ -369,12 +410,14 @@ class ZaiClient:
         config: Any,
         model: str = "glm-5",
         enable_thinking: bool = True,
+        proxy_pool: Any | None = None,
     ):
         self.budget = budget
         self.config = config
         self.model = model
         self.enable_thinking = enable_thinking
         self.demo_mode = False
+        self.proxy_pool = proxy_pool  # Optional ProxyPool for rate limit bypass
 
         # Session state — primary + backup tokens for resilience
         self._token: str | None = None
@@ -515,10 +558,12 @@ class ZaiClient:
             "",
             "RULES:",
             "1. The JSON MUST be on its own line — NOT inside ``` code blocks.",
-            "2. Write reasoning BEFORE the JSON. The JSON must be LAST.",
-            "3. Do NOT describe what you would do — OUTPUT THE ACTUAL JSON.",
+            "2. Write reasoning BEFORE the JSON. The JSON must be the LAST thing you output.",
+            "3. Do NOT just describe what you would do — you MUST OUTPUT THE ACTUAL JSON.",
             "4. Use double quotes for all strings. No trailing commas.",
             "5. For multiple tools, output multiple JSON lines.",
+            "6. EVERY response MUST end with a JSON tool call. If you respond without one, you FAIL.",
+            "7. After receiving tool results, analyze them briefly then IMMEDIATELY output the next tool call JSON.",
             "</tool_calling_instructions>",
             "",
             "<available_tools>",
@@ -618,6 +663,21 @@ class ZaiClient:
                     # Map tool_result role to user (GLM-5 uses user/assistant/system)
                     glm_role = "user" if role == "tool" else role
                     converted.append({"role": glm_role, "content": "\n".join(parts)})
+
+        # Append tool-call reminder to the LAST user message containing tool results
+        # GLM-5 almost never outputs JSON tool calls on first attempt without this nudge.
+        # This reminder right before generation cuts retry rate from ~95% to near 0%.
+        _TOOL_CALL_NUDGE = (
+            '\n\nIMPORTANT: Analyze the result above, then output your next action as a JSON object '
+            'on its own line. Example:\n'
+            '{"name": "send_http_request", "input": {"url": "https://TARGET/path", "method": "GET"}}'
+        )
+        for i in range(len(converted) - 1, -1, -1):
+            c = converted[i].get("content", "")
+            if isinstance(c, str) and "--- TOOL RESULT ---" in c:
+                converted[i] = dict(converted[i])
+                converted[i]["content"] = c + _TOOL_CALL_NUDGE
+                break
 
         # Merge consecutive same-role messages
         merged = []
@@ -779,6 +839,25 @@ class ZaiClient:
         logger.info("zai_calling", model=self.model, msg_count=len(glm_messages),
                      est_input_tokens=estimated_input_tokens)
 
+        # ── Proxy pool path: route through rotating proxies ──
+        if self.proxy_pool:
+            return await self._call_via_proxy_pool(
+                url=url, query_params=query_params, headers=headers,
+                body=body, prompt_text=prompt_text,
+                estimated_input_tokens=estimated_input_tokens,
+                phase=phase, target=target, tools=tools,
+            )
+
+        # ── Global rate limiter: enforce single-concurrency + min interval ──
+        global _ZAI_LAST_CALL_TIME
+        async with _ZAI_SEMAPHORE:
+            elapsed_since_last = time.time() - _ZAI_LAST_CALL_TIME
+            if elapsed_since_last < _ZAI_MIN_INTERVAL:
+                wait = _ZAI_MIN_INTERVAL - elapsed_since_last
+                logger.debug("zai_rate_wait", wait=f"{wait:.1f}s")
+                await asyncio.sleep(wait)
+            _ZAI_LAST_CALL_TIME = time.time()
+
         # Stream the response using document buffer approach.
         # Z.ai sends a mix of delta_content (appends) and edit_content
         # with edit_index (splices). The full document includes a
@@ -793,7 +872,7 @@ class ZaiClient:
         native_tool_calls: list[ZaiToolUseBlock] = []
         output_tokens = 0
 
-        max_retries = 5
+        max_retries = 3
         for attempt in range(max_retries):
             try:
                 async with self._http.stream(
@@ -807,8 +886,9 @@ class ZaiClient:
                         logger.warning("zai_http_error", status=stream.status_code,
                                        body=error_body[:300], attempt=attempt)
                         if attempt < max_retries - 1:
-                            # Exponential backoff: 10s, 30s, 60s, 120s
-                            backoff = min(10 * (3 ** attempt), 120)
+                            # Short backoff for 400/403/429; fail fast on 405
+                            # (brain_node handles long 405 cooldown)
+                            backoff = 5 if stream.status_code == 405 else min(10 * (3 ** attempt), 120)
                             logger.info("zai_rate_limit_backoff", wait=backoff,
                                         attempt=attempt, status=stream.status_code)
                             import asyncio as _aio_inner
@@ -906,7 +986,33 @@ class ZaiClient:
                     continue
                 raise
 
-        # Build full document and extract answer vs thinking
+        # Parse the streamed response into a ZaiResponse
+        return self._parse_streamed_response(
+            doc_buffer=doc_buffer,
+            native_tool_calls=native_tool_calls,
+            output_tokens=output_tokens,
+            estimated_input_tokens=estimated_input_tokens,
+            phase=phase,
+            target=target,
+            tools=tools,
+        )
+
+    # ── Shared response parsing ────────────────────────────────────
+
+    def _parse_streamed_response(
+        self,
+        doc_buffer: list[str],
+        native_tool_calls: list[ZaiToolUseBlock],
+        output_tokens: int,
+        estimated_input_tokens: int,
+        phase: str,
+        target: str,
+        tools: list[dict[str, Any]],
+    ) -> ZaiResponse:
+        """Parse SSE doc buffer into a ZaiResponse.
+
+        Shared by both direct and proxy-pool call paths.
+        """
         full_doc = "".join(doc_buffer)
 
         # Extract <glm_block> tool calls from the full document
@@ -1009,6 +1115,10 @@ class ZaiClient:
         if not all_tool_calls:
             clean_text, text_tool_calls = _extract_tool_calls(full_text)
             all_tool_calls = text_tool_calls
+            if not all_tool_calls and full_text.strip():
+                logger.warning("zai_no_tool_calls_in_text",
+                             text_preview=full_text[:300],
+                             text_len=len(full_text))
         else:
             clean_text = full_text
 
@@ -1055,6 +1165,187 @@ class ZaiClient:
         )
 
         return ZaiResponse(content=content, stop_reason=stop_reason, usage=usage)
+
+    # ── Proxy pool call path ──────────────────────────────────────
+
+    async def _call_via_proxy_pool(
+        self,
+        url: str,
+        query_params: dict[str, str],
+        headers: dict[str, str],
+        body: dict[str, Any],
+        prompt_text: str,
+        estimated_input_tokens: int,
+        phase: str,
+        target: str,
+        tools: list[dict[str, Any]],
+    ) -> ZaiResponse:
+        """Route Z.ai call through proxy pool with per-proxy rate limiting."""
+        from ai_brain.active.proxy_pool import ProxyPool  # noqa: F811
+
+        max_retries = 5
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries):
+            try:
+                proxy = await self.proxy_pool.acquire()
+            except RuntimeError as e:
+                # No healthy proxies available — wait and retry
+                logger.warning("zai_proxy_acquire_failed", error=str(e), attempt=attempt)
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+            try:
+                # Ensure this proxy has a Z.ai guest session
+                await self.proxy_pool.ensure_proxy_session(proxy)
+
+                # Override auth with proxy's session
+                p_headers = dict(headers)
+                p_headers["Authorization"] = f"Bearer {proxy.zai_token}"
+                cookie_parts = [f"token={proxy.zai_token}"]
+                for k, v in proxy.zai_cookies.items():
+                    if k != "token":
+                        cookie_parts.append(f"{k}={v}")
+                p_headers["Cookie"] = "; ".join(cookie_parts)
+
+                # Re-sign with proxy's user_id
+                p_params = dict(query_params)
+                p_params["user_id"] = proxy.zai_user_id or ""
+                request_id = str(uuid.uuid4())
+                timestamp_ms = int(time.time() * 1000)
+                p_params["requestId"] = request_id
+                p_params["timestamp"] = str(timestamp_ms)
+                p_params["signature_timestamp"] = str(timestamp_ms)
+                signature = self._generate_signature(
+                    prompt_text, proxy.zai_user_id or "",
+                    request_id, timestamp_ms,
+                )
+                p_headers["X-Signature"] = signature
+
+                client = self.proxy_pool.get_http_client(proxy)
+
+                # Stream the response (same SSE parsing as direct path)
+                doc_buffer: list[str] = []
+                native_tool_calls: list[ZaiToolUseBlock] = []
+                output_tokens = 0
+
+                async with client.stream(
+                    "POST", url, params=p_params,
+                    headers=p_headers, json=body,
+                ) as stream:
+                    if stream.status_code in (400, 403, 405, 429):
+                        error_body = ""
+                        async for chunk in stream.aiter_text():
+                            error_body += chunk
+                        logger.warning(
+                            "zai_proxy_http_error",
+                            status=stream.status_code,
+                            proxy=proxy.url[:30],
+                            body=error_body[:300],
+                            attempt=attempt,
+                        )
+                        # Rotate session on auth errors
+                        if stream.status_code in (403, 405):
+                            self.proxy_pool.invalidate_proxy_session(proxy)
+                        self.proxy_pool.release(proxy, success=False)
+                        last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}")
+                        continue
+
+                    if stream.status_code != 200:
+                        error_body = ""
+                        async for chunk in stream.aiter_text():
+                            error_body += chunk
+                        self.proxy_pool.release(proxy, success=False)
+                        last_error = RuntimeError(f"Z.ai {stream.status_code} via {proxy.url[:30]}: {error_body[:300]}")
+                        continue
+
+                    # Parse SSE stream
+                    async for line in stream.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+
+                        if data_str == "[DONE]" or data_str == '{"data":"[DONE]"}':
+                            break
+
+                        try:
+                            event = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_data = event.get("data", event)
+                        if isinstance(event_data, str):
+                            if event_data == "[DONE]":
+                                break
+                            continue
+
+                        phase_val = event_data.get("phase", "")
+                        delta = event_data.get("delta_content", "")
+                        edit = event_data.get("edit_content", "")
+                        edit_idx = event_data.get("edit_index")
+
+                        if phase_val == "tool_call" and edit:
+                            doc_buffer.append(edit)
+                            output_tokens += 1
+
+                        if delta:
+                            doc_buffer.append(delta)
+                            output_tokens += 1
+
+                        if edit and edit_idx is not None and phase_val != "tool_call":
+                            current_doc = "".join(doc_buffer)
+                            if edit_idx >= len(current_doc):
+                                doc_buffer.append(edit)
+                            else:
+                                new_doc = current_doc[:edit_idx] + edit
+                                doc_buffer = [new_doc]
+                            output_tokens += 1
+
+                        if event_data.get("done"):
+                            break
+
+                        usage_data = event_data.get("usage", {})
+                        if usage_data:
+                            estimated_input_tokens = usage_data.get(
+                                "prompt_tokens", estimated_input_tokens,
+                            )
+                            output_tokens = max(
+                                output_tokens,
+                                usage_data.get("completion_tokens", output_tokens),
+                            )
+
+                self.proxy_pool.release(proxy, success=True)
+
+                # Parse the response (same logic as direct path)
+                return self._parse_streamed_response(
+                    doc_buffer=doc_buffer,
+                    native_tool_calls=native_tool_calls,
+                    output_tokens=output_tokens,
+                    estimated_input_tokens=estimated_input_tokens,
+                    phase=phase,
+                    target=target,
+                    tools=tools,
+                )
+
+            except Exception as e:
+                self.proxy_pool.release(proxy, success=False)
+                last_error = e
+                logger.warning(
+                    "zai_proxy_call_failed",
+                    proxy=proxy.url[:30],
+                    error=str(e),
+                    attempt=attempt,
+                )
+                # Backoff before retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 * (attempt + 1))
+
+        # All retries exhausted — return error response instead of crashing
+        logger.error("zai_proxy_all_retries_failed", error=str(last_error))
+        return ZaiResponse(
+            content=[{"type": "text", "text": f"[ERROR: All {max_retries} proxy retries failed: {last_error}]"}],
+            stop_reason="error",
+            usage=ZaiUsage(input_tokens=estimated_input_tokens, output_tokens=0),
+        )
 
     def select_model(self, task_tier: str) -> str:
         """Always returns the Z.ai model."""

@@ -179,6 +179,23 @@ def parse_args() -> argparse.Namespace:
         "--zai-model", type=str, default="glm-5",
         help="Z.ai model to use (default: glm-5). Options: glm-5, glm-4.7, glm-4.6v",
     )
+    # Proxy pool for Z.ai rate limit bypass
+    parser.add_argument(
+        "--enable-proxylist", action="store_true", default=False,
+        help="Use rotating proxy pool for Z.ai calls (bypass rate limits)",
+    )
+    parser.add_argument(
+        "--proxy-ratelimit", type=float, default=3.0,
+        help="Seconds between Z.ai calls per proxy IP (default: 3.0)",
+    )
+    parser.add_argument(
+        "--min-proxies", type=int, default=10,
+        help="Minimum healthy proxies before starting (default: 10)",
+    )
+    parser.add_argument(
+        "--max-proxies", type=int, default=100,
+        help="Maximum proxies to validate (default: 100)",
+    )
     return parser.parse_args()
 
 
@@ -224,15 +241,30 @@ async def main() -> None:
     budget = BudgetManager(budget_cfg, active_testing=True)
 
     # Brain client — Z.ai (free GLM-5) or Claude
+    proxy_pool = None
     if args.zai:
         from ai_brain.active.zai_client import ZaiClient
+
+        if args.enable_proxylist:
+            from ai_brain.active.proxy_pool import ProxyPool
+            proxy_pool = ProxyPool(
+                rate_limit_seconds=args.proxy_ratelimit,
+                min_proxies=args.min_proxies,
+                max_proxies=args.max_proxies,
+            )
+            print(f"[*] Warming proxy pool (min={args.min_proxies})...")
+            await proxy_pool.warm()
+            stats = proxy_pool.stats()
+            print(f"[*] Proxy pool ready: {stats['healthy']}/{stats['total']} proxies, {args.proxy_ratelimit}s rate limit")
+
         client = ZaiClient(
             budget=budget,
             config=config,
             model=args.zai_model,
             enable_thinking=True,
+            proxy_pool=proxy_pool,
         )
-        logger.info("using_zai_brain", model=args.zai_model)
+        logger.info("using_zai_brain", model=args.zai_model, proxy_pool=args.enable_proxylist)
         print(f"[*] Brain: Z.ai {args.zai_model} (free, with thinking)")
         # Still need a Claude client for compression (Haiku)
         rate_limiter = DualRateLimiter(
@@ -258,10 +290,12 @@ async def main() -> None:
         )
         claude_client = client
 
-    # Scope
+    # Scope — flatten comma-separated values (supports both --allowed-domains "a,b" and --allowed-domains a b)
+    _flat_allowed = [d.strip() for raw in args.allowed_domains for d in raw.split(",") if d.strip()]
+    _flat_oos = [d.strip() for raw in args.out_of_scope for d in raw.split(",") if d.strip()]
     scope = ScopeEnforcer(
-        allowed_domains=args.allowed_domains,
-        out_of_scope_domains=args.out_of_scope,
+        allowed_domains=_flat_allowed,
+        out_of_scope_domains=_flat_oos,
     )
     scope_guard = ActiveScopeGuard(scope)
 
@@ -295,6 +329,17 @@ async def main() -> None:
     if not args.no_memory:
         saved_memory = memory.load()
 
+    # Findings DB
+    findings_db = None
+    try:
+        from ai_brain.active.findings_db import FindingsDB
+        findings_db = FindingsDB()
+        await findings_db.connect()
+        print(f"[*] Findings DB: connected (PostgreSQL)")
+    except Exception as _fdb_init_err:
+        print(f"[*] Findings DB: unavailable ({_fdb_init_err}) — using JSON only")
+        findings_db = None
+
     # Parse custom headers
     default_headers: dict[str, str] = {}
     for h in args.header:
@@ -320,6 +365,9 @@ async def main() -> None:
     print(f"  Mode:       {mode_str}")
     print(f"  Timeout:    {timeout_str}")
     print(f"  Dry run:    {args.dry_run}")
+    if proxy_pool:
+        stats = proxy_pool.stats()
+        print(f"  Proxy pool: {stats['healthy']}/{stats['total']} proxies, {args.proxy_ratelimit}s rate limit")
     if active_cfg.upstream_proxy:
         print(f"  Proxy:      {active_cfg.upstream_proxy}")
     if captcha_solver.has_service:
@@ -395,6 +443,7 @@ async def main() -> None:
                 "budget_limit": args.budget,
                 "transcript": transcript,
                 "default_headers": default_headers,
+                "findings_db": findings_db,
             },
         }
 
@@ -642,12 +691,37 @@ async def main() -> None:
         except Exception as e:
             print(f"\n[!] Failed to save results: {e}")
 
+        # Final sync to findings DB
+        if findings_db and findings:
+            try:
+                count = await findings_db.bulk_upsert(
+                    findings,
+                    domain=result.get("domain", ""),
+                    target_url=target,
+                    session_id=result.get("session_id", ""),
+                )
+                print(f"  Findings DB: {count} findings synced")
+            except Exception as e:
+                print(f"  [!] Findings DB final sync failed: {e}")
+
     finally:
         # Stop transcript logging
         try:
             transcript.stop()
         except Exception:
             pass
+
+        if findings_db:
+            try:
+                await findings_db.close()
+            except Exception:
+                pass
+
+        if proxy_pool:
+            try:
+                await proxy_pool.close()
+            except Exception:
+                pass
 
         for name, service in [
             ("goja", goja_mgr),

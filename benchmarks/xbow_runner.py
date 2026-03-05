@@ -264,6 +264,7 @@ async def run_challenge(
     zai_model: str = "glm-5",
     use_chatgpt: bool = False,
     chatgpt_model: str = "auto",
+    proxy_pool: Any | None = None,
 ) -> ChallengeResult:
     """Run the AIBBP ReAct agent against one XBOW challenge."""
     meta = load_challenge_metadata(benchmark_id)
@@ -322,6 +323,7 @@ async def run_challenge(
             zai_model=zai_model,
             use_chatgpt=use_chatgpt,
             chatgpt_model=chatgpt_model,
+            proxy_pool=proxy_pool,
         )
         elapsed = time.time() - start_time
 
@@ -360,6 +362,7 @@ async def _run_agent_ctf(
     zai_model: str = "glm-5",
     use_chatgpt: bool = False,
     chatgpt_model: str = "auto",
+    proxy_pool: Any | None = None,
 ) -> dict[str, Any]:
     """Run the ReAct agent in CTF mode (flag extraction)."""
     from ai_brain.active.browser import BrowserController
@@ -419,6 +422,7 @@ async def _run_agent_ctf(
         client = ZaiClient(
             budget=budget_mgr, config=config,
             model=zai_model, enable_thinking=True,
+            proxy_pool=proxy_pool,
         )
         # Claude client for compression (Haiku)
         claude_client = ClaudeClient(
@@ -701,6 +705,15 @@ async def main():
                         help="Use ChatGPT (free anonymous) instead of Claude for the brain")
     parser.add_argument("--chatgpt-model", type=str, default="auto",
                         help="ChatGPT model (default: auto, also: gpt-4o-mini)")
+    # Proxy pool for Z.ai rate limit bypass
+    parser.add_argument("--enable-proxylist", action="store_true", default=False,
+                        help="Use rotating proxy pool for Z.ai calls")
+    parser.add_argument("--proxy-ratelimit", type=float, default=3.0,
+                        help="Seconds between Z.ai calls per proxy IP (default: 3.0)")
+    parser.add_argument("--min-proxies", type=int, default=10,
+                        help="Minimum healthy proxies before starting (default: 10)")
+    parser.add_argument("--max-proxies", type=int, default=100,
+                        help="Maximum proxies to validate (default: 100)")
     args = parser.parse_args()
 
     # Determine which challenges to run
@@ -729,17 +742,36 @@ async def main():
         brain_label = "Claude (Opus/Sonnet)"
     print(f"\nRunning {len(challenge_ids)} challenges (brain: {brain_label}, budget: ${args.budget}/ea, max_turns: {args.max_turns})")
 
+    # Create proxy pool if requested (shared across all challenges)
+    proxy_pool = None
+    if args.enable_proxylist and args.zai:
+        from ai_brain.active.proxy_pool import ProxyPool
+        proxy_pool = ProxyPool(
+            rate_limit_seconds=args.proxy_ratelimit,
+            min_proxies=args.min_proxies,
+            max_proxies=args.max_proxies,
+        )
+        print(f"[*] Warming proxy pool (min={args.min_proxies})...")
+        await proxy_pool.warm()
+        stats = proxy_pool.stats()
+        print(f"[*] Proxy pool ready: {stats['healthy']}/{stats['total']} proxies, {args.proxy_ratelimit}s rate limit")
+
     suite = BenchmarkSuite()
     start_time = time.time()
 
-    for i, cid in enumerate(challenge_ids, 1):
-        print(f"\n[{i}/{len(challenge_ids)}]", end="")
-        flag = generate_flag(cid)
-        result = await run_challenge(cid, flag, args.budget, args.max_turns,
-                                     use_zai=args.zai, zai_model=args.zai_model,
-                                     use_chatgpt=args.chatgpt, chatgpt_model=args.chatgpt_model)
-        suite.results.append(result)
-        suite.total_cost += result.budget_spent
+    try:
+        for i, cid in enumerate(challenge_ids, 1):
+            print(f"\n[{i}/{len(challenge_ids)}]", end="")
+            flag = generate_flag(cid)
+            result = await run_challenge(cid, flag, args.budget, args.max_turns,
+                                         use_zai=args.zai, zai_model=args.zai_model,
+                                         use_chatgpt=args.chatgpt, chatgpt_model=args.chatgpt_model,
+                                         proxy_pool=proxy_pool)
+            suite.results.append(result)
+            suite.total_cost += result.budget_spent
+    finally:
+        if proxy_pool:
+            await proxy_pool.close()
 
     suite.total_time = time.time() - start_time
 

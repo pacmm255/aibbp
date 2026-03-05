@@ -576,8 +576,10 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
                               "timeout", "connection", "OAuth", "expired", "401"]
         is_transient = any(kw.lower() in error_str.lower() for kw in transient_keywords)
         if is_transient:
-            wait = 60
+            # 405 = IP-level rate limit on Z.ai, needs longer cooldown
+            wait = 300 if "405" in error_str else 60
             logger.warning("brain_transient_error_waiting", wait=wait, error=error_str[:100])
+            print(f"\n  [!] Transient error — waiting {wait}s before retry...")
             await _aio.sleep(wait)
             # Return empty result — graph will loop back to brain
             return {
@@ -605,7 +607,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     # (Skip in Z.ai/ChatGPT mode — no Opus fallback available)
     text_blocks = [b for b in content_blocks if getattr(b, "type", "") == "text"]
     if not is_free_brain and task_tier == "complex" and not tool_calls and response.stop_reason == "end_turn":
-        all_text = " ".join(b.text for b in text_blocks).lower()
+        all_text = " ".join(_block_text(b) for b in text_blocks).lower()
         _refusal_phrases = [
             "i can't", "i cannot", "i'm unable", "i am unable",
             "not appropriate", "safety concern", "won't be able",
@@ -731,7 +733,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
 
     # Log brain reasoning
     if text_blocks:
-        reasoning = text_blocks[0].text[:500]
+        reasoning = _block_text(text_blocks[0])[:500]
         logger.info("brain_reasoning", preview=reasoning)
 
     # ── Transcript logging: brain response ──
@@ -762,12 +764,12 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             thinking_content = getattr(tb, "thinking", "") or str(tb)
             _print_thinking(thinking_content)
         if text_blocks:
-            full_reasoning = "\n".join(b.text for b in text_blocks)
+            full_reasoning = "\n".join(_block_text(b) for b in text_blocks)
             _print_reasoning(full_reasoning)
         if tool_calls:
             print(f"\n{_MAGENTA}{_BOLD}🔧 TOOLS ({len(tool_calls)}):{_RESET}")
             for tc in tool_calls:
-                _print_tool_call(tc.name, tc.input if hasattr(tc, "input") else {})
+                _print_tool_call(_block_attr(tc, "name", "?"), _block_attr(tc, "input", {}))
 
     # Update budget tracking from state
     budget_spent = budget.total_spent
@@ -798,7 +800,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         # In indefinite mode, never auto-detect "done" from text
         max_turns = state.get("max_turns", 150)
         if max_turns != 0:
-            all_text = " ".join(b.text for b in text_blocks).lower()
+            all_text = " ".join(_block_text(b) for b in text_blocks).lower()
             if any(phrase in all_text for phrase in [
                 "testing complete", "finished testing", "concluding",
                 "no more", "all done", "wrapping up",
@@ -1315,6 +1317,25 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
             if fid not in existing_f:
                 _print_finding(fid, fdata)
 
+    # ── Push new findings to DB ──
+    if state_updates and state_updates.get("findings"):
+        _newly_added = {
+            fid: fd for fid, fd in state_updates.get("findings", {}).items()
+            if fid not in state.get("findings", {})
+        }
+        if _newly_added:
+            _fdb = config["configurable"].get("findings_db")
+            if _fdb:
+                try:
+                    await _fdb.bulk_upsert(
+                        _newly_added,
+                        domain=state.get("domain", ""),
+                        target_url=state.get("target_url", ""),
+                        session_id=state.get("session_id", ""),
+                    )
+                except Exception as _fdb_err:
+                    logger.warning("findings_db_push_failed", error=str(_fdb_err))
+
     # ── Info gain tracking ────────────────────────────────────
     new_ep = len(result.get("endpoints", state.get("endpoints", {}))) - prev_ep_count
     new_findings = len(result.get("findings", state.get("findings", {}))) - prev_finding_count
@@ -1448,6 +1469,20 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
                     pass
         except Exception as e:
             logger.warning("memory_auto_save_failed", error=str(e))
+
+    # Bulk sync all findings to DB (catches any missed)
+    if turn_count > 0 and turn_count % 10 == 0:
+        _fdb_cc = config["configurable"].get("findings_db")
+        if _fdb_cc and state.get("findings"):
+            try:
+                await _fdb_cc.bulk_upsert(
+                    state.get("findings", {}),
+                    domain=state.get("domain", ""),
+                    target_url=state.get("target_url", ""),
+                    session_id=state.get("session_id", ""),
+                )
+            except Exception:
+                pass
 
     messages = state.get("messages", [])
     total_chars = sum(len(json.dumps(m, default=str)) for m in messages)
@@ -1708,6 +1743,20 @@ def _route_after_compress(state: PentestState) -> str:
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+def _block_text(block) -> str:
+    """Safely get text from a content block (works with both objects and dicts)."""
+    if isinstance(block, dict):
+        return block.get("text", "")
+    return getattr(block, "text", "")
+
+
+def _block_attr(block, attr: str, default=None):
+    """Safely get an attribute from a content block (works with both objects and dicts)."""
+    if isinstance(block, dict):
+        return block.get(attr, default)
+    return getattr(block, attr, default)
+
+
 def _serialize_content(content_blocks: list) -> list[dict[str, Any]]:
     """Serialize Anthropic content blocks to dicts for message storage."""
     serialized = []
@@ -1715,13 +1764,13 @@ def _serialize_content(content_blocks: list) -> list[dict[str, Any]]:
         block_type = getattr(block, "type", "text")
 
         if block_type == "text":
-            serialized.append({"type": "text", "text": block.text})
+            serialized.append({"type": "text", "text": _block_text(block)})
         elif block_type == "tool_use":
             serialized.append({
                 "type": "tool_use",
-                "id": block.id,
-                "name": block.name,
-                "input": block.input,
+                "id": _block_attr(block, "id", ""),
+                "name": _block_attr(block, "name", ""),
+                "input": _block_attr(block, "input", {}),
             })
         elif block_type == "thinking":
             # Don't store thinking blocks — they're internal
