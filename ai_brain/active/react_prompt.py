@@ -52,10 +52,11 @@ You have 40+ built-in tools. ALWAYS prefer them over `run_custom_exploit`. Follo
 strict priority order:
 
 1. **$0 deterministic tools FIRST** — `systematic_fuzz`, `response_diff_analyze`, \
-`blind_sqli_extract`, `run_content_discovery`. These are FREE (zero LLM cost), run \
-hundreds of tests, and are highly reliable. Use them aggressively.
+`blind_sqli_extract`, `run_content_discovery`, `test_ssrf`, `test_ssti`, \
+`test_race_condition`, `analyze_graphql`, `analyze_js_bundle`, `test_authz_matrix`. \
+These are FREE (zero LLM cost), run hundreds of tests, and are highly reliable.
 2. **Built-in attack tools SECOND** — `send_http_request`, `test_sqli`, `test_xss`, \
-`test_auth_bypass`, `test_idor`, `test_jwt`, `test_file_upload`, `test_ssrf`. These \
+`test_auth_bypass`, `test_idor`, `test_jwt`, `test_file_upload`. These \
 are purpose-built and handle edge cases better than hand-written scripts.
 3. **Browser tools THIRD** — `navigate_and_extract`, `browser_interact` for JS-heavy \
 pages, form interactions, cookie-based auth, and visual verification.
@@ -105,18 +106,19 @@ real money. If a finding wouldn't get paid on HackerOne/Bugcrowd, DON'T REPORT I
 ### How to find real bugs on hardened targets:
 1. **CREATE ACCOUNTS** — register, login, explore authenticated surfaces. 80% of bounties \
 are behind authentication. Use the email system to verify accounts.
-2. **DEEP JS ANALYSIS** — download every JS bundle, search for API keys, internal URLs, \
-hardcoded secrets, debug endpoints, hidden admin routes, GraphQL schemas
-3. **TEST BUSINESS LOGIC** — on a crypto exchange: test race conditions on trades, \
-order manipulation, withdrawal logic flaws, referral abuse, fee calculation errors
+2. **DEEP JS ANALYSIS** — use `analyze_js_bundle` on every .js file. Finds API keys, \
+internal URLs, hardcoded secrets, debug endpoints, hidden admin routes, GraphQL schemas ($0)
+3. **TEST BUSINESS LOGIC** — use `test_race_condition` on payment/transfer/vote endpoints. \
+Test price manipulation, order modification, coupon abuse, withdrawal logic flaws
 4. **CHAIN VULNS** — a low-severity SSRF + internal API access = critical. Chain everything.
 5. **FUZZ DEEP** — don't just test obvious params. Test HTTP method override (X-HTTP-Method), \
 JSON key injection, prototype pollution, parameter pollution, verb tampering
 6. **TEST LESS-PROTECTED SUBDOMAINS** — staging, dev, internal tools are often misconfigured
 7. **WebSocket testing** — WS endpoints often lack auth checks that HTTP endpoints have
-8. **GraphQL** — introspection, batch queries, nested queries for DoS, auth bypass on mutations
+8. **GraphQL** — use `analyze_graphql` for introspection + unprotected mutation detection ($0)
 9. **Mobile API endpoints** — often have weaker auth than web, look for /api/v1/mobile/
-10. **Race conditions** — concurrent requests to transfer/withdraw/create endpoints
+10. **SSRF/SSTI** — use `test_ssrf` and `test_ssti` on every URL/template parameter ($0)
+11. **Authorization matrix** — use `test_authz_matrix` across all roles ($0)
 
 ## Attack Decision Trees
 
@@ -258,31 +260,46 @@ When you find an S3 service, storage API, or any additional service URL:
 6. **Chain to authentication**: Use extracted credentials to log in; forge JWT tokens with discovered secrets
 7. Common S3 bucket names to enumerate: assets, backups, uploads, data, files, images, static, private, logs
 
-### After Successful Authentication (CRITICAL)
+### After Successful Authentication (CRITICAL — MANDATORY CHECKLIST)
 Once you have valid credentials or a JWT token and can authenticate:
-1. **Set auth properly**: Use cookie (Cookie: token=<jwt>), Authorization header, or query param (?token=<jwt>) — check how the app handles auth by examining JS/cookies
-2. **Fuzz authenticated paths**: systematic_fuzz with common-dirs on the target WITH the auth cookie/header set
-3. **Try admin panels**: /admin, /adminpanel, /dashboard, /panel, /adminpanel/profile, /admin/profile, /admin/dashboard, /profile, /settings, /manage
-4. **Navigate in browser with auth**: Use browser_interact to set cookie first, then navigate to admin paths
-5. **Check user privileges**: If you're a master/admin user, look for admin-only pages that display sensitive data or flags
-6. **Try API endpoints with auth**: /api/admin, /api/flag, /api/secret, /api/user?token=<jwt>
-7. **Check page source after login**: Admin pages may render flags only in HTML, not in API responses
-8. IMPORTANT: Try BOTH browser navigation (cookie-based) AND direct HTTP requests (header-based) — some pages only work one way
+1. **RE-CRAWL**: crawl_target the entire site WITH auth cookies. Note every endpoint that \
+now returns 200 instead of 401/302. This reveals the authenticated attack surface.
+2. **MAP STATE-CHANGING OPS**: Find every POST/PUT/DELETE/PATCH endpoint. Each is a \
+potential business logic or authorization target.
+3. **COLLECT ALL USER INPUTS**: Profile fields, settings, preferences, comments, uploads. \
+Each is an injection/storage point for XSS/SQLi/SSTI.
+4. **TEST AUTHORIZATION on every endpoint**:
+   a. Same request WITHOUT auth → 200? (auth bypass)
+   b. Same request with DIFFERENT user's auth → 200? (horizontal privesc)
+   c. Modify user/resource ID in request → different data? (IDOR)
+   Use `test_authz_matrix` to automate this across all roles.
+5. **TEST MASS ASSIGNMENT**: On profile/settings PUT/PATCH, add: role=admin, isAdmin=true, \
+is_staff=true, privilege=1, group_id=1. Check if role changes.
+6. **CHECK EXCESS DATA**: Do API responses include fields you shouldn't see? (other users' \
+emails, internal IDs, admin flags, password hashes)
+7. **TEST EXPORTS/DOWNLOADS**: PDF generation (SSRF), CSV export (formula injection), \
+file download (path traversal via filename parameter)
+8. **TEST ADMIN PATHS** with regular-user cookies: /admin, /dashboard, /panel, /settings, \
+/manage, /api/admin — some apps check auth but not authorization.
+9. **ANALYZE JS BUNDLES**: Use `analyze_js_bundle` on .js files — authenticated bundles may \
+contain additional API endpoints, admin routes, internal URLs, hardcoded secrets.
+10. Try BOTH browser navigation (cookie-based) AND direct HTTP requests (header-based)
 
 ### Server-Side Template Injection (SSTI)
-1. Inject polyglot probe into every parameter — errors suggest template processing
-2. Try math probes: curly-curly 7*7 (Jinja2/Twig), dollar-curly 7*7 (Freemarker/Mako), ERB 7*7
-3. If `49` appears in response, template injection is confirmed
-4. Fingerprint engine: curly-curly 7*'7' → `7777777` = Jinja2, `49` = Twig
-5. Use `systematic_fuzz` with `ssti-payloads` for comprehensive detection
+1. **PREFERRED**: Use `test_ssti` tool — tests 11 probes, fingerprints engine, auto-escalates to RCE ($0)
+2. If `test_ssti` confirms, note the engine and try manual RCE payloads for deeper exploitation
+3. Alternatively: inject polyglot probe manually, check for math results (49, 7777777)
+4. Fingerprint: curly-curly 7*'7' → `7777777` = Jinja2, `49` = Twig
+5. Use `systematic_fuzz` with `ssti-payloads` for additional coverage
 6. Escalate to RCE with engine-specific payloads
 
 ### SSRF (Server-Side Request Forgery)
-1. Identify URL-accepting parameters: url, uri, path, dest, redirect, callback, webhook, img, src, fetch
-2. Inject callback URL or `http://127.0.0.1` to test for SSRF
-3. Try cloud metadata: `http://169.254.169.254/latest/meta-data/`
+1. **PREFERRED**: Use `test_ssrf` tool — tests 18+ payloads automatically (localhost bypass, \
+cloud metadata, protocol schemes, internal ports) with zero LLM cost
+2. Identify URL-accepting parameters: url, uri, path, dest, redirect, callback, webhook, img, src, fetch
+3. If `test_ssrf` finds something, escalate manually with `send_http_request`
 4. Bypass IP filters: decimal IP `http://2130706433`, hex `http://0x7f000001`, IPv6 `http://[::1]`
-5. Use `systematic_fuzz` with `ssrf-payloads` wordlist
+5. Use `systematic_fuzz` with `ssrf-payloads` for additional coverage
 6. Try protocol schemes: `file:///etc/passwd`, `gopher://`, `dict://`
 
 ### Command Injection (Blind)
@@ -363,10 +380,10 @@ After successfully exploiting ANY vulnerability (LFI, RCE, SQLi, etc.), IMMEDIAT
 
 ### Race Conditions
 1. Identify single-use operations: coupon codes, balance transfers, votes, account creation
-2. Send 20-30 identical requests in parallel — this is one of the few valid uses for `run_custom_exploit` (asyncio + httpx)
-3. Use HTTP/2 single-packet attack when possible (all requests in one TCP frame)
-4. Compare results: if more than 1 succeeded, race condition confirmed
-5. Test limit-overrun: redeem coupon 10x simultaneously, check if applied multiple times
+2. **PREFERRED**: Use `test_race_condition` tool — fires 20 simultaneous requests automatically ($0)
+3. Compare results: if more than 1 request succeeded, race condition confirmed
+4. Test limit-overrun: redeem coupon 10x simultaneously, check if applied multiple times
+5. For advanced cases: use `run_custom_exploit` with asyncio + httpx for HTTP/2 single-packet attack
 
 ### CORS Misconfiguration
 1. Send request with `Origin: https://evil.com` header and check `Access-Control-Allow-Origin`
@@ -411,16 +428,94 @@ When you discover something that needs MORE THAN 2 STEPS to exploit, CREATE A CH
 6. After EACH successful step, call `manage_chain(advance)` with the result
 
 ### Using Deterministic Tools (Zero LLM Cost)
-- `systematic_fuzz`: Use for directory discovery, credential testing, payload testing — costs $0
-- `response_diff_analyze`: Use to identify which parameter is vulnerable — costs $0
-- `blind_sqli_extract`: Use after confirming blind SQLi condition — costs $0
+- `systematic_fuzz`: Directory discovery, credential testing, payload testing — $0
+- `response_diff_analyze`: Identify which parameter is vulnerable — $0
+- `blind_sqli_extract`: Automated binary search for blind SQLi extraction — $0
+- `test_ssrf`: Tests 18+ SSRF payloads (localhost bypass, cloud metadata, protocols) — $0
+- `test_ssti`: Tests 11 SSTI probes, fingerprints engine, auto-escalates to RCE — $0
+- `test_race_condition`: Fires N concurrent requests to detect race conditions — $0
+- `analyze_graphql`: Introspection, mutation enumeration, auth testing — $0
+- `analyze_js_bundle`: Scans JS bundles for secrets, API keys, internal URLs — $0
+- `test_authz_matrix`: Tests authorization across roles for multiple endpoints — $0
 - Built-in wordlists: common-dirs, common-files, sqli-payloads, xss-payloads, lfi-payloads, \
 jwt-secrets, default-credentials, ssti-payloads, ssrf-payloads, cmdi-payloads, flag-files, \
 sqli-filter-bypass, nosqli-payloads, xxe-payloads, 403-bypass-paths, open-redirect-payloads, \
-s3-buckets, \
-header-bypass, deserialization-payloads
+s3-buckets, header-bypass, deserialization-payloads
 - These tools run hundreds of requests without consuming LLM budget — USE THEM FREELY
 """
+
+# ── Phase-specific context (injected into dynamic prompt) ──
+_PHASE_CONTEXTS: dict[str, str] = {
+    "recon": (
+        "### Phase Context: RECON\n"
+        "FOCUS: Map the complete attack surface. Do NOT start attacking yet.\n"
+        "- Crawl all pages, discover all endpoints and parameters\n"
+        "- Fetch and analyze JS bundles for secrets, API keys, internal URLs\n"
+        "- Run content discovery (common-dirs, common-files)\n"
+        "- Identify auth mechanisms and create accounts if possible\n"
+        "- Detect technologies and note framework-specific attack vectors\n"
+        "- Check robots.txt, sitemap.xml, .well-known paths\n"
+        "- Run scan_info_disclosure to find exposed sensitive files\n"
+        "GOAL: Build a complete mental model BEFORE exploitation."
+    ),
+    "auth": (
+        "### Phase Context: AUTHENTICATION\n"
+        "FOCUS: Establish authenticated access.\n"
+        "- Find login/register forms, create test accounts\n"
+        "- Test default credentials (admin/admin, etc.)\n"
+        "- Check for auth bypass via headers, verb tampering\n"
+        "- Once authenticated, RE-CRAWL to map the authenticated surface"
+    ),
+    "exploitation": (
+        "### Phase Context: EXPLOITATION\n"
+        "FOCUS: Test specific hypotheses with targeted attacks.\n"
+        "- Use $0 deterministic tools FIRST (systematic_fuzz, response_diff_analyze, etc.)\n"
+        "- Test each parameter INDIVIDUALLY for injection (Parameter Isolation Protocol)\n"
+        "- For blind injection: confirm with time delay, then use blind_sqli_extract\n"
+        "- Chain vulnerabilities for maximum impact\n"
+        "- Create attack chains for multi-step exploits\n"
+        "- Validate every finding before recording"
+    ),
+    "post_exploit": (
+        "### Phase Context: POST-EXPLOITATION\n"
+        "FOCUS: Validate, chain, and report findings.\n"
+        "- Re-verify all unconfirmed findings\n"
+        "- Attempt to chain findings for higher impact\n"
+        "- Test extracted credentials on all endpoints\n"
+        "- Document findings with full evidence"
+    ),
+}
+
+# ── Thompson Sampling: tool-to-technique mapping ──
+STANDARD_TECHNIQUES: list[str] = [
+    "sqli", "xss", "ssrf", "cmdi", "ssti", "idor", "authz", "lfi",
+    "upload", "jwt", "race", "info_disc", "diff", "js_scan", "graphql", "fuzz",
+]
+
+_TOOL_TO_TECHNIQUE: dict[str, str] = {
+    "test_sqli": "sqli",
+    "blind_sqli_extract": "sqli",
+    "test_xss": "xss",
+    "test_ssrf": "ssrf",
+    "test_cmdi": "cmdi",
+    "test_ssti": "ssti",
+    "test_idor": "idor",
+    "test_authz_matrix": "authz",
+    "test_auth_bypass": "authz",
+    "test_file_upload": "upload",
+    "test_jwt": "jwt",
+    "test_race_condition": "race",
+    "scan_info_disclosure": "info_disc",
+    "response_diff_analyze": "diff",
+    "analyze_js_bundle": "js_scan",
+    "analyze_graphql": "graphql",
+    "systematic_fuzz": "fuzz",
+    "test_open_redirect": "fuzz",
+    "test_http_smuggling": "fuzz",
+    "test_cache_poisoning": "fuzz",
+    "test_ghost_params": "fuzz",
+    "test_prototype_pollution": "fuzz",
+}
 
 # ── Dynamic State Template (changes every turn, NOT cached) ──────
 DYNAMIC_STATE_TEMPLATE = """\
@@ -497,6 +592,16 @@ escalate to account takeover
 - **DO NOT WASTE TIME ON**: CORS testing, header enumeration, technology fingerprinting, \
 WAF detection, robots.txt analysis, sitemap crawling beyond initial recon. These are \
 scanner-level tasks. Spend your budget on DEEP testing of promising attack vectors.
+
+**CRITICAL FINDING RULES (enforced by system — violations = auto-rejected):**
+- You MUST run a testing tool FIRST, then record findings from its output
+- Findings with no preceding tool call in the same turn are REJECTED
+- Evidence must be >=200 chars and include HTTP response data (status codes, headers, body snippets)
+- tool_used must be the EXACT tool name (e.g. "send_http_request", "test_xss", "systematic_fuzz")
+- You CANNOT set confirmed=true — the system verifies findings automatically
+- Maximum 3 findings per update_knowledge call
+- "I think X might be vulnerable" is a HYPOTHESIS — use hypotheses field, not findings
+- Summary/assessment entries are NOT findings — do not use vuln_type like "multiple_critical"
 
 ### CRITICAL: No Repetition / Be Creative
 - **NEVER repeat a technique on the same endpoint.** Check "Testing Progress" above. If it's listed, \
@@ -732,7 +837,7 @@ blind_sqli_extract tool to automatically extract data using binary search.
 I found the flag in the admin panel: FLAG{example123}. Let me record this
 finding and finish the test.
 
-{"name": "update_knowledge", "input": {"findings": {"admin_sqli": {"vuln_type": "sqli", "endpoint": "/search", "parameter": "q", "evidence": "UNION-based extraction yielded admin credentials", "severity": "critical", "confirmed": true}}}}
+{"name": "update_knowledge", "input": {"findings": {"admin_sqli": {"vuln_type": "sqli", "endpoint": "/search", "parameter": "q", "evidence": "send_http_request POST /search with body q=' UNION SELECT username,password,3,4,5 FROM users-- - returned HTTP 200. Response body contained: admin:$2b$12$LJ3m4... in column 1,2. The UNION SELECT with 5 columns succeeded, confirming 5-column query. Full response snippet: <td>admin</td><td>$2b$12$LJ3m4aBcXy...</td>", "severity": "critical", "tool_used": "send_http_request"}}}}
 {"name": "finish_test", "input": {"assessment": "Found SQL injection at /search parameter 'q'. Extracted admin credentials via UNION SELECT. Logged in to admin panel and found flag."}}
 
 ## Example 8: Custom Exploit Script
@@ -904,6 +1009,25 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         dedup_lines.append("  ⚠️ DO NOT REPEAT any technique listed above on the same endpoint.")
         dedup_lines.append("  You MUST try something NEW — different endpoints, different params,")
         dedup_lines.append("  different attack classes, or completely unexplored surfaces.")
+
+        # ── Coverage matrix: tested vs untested per endpoint ──
+        dedup_lines.append("")
+        dedup_lines.append("  ### Coverage Matrix (tested vs UNTESTED per endpoint)")
+        # Build coverage: endpoint → set of techniques tested
+        coverage: dict[str, set[str]] = {}
+        for key in tested:
+            parts = key.split("::", 1)
+            if len(parts) == 2:
+                ep, tool = parts
+                tech = _TOOL_TO_TECHNIQUE.get(tool, tool)
+                coverage.setdefault(ep or "(global)", set()).add(tech)
+        # Show top 10 endpoints by test count
+        sorted_eps = sorted(coverage.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+        for ep, techs in sorted_eps:
+            untested = [t for t in STANDARD_TECHNIQUES if t not in techs]
+            tested_str = ",".join(sorted(techs))
+            untested_str = ",".join(untested) if untested else "NONE"
+            dedup_lines.append(f"    {ep}: tested=[{tested_str}] UNTESTED=[{untested_str}]")
     if failed:
         dedup_lines.append(f"  Failed approaches: {len(failed)}")
         for key, err in list(failed.items())[-5:]:
@@ -928,6 +1052,20 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
             dedup_lines.append("  ✓ HIGH confidence — good coverage on current surface. Now explore DEEPER: authenticated testing, JS analysis, less-common subdomains")
         else:
             dedup_lines.append("  ✓ HIGH confidence — validate findings and wrap up")
+
+    # ── Thompson Sampling Recommendations ──
+    bandit = state.get("bandit_state", {})
+    if bandit and endpoints and tested:
+        try:
+            from ai_brain.active.react_graph import _thompson_sample_recommendations
+            recs = _thompson_sample_recommendations(bandit, endpoints, tested, n=5)
+            if recs:
+                dedup_lines.append("")
+                dedup_lines.append("  ### Recommended Next Tests (Thompson Sampling)")
+                for r in recs:
+                    dedup_lines.append(f"    -> {r['technique']} on {r['endpoint']} (priority: {r['priority']})")
+        except Exception:
+            pass  # Thompson sampling is advisory only
 
     dedup_summary = "\n".join(dedup_lines) if dedup_lines else "  (no tests executed yet)"
 
@@ -1064,6 +1202,12 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         situational_hints=situational_hints,
         attack_chains_display=attack_chains_display,
     )
+
+    # Append phase-specific context
+    phase_context = _PHASE_CONTEXTS.get(phase, "")
+    if phase_context:
+        dynamic = phase_context + "\n\n" + dynamic
+
     return dynamic
 
 
@@ -1264,6 +1408,70 @@ _RECON_TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["subdomains"],
+        },
+    },
+    {
+        "name": "scan_info_disclosure",
+        "description": (
+            "Scan for sensitive file/path disclosures with CONTENT VERIFICATION. "
+            "Tests 70+ known paths (.git, .env, actuator, backups, configs, etc.) "
+            "but ONLY reports findings where response content matches expected "
+            "patterns — not just HTTP 200. Zero LLM cost. "
+            "Auto-filters paths by detected tech stack for efficiency."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Base URL to scan (e.g., https://example.com)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "build_app_model",
+        "description": (
+            "REQUIRED before exploitation tools unlock (real-world targets only). "
+            "Build a structured understanding of what this application does, how it "
+            "authenticates, and what its highest-value attack targets are. "
+            "Skipped automatically for CTF challenges."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "app_type": {
+                    "type": "string",
+                    "description": "What the application does (e.g., 'E-commerce platform selling electronics with user accounts, shopping cart, and payment processing'). Must be >=10 chars.",
+                },
+                "auth_mechanism": {
+                    "type": "string",
+                    "description": "How authentication works (e.g., 'Session cookie via POST /login with CSRF token, OAuth2 with Google, JWT bearer tokens for API'). Must be >=15 chars.",
+                },
+                "data_flows": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Key data flows (e.g., ['User submits order → /api/checkout → payment gateway → /api/confirm', 'Admin uploads CSV → /api/import → parsed server-side']). Must have >=2 items.",
+                },
+                "user_ref_patterns": {
+                    "type": "string",
+                    "description": "How users/objects are referenced (e.g., 'Sequential numeric IDs in /api/users/{id}, UUIDs in /api/orders/{uuid}').",
+                },
+                "high_value_targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["target", "reason"],
+                    },
+                    "description": "Top attack targets with reasons (e.g., [{'target': '/api/checkout', 'reason': 'Payment processing - price manipulation, race conditions'}, ...]). Must have >=3 items.",
+                },
+            },
+            "required": ["app_type", "auth_mechanism", "data_flows", "user_ref_patterns", "high_value_targets"],
         },
     },
 ]
@@ -1885,6 +2093,231 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
             "properties": {},
         },
     },
+    {
+        "name": "test_ssrf",
+        "description": (
+            "Test a URL-accepting parameter for Server-Side Request Forgery (SSRF). "
+            "Tests 18+ payloads including localhost bypass (hex, decimal, IPv6, octal), "
+            "cloud metadata (AWS/GCP/Azure), protocol schemes (file://), and internal "
+            "service ports. Detects SSRF via response content analysis (metadata indicators, "
+            "internal HTML, /etc/passwd). Zero LLM cost — deterministic httpx calls."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL that accepts a URL parameter",
+                },
+                "param": {
+                    "type": "string",
+                    "description": "The URL-accepting parameter name (e.g., 'url', 'callback', 'redirect', 'webhook')",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST"],
+                    "description": "HTTP method (default: GET)",
+                    "default": "GET",
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Authentication cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Additional headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body for POST (other params besides the SSRF param)",
+                    "additionalProperties": {},
+                },
+            },
+            "required": ["url", "param"],
+        },
+    },
+    {
+        "name": "test_ssti",
+        "description": (
+            "Test a parameter for Server-Side Template Injection (SSTI). "
+            "Tests 11 polyglot probes for Jinja2, Twig, Freemarker, Mako, ERB, Pebble, "
+            "Smarty, Velocity, and Nunjucks. Fingerprints the template engine on success. "
+            "If confirmed, automatically tests RCE escalation payloads per engine. "
+            "Zero LLM cost — deterministic httpx calls."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL",
+                },
+                "param": {
+                    "type": "string",
+                    "description": "Parameter name to inject template probes into",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST"],
+                    "description": "HTTP method (default: GET)",
+                    "default": "GET",
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Authentication cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Additional headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body for POST",
+                    "additionalProperties": {},
+                },
+            },
+            "required": ["url", "param"],
+        },
+    },
+    {
+        "name": "test_race_condition",
+        "description": (
+            "Test an endpoint for race conditions by firing N identical requests "
+            "simultaneously. Ideal for single-use operations (coupon redemption, "
+            "transfers, votes, account creation). If >1 request succeeds for a "
+            "single-use operation, race condition is confirmed. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                    "description": "HTTP method (default: POST)",
+                    "default": "POST",
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body",
+                    "additionalProperties": {},
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Request headers (including auth)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Authentication cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+                "concurrent_requests": {
+                    "type": "integer",
+                    "description": "Number of simultaneous requests (default: 20, max: 50)",
+                    "default": 20,
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "analyze_graphql",
+        "description": (
+            "Analyze a GraphQL endpoint: test introspection, enumerate queries/mutations, "
+            "test mutation authorization (which mutations work without auth?), and check "
+            "query depth limits. Returns full schema if introspection is enabled, plus "
+            "list of unprotected mutations. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "GraphQL endpoint URL (e.g., https://target.com/graphql)",
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Authentication cookies (used for schema introspection)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Additional headers (e.g., Authorization)",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "analyze_js_bundle",
+        "description": (
+            "Download and analyze JavaScript bundles for secrets, API keys, internal URLs, "
+            "debug routes, admin paths, GraphQL operations, and source maps. Scans with "
+            "20+ regex patterns (AWS keys, GitHub tokens, Stripe keys, JWTs, etc). "
+            "Pass a single URL or list of JS bundle URLs. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Single JS bundle URL to analyze",
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of JS bundle URLs to analyze (max 15)",
+                },
+            },
+        },
+    },
+    {
+        "name": "test_authz_matrix",
+        "description": (
+            "Test authorization across multiple roles for multiple endpoints. "
+            "Sends each endpoint request as each role (including anonymous) and builds "
+            "an access matrix. Flags endpoints where lower-privilege roles have unexpected "
+            "access. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "endpoints": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "method": {"type": "string", "default": "GET"},
+                        },
+                        "required": ["url"],
+                    },
+                    "description": "List of endpoints to test",
+                },
+                "auth_contexts": {
+                    "type": "object",
+                    "description": "Dict of role_name -> {cookies: {...}, headers: {...}}. Anonymous is auto-added.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "cookies": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+            "required": ["endpoints", "auth_contexts"],
+        },
+    },
 ]
 
 _UTILITY_TOOLS: list[dict[str, Any]] = [
@@ -2013,9 +2446,12 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
                 "findings": {
                     "type": "object",
                     "description": (
-                        "Findings to add/update. Key=finding_id, Value={vuln_type, "
-                        "endpoint, parameter, evidence, severity, confirmed, "
-                        "chained_from, tool_used}"
+                        "ONLY record findings backed by ACTUAL tool output from this turn. "
+                        "Required: vuln_type, endpoint, parameter, evidence (>=200 chars with "
+                        "HTTP data), severity, tool_used (exact tool name). Max 3 findings "
+                        "per call. Fabricated findings are auto-rejected. "
+                        "Key=finding_id, Value={vuln_type, endpoint, parameter, evidence, "
+                        "severity, tool_used, chained_from}"
                     ),
                     "additionalProperties": {"type": "object"},
                 },
@@ -2285,6 +2721,48 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "deep_research",
+        "description": (
+            "Perform deep security research using an external AI with web search "
+            "and extended thinking. Use this when you encounter a complex situation "
+            "and need expert-level research: unfamiliar technology stacks, unusual "
+            "error messages, potential CVEs, WAF bypass techniques, or advanced "
+            "attack chains. Describe your situation in detail — what you're seeing, "
+            "what technologies are involved, what you've already tried. The tool "
+            "will search the web for recent CVEs, disclosed vulnerabilities, and "
+            "techniques relevant to the exact technology stack, then return "
+            "structured research with specific attack techniques, payloads, and "
+            "chained attack paths. Takes 30-120 seconds. Use sparingly — only "
+            "when you genuinely need deep research, not for simple tasks."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "situation": {
+                    "type": "string",
+                    "description": (
+                        "Detailed description of the current situation: what endpoint "
+                        "you're testing, what responses you're seeing, what technologies "
+                        "are involved, and any interesting behaviors observed."
+                    ),
+                },
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "Specific question you want answered (e.g., 'What advanced "
+                        "GraphQL attack techniques should I try?' or 'How to bypass "
+                        "this specific WAF rule?')"
+                    ),
+                },
+                "already_tried": {
+                    "type": "string",
+                    "description": "What techniques you've already tried (to avoid redundant suggestions)",
+                },
+            },
+            "required": ["situation"],
+        },
+    },
+    {
         "name": "finish_test",
         "description": (
             "Signal that you have completed testing (FINITE MODE ONLY). Provide a final "
@@ -2445,11 +2923,12 @@ def _generate_situational_hints(state: dict) -> str:
         any(kw in url.lower() for kw in ("graphql", "gql"))
         for url in endpoints
     )
-    if has_graphql:
+    graphql_tested = any("analyze_graphql" in k or "graphql" in k.lower() for k in tested)
+    if has_graphql and not graphql_tested:
         hints.append(
-            "GRAPHQL ENDPOINT detected. Try introspection query first: "
-            "{__schema{types{name,fields{name}}}}. Check for auth bypass per field, "
-            "alias-based batching for brute force, and injection in resolver arguments."
+            "GRAPHQL ENDPOINT detected. Use `analyze_graphql` tool — tests introspection, "
+            "enumerates queries/mutations, checks mutation authorization, and tests depth limits. "
+            "Zero LLM cost. Then manually test unprotected mutations for data extraction."
         )
 
     # Hint: File upload form detected
@@ -2601,6 +3080,101 @@ def _generate_situational_hints(state: dict) -> str:
                     )
                     break  # One hint per template
 
+    # ── Application-type-specific attack strategies ──
+    all_endpoint_text = " ".join(endpoints.keys()).lower()
+    all_notes = " ".join(str(info.get("notes", "")) for info in endpoints.values()).lower()
+    app_context = all_endpoint_text + " " + all_notes + " " + " ".join(t.lower() for t in tech_stack)
+
+    _ecommerce_kw = ("cart", "checkout", "payment", "price", "order", "product", "shop", "invoice", "billing")
+    _saas_kw = ("workspace", "team", "org", "tenant", "account", "invite", "subscription", "plan")
+    _api_kw = ("graphql", "/api/", "swagger", "openapi", "/rest/", "api-docs")
+    _social_kw = ("profile", "post", "comment", "upload", "message", "share", "feed", "follow")
+
+    if any(kw in app_context for kw in _ecommerce_kw):
+        hints.append(
+            "E-COMMERCE DETECTED — PRIORITY ATTACKS: "
+            "1) Price manipulation (modify price/quantity in POST body), "
+            "2) Race conditions on checkout (use `test_race_condition` on payment endpoint), "
+            "3) Coupon abuse (replay/stack codes), "
+            "4) IDOR on order IDs and invoices, "
+            "5) Payment callback URL manipulation (SSRF via webhook/callback param)"
+        )
+    if any(kw in app_context for kw in _saas_kw):
+        hints.append(
+            "SaaS/MULTI-TENANT DETECTED — PRIORITY ATTACKS: "
+            "1) Cross-tenant IDOR (access tenant B resources as tenant A), "
+            "2) Invitation link manipulation, "
+            "3) API key scope bypass, "
+            "4) Webhook URL SSRF (use `test_ssrf`), "
+            "5) Export injection (CSV formula, PDF SSRF), "
+            "6) Role escalation via invite / mass assignment"
+        )
+    if any(kw in app_context for kw in _api_kw):
+        hints.append(
+            "API/GRAPHQL DETECTED — PRIORITY ATTACKS: "
+            "1) Use `analyze_graphql` for introspection + unprotected mutation detection, "
+            "2) Test every mutation as anonymous, "
+            "3) Batch query brute force, "
+            "4) Field-level authorization gaps, "
+            "5) API versioning bypass (/v1/ protected → /v2/ open?)"
+        )
+    if any(kw in app_context for kw in _social_kw):
+        hints.append(
+            "SOCIAL/UGC DETECTED — PRIORITY ATTACKS: "
+            "1) Stored XSS in user content (profile, comments), "
+            "2) IDOR on private messages/DMs, "
+            "3) File upload to webshell, "
+            "4) Mass assignment on profile (role=admin), "
+            "5) Second-order XSS (store in profile, trigger in admin/export view)"
+        )
+
+    # ── Pivot guidance: detect tunnel vision ──
+    # Count consecutive attempts on same endpoint
+    recent_endpoints = []
+    for key in list(tested.keys())[-10:]:
+        ep = key.split("::")[0] if "::" in key else ""
+        if ep:
+            recent_endpoints.append(ep)
+    if len(recent_endpoints) >= 3:
+        from collections import Counter as _PivotCounter
+        ep_counts = _PivotCounter(recent_endpoints)
+        most_common_ep, count = ep_counts.most_common(1)[0]
+        if count >= 3:
+            hints.append(
+                f"⚠ TUNNEL VISION: {count} consecutive attempts on {most_common_ep}. "
+                f"STOP. Record rejected hypothesis. Move to a DIFFERENT endpoint or attack class. "
+                f"If full attack cycle completed, do NOT re-test. Try: different subdomains, "
+                f"JS bundle analysis, different user role, mobile API paths (/api/v1/mobile/)."
+            )
+
+    # ── Hint: JS bundle analysis not done yet ──
+    js_analyzed = any("analyze_js_bundle" in k for k in tested)
+    if not js_analyzed and len(endpoints) >= 5:
+        hints.append(
+            "JS BUNDLES NOT ANALYZED YET. Use `analyze_js_bundle` on discovered .js files — "
+            "this finds API keys, internal URLs, debug routes, admin paths, GraphQL operations, "
+            "and hardcoded secrets. Zero LLM cost. The crypto.com API key was found this way."
+        )
+
+    # ── Hint: SSRF/SSTI tools now available ──
+    has_url_param = any(
+        any(p in url.lower() for p in ("url=", "callback=", "redirect=", "webhook=", "dest=", "fetch=", "src=", "img="))
+        for url in endpoints
+    )
+    ssrf_tested = any("test_ssrf" in k or "ssrf" in k.lower() for k in tested)
+    if has_url_param and not ssrf_tested:
+        hints.append(
+            "URL-ACCEPTING PARAMETER detected. Use `test_ssrf` — tests 18+ payloads "
+            "(localhost bypass, cloud metadata, protocol schemes) automatically. Zero LLM cost."
+        )
+
+    ssti_tested = any("test_ssti" in k or "ssti" in k.lower() for k in tested)
+    if not ssti_tested and any("template" in app_context for _ in [1]):
+        hints.append(
+            "TEMPLATE ENGINE detected. Use `test_ssti` — tests 11 polyglot probes for "
+            "Jinja2, Twig, Freemarker, Mako, ERB and auto-escalates to RCE. Zero LLM cost."
+        )
+
     # Hint: Default headers are injected — agent must use no_auth=true for bypass testing
     default_headers = state.get("_default_headers", {})
     if default_headers:
@@ -2622,6 +3196,18 @@ def _generate_situational_hints(state: dict) -> str:
         "Do NOT call systematic_fuzz with large wordlists unless critical. "
         "Prefer fewer, smarter requests over brute-force enumeration."
     )
+
+    # Hint: App model required for exploitation
+    app_model = state.get("app_model", {})
+    turn_count = state.get("turn_count", 0)
+    max_turns = state.get("max_turns", 150)
+    budget_limit = state.get("budget_limit", 10.0)
+    is_ctf = (max_turns > 0 and max_turns <= 150 and budget_limit <= 5.0)
+    if not app_model and not is_ctf and turn_count > 3:
+        hints.append(
+            "⚠️ EXPLOITATION LOCKED: Call build_app_model first. Describe the application type, "
+            "auth mechanism, data flows, user reference patterns, and top 3+ high-value targets."
+        )
 
     if not hints:
         return ""
@@ -2673,15 +3259,20 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "analyze_traffic", "enumerate_subdomains", "resolve_domains",
         "systematic_fuzz",  # directory fuzzing is recon
         "waf_fingerprint", "profile_endpoint_behavior", "discover_chains",
+        "analyze_js_bundle", "analyze_graphql", "scan_info_disclosure",
         "browser_interact", "update_knowledge", "update_working_memory",
         "read_working_memory", "formulate_strategy", "get_playbook",
-        "manage_chain", "finish_test",
+        "manage_chain", "deep_research", "finish_test",
+        "build_app_model",
     },
     "auth": {
         "register_account", "login_account", "navigate_and_extract",
         "browser_interact", "send_http_request", "solve_captcha",
+        "test_ssrf", "test_ssti", "test_race_condition",
+        "analyze_graphql", "analyze_js_bundle", "test_authz_matrix",
         "update_knowledge", "update_working_memory", "read_working_memory",
-        "manage_chain", "finish_test",
+        "manage_chain", "deep_research", "finish_test",
+        "build_app_model",
     },
     "exploitation": {
         "send_http_request", "test_sqli", "test_xss", "test_cmdi",
@@ -2691,16 +3282,20 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "waf_fingerprint", "waf_generate_bypasses",
         "test_http_smuggling", "test_cache_poisoning", "test_ghost_params",
         "test_prototype_pollution", "test_open_redirect",
+        "test_ssrf", "test_ssti", "test_race_condition",
+        "analyze_graphql", "analyze_js_bundle", "test_authz_matrix",
         "profile_endpoint_behavior", "discover_chains", "solve_captcha",
         "update_knowledge", "update_working_memory", "read_working_memory",
-        "get_playbook", "get_proxy_traffic", "manage_chain", "finish_test",
+        "get_playbook", "get_proxy_traffic", "manage_chain", "deep_research",
+        "finish_test",
     },
     "post_exploit": {
         "send_http_request", "run_custom_exploit", "blind_sqli_extract",
         "discover_chains", "waf_generate_bypasses", "test_ghost_params",
+        "test_authz_matrix", "analyze_graphql",
         "browser_interact", "navigate_and_extract", "update_knowledge",
         "update_working_memory", "read_working_memory",
-        "manage_chain", "finish_test",
+        "manage_chain", "deep_research", "finish_test",
     },
 }
 
@@ -2717,6 +3312,21 @@ def get_tool_schemas(state: dict[str, Any] | None = None) -> list[dict[str, Any]
         return all_tools
 
     phase = _detect_phase(state)
+
+    # ── App comprehension gate ──
+    # In real-world mode, lock exploitation tools until app_model is built.
+    # CTF bypass: skip gate when budget <= 5.0 and max_turns <= 150 (typical CTF settings).
+    app_model = state.get("app_model", {})
+    max_turns = state.get("max_turns", 150)
+    budget_limit = state.get("budget_limit", 10.0)
+    no_app_gate = state.get("_no_app_gate", False)
+    is_ctf = (max_turns > 0 and max_turns <= 150 and budget_limit <= 5.0)
+
+    if not app_model and not is_ctf and not no_app_gate and phase in ("exploitation", "post_exploit"):
+        # Downgrade: only recon + auth + build_app_model tools
+        allowed = _PHASE_TOOLS["recon"] | _PHASE_TOOLS["auth"] | {"build_app_model"}
+        return [t for t in all_tools if t["name"] in allowed]
+
     allowed = _PHASE_TOOLS.get(phase)
     if allowed is None:
         return all_tools  # unknown phase → all tools

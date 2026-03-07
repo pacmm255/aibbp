@@ -189,6 +189,10 @@ class WafBypassEngine:
         self._rate_limit = rate_limit
         self._profiles: dict[str, WafProfile] = {}
 
+    def has_profile(self, domain: str) -> bool:
+        """Check if a WAF profile exists for this domain."""
+        return domain in self._profiles
+
     async def fingerprint(
         self,
         target_url: str,

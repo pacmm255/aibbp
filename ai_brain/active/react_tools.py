@@ -21,6 +21,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
+
+import httpx
 import structlog
 
 from ai_brain.active.recon_engine import SubdomainEnumerator
@@ -84,8 +87,10 @@ class ToolDeps:
     chain_engine: Any | None = None  # ChainDiscoveryEngine
     reasoning_engine: Any | None = None  # AdversarialReasoningEngine
     behavior_profiler: Any | None = None  # BehaviorProfiler
+    agent_c_research: Any | None = None  # AgentCResearch (deep research tool)
     goja_socks5_url: str | None = None  # Goja SOCKS5 proxy for Chrome TLS fingerprinting
     current_state: dict[str, Any] | None = None  # For tools that need state read access
+    tools_executed_this_turn: set[str] = field(default_factory=set)  # Provenance tracking
     max_turns: int = 150  # 0 = indefinite mode
     default_headers: dict[str, str] = field(default_factory=dict)  # Custom headers for bug bounty programs
     _cf_cookie_jar: dict[str, tuple[float, dict[str, str]]] = field(default_factory=dict)  # domain -> (timestamp, cookies)
@@ -271,6 +276,27 @@ async def _dispatch(
         }
         if js_endpoints:
             result_data["js_api_endpoints"] = js_endpoints
+
+        # Auto-auth-check: fire one unauthenticated request to tag auth requirement
+        try:
+            async with httpx.AsyncClient(
+                verify=False, timeout=5,
+                **({"proxy": deps.goja_socks5_url} if deps.goja_socks5_url else {}),
+            ) as _auth_check_client:
+                anon_resp = await _auth_check_client.get(url)
+                if anon_resp.status_code in (401, 403):
+                    result_data["auth_required"] = True
+                elif anon_resp.status_code in (301, 302, 307, 308):
+                    location = anon_resp.headers.get("location", "").lower()
+                    if any(kw in location for kw in ("login", "auth", "signin")):
+                        result_data["auth_required"] = True
+                    else:
+                        result_data["auth_required"] = False
+                else:
+                    result_data["auth_required"] = False
+        except Exception:
+            pass  # Don't fail the tool on auth check error
+
         return result_data
 
     if tool_name == "crawl_target":
@@ -342,7 +368,105 @@ async def _dispatch(
         enumerator = SubdomainEnumerator(deps.scope_guard, deps.config.tools_timeout)
         return await enumerator.resolve_domains(subdomains)
 
+    if tool_name == "scan_info_disclosure":
+        from ai_brain.active.deterministic_tools import InfoDisclosureScanner
+        scanner = InfoDisclosureScanner(deps.scope_guard, socks_proxy=deps.goja_socks5_url)
+        tech_stack = state.get("tech_stack", []) if state else []
+        result = await scanner.scan(inp["url"], tech_stack=tech_stack or None)
+
+        # Auto-generate findings for critical verified disclosures
+        auto_findings: dict[str, Any] = {}
+        for item in result.get("verified", []):
+            cat = item["category"]
+            path = item["path"]
+            preview = item.get("evidence_preview", "")
+            severity = "high"
+            if cat in ("creds", "backup") and any(kw in preview.lower() for kw in ("password", "secret", "private_key")):
+                severity = "critical"
+            elif cat in ("git", "env"):
+                severity = "high"
+            elif cat in ("api_docs", "robots", "sitemap", "sourcemap"):
+                severity = "low"
+                continue  # Don't auto-create findings for low-severity disclosures
+            else:
+                severity = "medium"
+
+            fid = f"info_disc_{cat}_{path.replace('/', '_').strip('_')}"
+            auto_findings[fid] = {
+                "vuln_type": "information_disclosure",
+                "endpoint": path,
+                "parameter": "",
+                "evidence": (
+                    f"scan_info_disclosure found {path} (category={cat}) with HTTP 200. "
+                    f"Content verification passed. Content-Length: {item['content_length']}. "
+                    f"Preview: {preview[:300]}"
+                ),
+                "severity": severity,
+                "confirmed": True,
+                "tool_used": "scan_info_disclosure",
+                "evidence_score": 4,
+                "evidence_score_reason": f"confirmed: verified {cat} content pattern",
+            }
+
+        state_update = {}
+        if auto_findings:
+            state_update["findings"] = auto_findings
+        return {**result, "_state_update": state_update} if state_update else result
+
+    if tool_name == "build_app_model":
+        # Validate substantive content (reject placeholders)
+        errors = []
+        app_type = inp.get("app_type", "")
+        auth_mechanism = inp.get("auth_mechanism", "")
+        data_flows = inp.get("data_flows", [])
+        high_value_targets = inp.get("high_value_targets", [])
+
+        if len(app_type) < 10:
+            errors.append("app_type must be >=10 chars (describe what the app does)")
+        if len(auth_mechanism) < 15:
+            errors.append("auth_mechanism must be >=15 chars (describe how auth works)")
+        if len(data_flows) < 2:
+            errors.append("data_flows must have >=2 items (describe key data flows)")
+        if len(high_value_targets) < 3:
+            errors.append("high_value_targets must have >=3 items with reasons")
+
+        # Reject placeholder/generic content
+        _placeholders = {"tbd", "todo", "unknown", "n/a", "none", "placeholder", "test"}
+        for field_val in [app_type, auth_mechanism]:
+            if field_val.lower().strip() in _placeholders:
+                errors.append(f"'{field_val}' looks like placeholder text — provide real analysis")
+
+        if errors:
+            return {"status": "rejected", "errors": errors, "message": "App model incomplete. Gather more recon data first."}
+
+        model = {
+            "app_type": app_type,
+            "auth_mechanism": auth_mechanism,
+            "data_flows": data_flows,
+            "user_ref_patterns": inp.get("user_ref_patterns", ""),
+            "high_value_targets": high_value_targets,
+        }
+        return {
+            "status": "accepted",
+            "message": "App model built. Exploitation tools are now unlocked.",
+            "_state_update": {"app_model": model},
+        }
+
     # ── Attack Tools ─────────────────────────────────────────────
+
+    # Auto-WAF-fingerprint: before running attack tools, ensure WAF profile exists
+    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf"}
+    if tool_name in _WAF_ATTACK_TOOLS and deps.waf_engine:
+        url = inp.get("url", "")
+        if url:
+            from urllib.parse import urlparse as _waf_urlparse
+            domain = _waf_urlparse(url).netloc
+            if domain and not deps.waf_engine.has_profile(domain):
+                try:
+                    logger.info("auto_waf_fingerprint", domain=domain, tool=tool_name)
+                    await deps.waf_engine.fingerprint(url)
+                except Exception as e:
+                    logger.debug("auto_waf_fingerprint_failed", error=str(e)[:80])
 
     if tool_name == "test_sqli":
         return await deps.tool_runner.run_sqlmap(
@@ -507,7 +631,7 @@ async def _dispatch(
 
         # Get tech stack for payload ranking
         tech = deps.config.technology_stack if hasattr(deps.config, "technology_stack") else []
-        payloads = generate_upload_payloads(tech_stack=tech, max_payloads=max_payloads)
+        payloads = generate_upload_payloads(tech_stack=tech)[:max_payloads]
 
         results = []
         for payload in payloads:
@@ -687,24 +811,37 @@ async def _dispatch(
 
     if tool_name == "update_knowledge":
         # Special: returns state update directive
-        # Validate findings at write-time (structured validation)
+        # ── Tool provenance check: block findings if no tool ran this turn ──
         validated_findings = {}
         if "findings" in inp:
-            validated_findings = _validate_findings(inp["findings"])
+            if not deps.tools_executed_this_turn:
+                return {
+                    "error": (
+                        "Cannot record findings — no testing tool was executed this turn. "
+                        "Run a tool (test_xss, send_http_request, systematic_fuzz, etc.) "
+                        "first, then record findings from its output."
+                    ),
+                    "_state_update": {},
+                }
+            validated_findings = _validate_findings(inp["findings"], source="brain")
+            if not validated_findings and inp["findings"]:
+                # All findings failed validation — give specific feedback
+                return {
+                    "error": (
+                        "All findings rejected. Common reasons: "
+                        "tool_used must be exact tool name (e.g. 'send_http_request', 'test_xss'), "
+                        "evidence must be >=200 chars with HTTP data (status codes, response body), "
+                        "max 3 findings per call, no summary/meta vuln_types. "
+                        "Run the testing tool, then record what it actually found."
+                    ),
+                    "_state_update": {},
+                }
 
         update: dict[str, Any] = {"_state_update": {}}
         if "endpoints" in inp:
             update["_state_update"]["endpoints"] = inp["endpoints"]
         if validated_findings:
             update["_state_update"]["findings"] = validated_findings
-        elif "findings" in inp:
-            # Validation returned nothing — return error
-            return {
-                "error": "Finding validation failed. Required fields: "
-                "vuln_type, endpoint, severity (critical/high/medium/low/info). "
-                "Provide at least these fields for each finding.",
-                "_state_update": {},
-            }
         if "hypotheses" in inp:
             update["_state_update"]["hypotheses"] = inp["hypotheses"]
         if "accounts" in inp:
@@ -1070,6 +1207,58 @@ async def _dispatch(
             "suggestions": suggestions[:10],
         }
 
+    if tool_name == "deep_research":
+        if not deps.agent_c_research:
+            return {"error": "Deep research not available. Enable with --zai-research flag."}
+        situation = inp.get("situation", "")
+        if not situation:
+            return {"error": "situation is required — describe what you're seeing in detail."}
+        # Build context from current state
+        state = deps.current_state or {}
+        tech_stack = state.get("tech_stack", [])
+        target_url = state.get("target_url", "")
+        # Collect already-tried from state
+        tested = state.get("tested_techniques", {})
+        tried_str = inp.get("already_tried", "")
+        if tested and not tried_str:
+            tried_str = ", ".join(list(tested.keys())[:30])
+        # Collect existing findings summary
+        findings = state.get("findings", {})
+        findings_str = ""
+        if findings:
+            f_lines = []
+            for fid, fd in list(findings.items())[:10]:
+                f_lines.append(f"- {fd.get('vuln_type', '?')}: {fd.get('endpoint', '?')} ({fd.get('severity', '?')})")
+            findings_str = "\n".join(f_lines)
+        result = await deps.agent_c_research.research(
+            situation=situation,
+            target_url=target_url,
+            tech_stack=tech_stack,
+            question=inp.get("question", ""),
+            already_tried=tried_str,
+            existing_findings=findings_str,
+        )
+        # Format for the agent
+        if result.get("success"):
+            output = {
+                "status": "success",
+                "research": result.get("research_text", "")[:8000],
+                "techniques_found": len(result.get("techniques", [])),
+                "cves_found": result.get("cves", []),
+                "web_search_used": result.get("web_search_used", False),
+                "duration_s": result.get("duration_s", 0),
+            }
+            # Include top techniques as structured data
+            techniques = result.get("techniques", [])[:5]
+            if techniques:
+                output["top_techniques"] = techniques
+            return output
+        return {
+            "status": "failed",
+            "error": result.get("error", "Unknown error"),
+            "partial_research": result.get("research_text", "")[:2000],
+        }
+
     if tool_name == "solve_captcha":
         ctx = inp.get("context_name", "default")
         await _ensure_context(deps, ctx)
@@ -1094,6 +1283,119 @@ async def _dispatch(
                 "For reCAPTCHA/hCaptcha/Turnstile, a --captcha-api-key is required."
             ),
         }
+
+    if tool_name == "test_ssrf":
+        from ai_brain.active.deterministic_tools import SSRFTester
+        tester = SSRFTester(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, 'tools_timeout') else 10,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        try:
+            return await tester.test(
+                url=inp["url"],
+                param=inp["param"],
+                method=inp.get("method", "GET"),
+                cookies=inp.get("cookies"),
+                headers=inp.get("headers"),
+                body=inp.get("body"),
+            )
+        finally:
+            await tester.close()
+
+    if tool_name == "test_ssti":
+        from ai_brain.active.deterministic_tools import SSTITester
+        tester = SSTITester(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, 'tools_timeout') else 10,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        try:
+            return await tester.test(
+                url=inp["url"],
+                param=inp["param"],
+                method=inp.get("method", "GET"),
+                cookies=inp.get("cookies"),
+                headers=inp.get("headers"),
+                body=inp.get("body"),
+            )
+        finally:
+            await tester.close()
+
+    if tool_name == "test_race_condition":
+        from ai_brain.active.deterministic_tools import RaceConditionTester
+        tester = RaceConditionTester(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, 'tools_timeout') else 15,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        concurrent = min(inp.get("concurrent_requests", 20), 50)
+        return await tester.test(
+            url=inp["url"],
+            method=inp.get("method", "POST"),
+            body=inp.get("body"),
+            headers=inp.get("headers"),
+            cookies=inp.get("cookies"),
+            concurrent_requests=concurrent,
+        )
+
+    if tool_name == "analyze_graphql":
+        from ai_brain.active.deterministic_tools import GraphQLAnalyzer
+        analyzer = GraphQLAnalyzer(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, 'tools_timeout') else 15,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        try:
+            return await analyzer.analyze(
+                url=inp["url"],
+                cookies=inp.get("cookies"),
+                headers=inp.get("headers"),
+            )
+        finally:
+            await analyzer.close()
+
+    if tool_name == "analyze_js_bundle":
+        from ai_brain.active.deterministic_tools import SecretScanner
+        scanner = SecretScanner()
+        urls = inp.get("urls") or ([inp["url"]] if inp.get("url") else [])
+        urls = urls[:15]  # Cap at 15
+
+        proxy_kwargs = {}
+        if deps.goja_socks5_url:
+            proxy_kwargs["proxy"] = deps.goja_socks5_url
+        async with httpx.AsyncClient(verify=False, timeout=15, **proxy_kwargs) as client:
+            all_results = {"bundles_analyzed": 0, "secrets": [], "api_endpoints": [],
+                          "internal_urls": [], "graphql_ops": [], "source_maps": [],
+                          "debug_routes": [], "admin_paths": []}
+            for js_url in urls:
+                try:
+                    resp = await client.get(js_url, headers=deps.default_headers or {})
+                    if resp.status_code == 200 and len(resp.text) > 0:
+                        scan = scanner.scan(resp.text)
+                        all_results["bundles_analyzed"] += 1
+                        for key in scan:
+                            for item in scan[key]:
+                                item["source_url"] = js_url
+                                all_results[key].append(item)
+                except Exception as e:
+                    logger.debug("js_bundle_fetch_failed", url=js_url, error=str(e)[:80])
+        return all_results
+
+    if tool_name == "test_authz_matrix":
+        from ai_brain.active.deterministic_tools import AuthorizationMatrixTester
+        tester = AuthorizationMatrixTester(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, 'tools_timeout') else 10,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        try:
+            return await tester.test(
+                endpoints=inp["endpoints"],
+                auth_contexts=inp.get("auth_contexts", {}),
+            )
+        finally:
+            await tester.close()
 
     if tool_name == "finish_test":
         # In indefinite mode, reject finish and tell brain to keep going
@@ -1225,6 +1527,51 @@ async def _crawl_bfs(
     }
     if all_js_endpoints:
         result["js_api_endpoints"] = sorted(all_js_endpoints)
+
+    # ── Auto-JS-bundle secret scanning on crawl (Change 2c) ──
+    # Extract JS bundle URLs from page scripts, scan top 10 by size for secrets
+    try:
+        from ai_brain.active.deterministic_tools import SecretScanner
+        scanner = SecretScanner()
+        js_urls = set()
+        for page in pages:
+            # Scripts are extracted during page visits but stored in page_info
+            # We already have js_api_endpoints — also scan external .js src
+            pass
+        # Collect script src URLs from all visited pages
+        for page in pages:
+            url_base = page.get("url", start_url)
+            # Re-check for script src in forms data
+        # Scan any discovered JS bundles from inline script endpoints
+        all_js_bundle_secrets = []
+        if all_js_endpoints:
+            js_bundle_urls = [
+                urljoin(start_url, ep) for ep in all_js_endpoints
+                if ep.endswith(".js") and not any(
+                    skip in ep for skip in ("vendor", "polyfill", "chunk", "webpack", "runtime")
+                )
+            ][:10]
+            if js_bundle_urls:
+                proxy_kwargs: dict[str, Any] = {}
+                if deps.goja_socks5_url:
+                    proxy_kwargs["proxy"] = deps.goja_socks5_url
+                async with httpx.AsyncClient(verify=False, timeout=10, **proxy_kwargs) as js_client:
+                    for js_url in js_bundle_urls:
+                        try:
+                            resp = await js_client.get(js_url)
+                            if resp.status_code == 200 and len(resp.text) > 100:
+                                scan = scanner.scan(resp.text)
+                                for category, items in scan.items():
+                                    for item in items:
+                                        item["source_url"] = js_url
+                                        all_js_bundle_secrets.append(item)
+                        except Exception:
+                            pass
+                if all_js_bundle_secrets:
+                    result["js_secrets"] = all_js_bundle_secrets[:50]
+    except Exception as e:
+        logger.debug("auto_js_scan_failed", error=str(e)[:80])
+
     return result
 
 
@@ -1465,16 +1812,180 @@ async def _login_account(
 _VALID_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info"})
 _REQUIRED_FINDING_FIELDS = ("vuln_type", "endpoint", "severity")
 
+# ── Anti-fabrication: tool provenance allowlist ──
+_REAL_TOOL_NAMES = frozenset({
+    "test_sqli", "test_xss", "test_cmdi", "test_ssrf", "test_ssti",
+    "test_auth_bypass", "test_idor", "test_jwt", "test_file_upload",
+    "test_race_condition", "test_authz_matrix",
+    "blind_sqli_extract", "systematic_fuzz", "response_diff_analyze",
+    "run_content_discovery", "send_http_request", "run_custom_exploit",
+    "navigate_and_extract", "browser_interact", "run_dalfox", "run_sqlmap",
+    "cors_tester", "open_redirect_tester", "cache_poison_tester",
+    "http_smuggling_tester", "ghost_param_discovery", "behavioral_profiler",
+    "run_commix", "deep_research", "crawl_target", "enumerate_subdomains",
+    "test_http_smuggling", "test_cache_poisoning", "test_ghost_params",
+    "test_prototype_pollution", "test_open_redirect", "test_cors",
+    "profile_endpoint_behavior", "waf_fingerprint", "waf_generate_bypasses",
+    "analyze_graphql", "analyze_js_bundle",
+    "scan_info_disclosure", "build_app_model",
+})
 
-def _validate_findings(findings: dict[str, Any]) -> dict[str, Any]:
-    """Validate findings at write-time, enforcing required fields.
+# ── Anti-fabrication: reject summary/meta vuln types ──
+_REJECT_VULN_TYPE_WORDS = frozenset({
+    "multiple", "assessment", "summary", "complete", "overview",
+    "general", "comprehensive", "final", "testing_complete",
+})
 
-    Required: vuln_type, endpoint, severity (must be in VALID_SEVERITIES).
-    Optional but recommended: parameter, evidence, confirmed, tool_used,
-    chained_from.
+# ── Evidence quality: at least one concrete indicator must be present ──
+_EVIDENCE_INDICATORS = re.compile(
+    r"\d{3}"           # HTTP status code (200, 403, 500, ...)
+    r"|https?://"      # URL
+    r"|/[a-zA-Z]"      # Path
+    r"|<[a-zA-Z]"      # HTML/XML tag
+    r'|\{"'            # JSON object
+    r"|<script"        # XSS payload
+    r"|UNION"          # SQLi payload
+    r"|\{\{"           # SSTI payload
+    r"|alert\("        # XSS indicator
+    r"|Location:"      # HTTP header
+    r"|Content-Type:"  # HTTP header
+    r"|Set-Cookie:"    # HTTP header
+    r"|HTTP/\d"        # HTTP version
+    r"|status[_\s]*code" # Status code reference
+    , re.IGNORECASE,
+)
+
+_MIN_EVIDENCE_LENGTH = 200  # Real tool output is verbose; 49-char prose = fabrication
+
+# ── Vuln type canonicalization for dedup ──
+_VULN_TYPE_CANONICAL: dict[str, str] = {
+    "reflected_xss": "xss", "stored_xss": "xss", "cross_site_scripting": "xss",
+    "sql_injection": "sqli", "blind_sqli": "sqli", "union_sqli": "sqli",
+    "command_injection": "cmdi", "os_command_injection": "cmdi",
+    "server_side_request_forgery": "ssrf", "open_redirect": "redirect",
+    "url_redirect": "redirect", "cors_misconfiguration": "cors",
+    "account_takeover": "ato", "path_traversal": "lfi",
+    "directory_traversal": "lfi", "local_file_inclusion": "lfi",
+    "nosql_injection": "nosqli",
+    "multiple_vulnerabilities": "REJECT",
+    "multiple_critical_vulnerabilities": "REJECT",
+    "multiple_critical": "REJECT",
+}
+
+
+def _canonicalize_vuln_type(vt: str) -> str:
+    """Normalize vuln_type to a canonical form for dedup."""
+    vt_lower = vt.lower().strip()
+    return _VULN_TYPE_CANONICAL.get(vt_lower, vt_lower)
+
+
+def _score_evidence(finding: dict) -> tuple[int, str]:
+    """Score evidence quality 0-5. Returns (score, reason).
+
+    5 = DEFINITIVE: OOB callback confirmed, extracted data from blind channel
+    4 = CONFIRMED: Payload reflected in executable context, data extracted
+    3 = STRONG: ≥2 distinct anomaly signals
+    2 = MODERATE: Single anomalous signal only
+    1 = WEAK: Describes intent without response data
+    0 = NONE: Empty or purely request-side data
+    """
+    evidence = str(finding.get("evidence", ""))
+    if not evidence or len(evidence) < 20:
+        return 0, "no evidence"
+
+    # Anti-patterns: force score ≤1 if evidence only describes intent
+    _INTENT_ONLY = re.compile(
+        r"^(?:.*(?:might be|possibly|could indicate|may be|appears to|"
+        r"potentially|suggests?|likely|probably|seems|i think|i believe).*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    has_response_data = bool(re.search(
+        r"HTTP[/ ]\d|status[_\s]*code|response|returned|body|header|content.length",
+        evidence, re.IGNORECASE,
+    ))
+    if _INTENT_ONLY.search(evidence) and not has_response_data:
+        return 1, "intent-only description without response data"
+
+    # Score 5: Definitive indicators
+    _DEFINITIVE = [
+        re.compile(r"root:x:0:0"),
+        re.compile(r"uid=\d+.*gid=\d+"),
+        re.compile(r"callback.*received|oob.*confirmed|interactsh.*hit", re.IGNORECASE),
+        re.compile(r"\|\s*\w+\s*\|\s*\w+\s*\|"),  # pipe-delimited table rows
+        re.compile(r"(?:password|secret|token)\s*[:=]\s*\S{8,}", re.IGNORECASE),
+    ]
+    for pat in _DEFINITIVE:
+        if pat.search(evidence):
+            return 5, f"definitive: {pat.pattern[:40]}"
+
+    # Score 4: Confirmed indicators
+    _CONFIRMED = [
+        re.compile(r"<script[^>]*>.*?alert\s*\(", re.IGNORECASE | re.DOTALL),
+        re.compile(r"<img[^>]+onerror\s*=", re.IGNORECASE),
+        re.compile(r"UNION\s+SELECT.*returned|UNION.*column", re.IGNORECASE),
+        re.compile(r"<\?php|<\?=", re.IGNORECASE),
+        re.compile(r"(?:total|drwx|lrwx)[\s\-]", re.IGNORECASE),
+        re.compile(r"(?:BEGIN|-----BEGIN)\s+(RSA|CERTIFICATE|PRIVATE)", re.IGNORECASE),
+        re.compile(r"(?:DB_|API_|SECRET|AWS_)[A-Z_]+=\S+", re.IGNORECASE),
+        re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT token
+        re.compile(r"flag\{[^}]+\}", re.IGNORECASE),
+    ]
+    for pat in _CONFIRMED:
+        if pat.search(evidence):
+            return 4, f"confirmed: {pat.pattern[:40]}"
+
+    # Score 3: Count distinct signal types
+    signals = 0
+    signal_details = []
+    # Status code anomaly
+    if re.search(r"(?:status|code)\s*[:=]?\s*(?:[45]\d{2}|302|301)", evidence, re.IGNORECASE):
+        signals += 1
+        signal_details.append("status_anomaly")
+    # Body content change
+    if re.search(r"(?:content.?length|body.?size|response.?length)\s*(?:changed|differ|!=|<>|\d+\s*vs)", evidence, re.IGNORECASE):
+        signals += 1
+        signal_details.append("body_change")
+    # Error keywords from the application
+    if re.search(r"(?:sql|syntax|mysql|postgres|sqlite|oracle|error|exception|traceback|stack.?trace)", evidence, re.IGNORECASE):
+        signals += 1
+        signal_details.append("error_in_response")
+    # Timing anomaly
+    if re.search(r"(?:elapsed|time|delay|sleep|waitfor)\s*[:=]?\s*\d{3,}|(?:\d+\s*(?:ms|seconds?)\s*(?:delay|slower))", evidence, re.IGNORECASE):
+        signals += 1
+        signal_details.append("timing_anomaly")
+    # Header anomaly
+    if re.search(r"(?:access.control.allow|x-forwarded|location:\s*http|set-cookie:\s*\S+)", evidence, re.IGNORECASE):
+        signals += 1
+        signal_details.append("header_anomaly")
+
+    if signals >= 2:
+        return 3, f"strong: {signals} signals ({', '.join(signal_details)})"
+    if signals == 1:
+        return 2, f"moderate: single signal ({', '.join(signal_details)})"
+
+    # If evidence has response data but no clear signals
+    if has_response_data and len(evidence) >= 200:
+        return 2, "moderate: has response data but no clear vulnerability signals"
+
+    return 1, "weak: no concrete response signals detected"
+
+
+def _validate_findings(
+    findings: dict[str, Any],
+    source: str = "brain",
+) -> dict[str, Any]:
+    """Validate findings at write-time with strict anti-fabrication gates.
+
+    source="brain": findings submitted via update_knowledge (strict checks)
+    source="tool_auto": findings auto-generated by tool code paths (relaxed)
 
     Returns validated findings dict (only valid entries included).
     """
+    # Cap findings per call from brain
+    if source == "brain" and len(findings) > 3:
+        logger.warning("finding_cap_exceeded", count=len(findings))
+        return {}  # Reject ALL — too many at once
+
     validated: dict[str, Any] = {}
 
     for fid, info in findings.items():
@@ -1485,25 +1996,71 @@ def _validate_findings(findings: dict[str, Any]) -> dict[str, Any]:
         # Check required fields
         missing = [f for f in _REQUIRED_FINDING_FIELDS if not info.get(f)]
         if missing:
-            logger.warning(
-                "finding_missing_fields",
-                finding_id=fid,
-                missing=missing,
-            )
+            logger.warning("finding_missing_fields", finding_id=fid, missing=missing)
             continue
 
         # Validate severity
         severity = info.get("severity", "").lower()
         if severity not in _VALID_SEVERITIES:
-            logger.warning(
-                "finding_invalid_severity",
-                finding_id=fid,
-                severity=severity,
-            )
+            logger.warning("finding_invalid_severity", finding_id=fid, severity=severity)
             continue
 
-        # Normalize severity to lowercase
+        # Normalize severity
         info["severity"] = severity
+
+        # ── Anti-fabrication gate 1: reject summary/meta vuln types ──
+        vuln_type = info.get("vuln_type", "")
+        canonical = _canonicalize_vuln_type(vuln_type)
+        if canonical == "REJECT":
+            logger.warning("finding_rejected_summary_type", finding_id=fid, vuln_type=vuln_type)
+            continue
+        vt_words = set(vuln_type.lower().replace("-", "_").split("_"))
+        if vt_words & _REJECT_VULN_TYPE_WORDS:
+            logger.warning("finding_rejected_summary_type", finding_id=fid, vuln_type=vuln_type)
+            continue
+
+        if source == "brain":
+            # ── Anti-fabrication gate 2: tool_used must be a real tool ──
+            tool_used = info.get("tool_used", "")
+            if not tool_used or tool_used == "?" or tool_used not in _REAL_TOOL_NAMES:
+                logger.warning(
+                    "finding_rejected_bad_tool",
+                    finding_id=fid,
+                    tool_used=tool_used,
+                )
+                continue
+
+            # ── Anti-fabrication gate 3: evidence quality check ──
+            evidence = str(info.get("evidence", ""))
+            if len(evidence) < _MIN_EVIDENCE_LENGTH:
+                logger.warning(
+                    "finding_rejected_short_evidence",
+                    finding_id=fid,
+                    evidence_len=len(evidence),
+                )
+                continue
+
+            if not _EVIDENCE_INDICATORS.search(evidence):
+                logger.warning(
+                    "finding_rejected_no_indicators",
+                    finding_id=fid,
+                    evidence_preview=evidence[:100],
+                )
+                continue
+
+            # ── Anti-fabrication gate 3b: evidence quality score ──
+            score, score_reason = _score_evidence(info)
+            info["evidence_score"] = score
+            info["evidence_score_reason"] = score_reason
+            if score < 3:
+                logger.warning(
+                    "finding_rejected_low_score",
+                    finding_id=fid, score=score, reason=score_reason,
+                )
+                continue
+
+            # ── Anti-fabrication gate 4: brain cannot set confirmed=True ──
+            info["confirmed"] = False
 
         # Ensure confirmed field has a boolean
         if "confirmed" not in info:

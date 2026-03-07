@@ -2,3 +2,7 @@
 ./benchmarks/*
 scan_logs/
 scan_logs/*
+__pycache__/
+data/h1_reports/
+reports/
+screenshots/

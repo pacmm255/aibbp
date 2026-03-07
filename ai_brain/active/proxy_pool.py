@@ -116,6 +116,38 @@ _PROXY_SOURCES: list[dict[str, str]] = [
     {"url": "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt", "protocol": "http", "format": "plain"},
     {"url": "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt", "protocol": "http", "format": "plain"},
 
+    # ── GitHub: iplocate/free-proxy-list (updated every 30 min, 10k+ commits) ──
+    {"url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt", "protocol": "http", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: fyvri/fresh-proxy-list (updated hourly, Go-based) ──
+    {"url": "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/http.txt", "protocol": "http", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/https.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: databay-labs/free-proxy-list (updated every 5 min, jsDelivr CDN) ──
+    {"url": "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: vmheaven/VMHeaven-Free-Proxy-Updated (updated every 15 min, 27k+ commits) ──
+    {"url": "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/http.txt", "protocol": "http", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/https.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: ebrasha/abdal-proxy-hub (updated every 10 min) ──
+    {"url": "https://raw.githubusercontent.com/ebrasha/abdal-proxy-hub/main/http-proxy-list-by-EbraSha.txt", "protocol": "http", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/ebrasha/abdal-proxy-hub/main/https-proxy-list-by-EbraSha.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: VPSLabCloud/VPSLab-Free-Proxy-List (updated every 15 min) ──
+    {"url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: a2u/free-proxy-list (updated hourly, 17k+ commits) ──
+    {"url": "https://raw.githubusercontent.com/a2u/free-proxy-list/master/free-proxy-list.txt", "protocol": "http", "format": "plain"},
+
+    # ── GitHub: jetkai/proxy-list (updated hourly when active) ──
+    {"url": "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt", "protocol": "http", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt", "protocol": "http", "format": "plain"},
+
+    # ── proxy-list.download API (no auth, plain text — sometimes unreliable) ──
+    {"url": "https://www.proxy-list.download/api/v1/get?type=http", "protocol": "http", "format": "plain"},
+
     # ── Geonode API (HTTP) ──
     {"url": "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps", "protocol": "http", "format": "geonode"},
 
@@ -128,14 +160,30 @@ _PROXY_SOURCES: list[dict[str, str]] = [
     {"url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt", "protocol": "socks5", "format": "plain"},
     {"url": "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt", "protocol": "socks5", "format": "plain"},
     {"url": "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/ebrasha/abdal-proxy-hub/main/socks5-proxy-list-by-EbraSha.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt", "protocol": "socks5", "format": "plain"},
+    {"url": "https://www.proxy-list.download/api/v1/get?type=socks5", "protocol": "socks5", "format": "plain"},
     {"url": "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks5", "protocol": "socks5", "format": "geonode"},
 
     # ── SOCKS4 proxies (lowest priority) ──
     {"url": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=5000&country=all&ssl=all&anonymity=all", "protocol": "socks4", "format": "plain"},
     {"url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks4.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/socks4.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/ebrasha/abdal-proxy-hub/main/socks4-proxy-list-by-EbraSha.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks4_all.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt", "protocol": "socks4", "format": "plain"},
+    {"url": "https://www.proxy-list.download/api/v1/get?type=socks4", "protocol": "socks4", "format": "plain"},
 ]
 
 _PROTOCOL_PRIORITY = {"http": 0, "https": 0, "socks5": 1, "socks4": 2}
+_MAX_CANDIDATE_QUEUE = 50000  # Cap to limit memory (~10MB vs ~51MB for 245K)
 
 # Target host for CONNECT check — we test if proxy can tunnel to Z.ai
 _CONNECT_TARGET = "chat.z.ai:443"
@@ -607,8 +655,9 @@ class ProxyPool:
                 existing = {p.url for p in self._proxies}
                 new = [p for p in raw if p.url not in existing and p.url not in self._tried_urls]
                 random.shuffle(new)
-                self._candidate_queue.extend(new)
-                logger.info("candidates_refreshed", new_candidates=len(new))
+                space = max(0, _MAX_CANDIDATE_QUEUE - len(self._candidate_queue))
+                self._candidate_queue.extend(new[:space])
+                logger.info("candidates_refreshed", new_candidates=min(len(new), space))
                 # Update shared cache
                 self._save_cached_proxies()
             except Exception as e:
@@ -643,6 +692,20 @@ class ProxyPool:
         then raw candidates (need both phases).
         Runs every 10 seconds.
         """
+        # ── Initial fetch if candidate queue is empty (e.g. loaded from cache) ──
+        if not self._candidate_queue and not self._p1_passed_queue:
+            try:
+                await asyncio.sleep(random.uniform(2, 8))  # Stagger
+                raw = await self._fetch_all()
+                existing = {p.url for p in self._proxies}
+                new = [p for p in raw if p.url not in existing and p.url not in self._tried_urls]
+                random.shuffle(new)
+                # Cap candidate queue to limit memory (~217 bytes per entry)
+                self._candidate_queue.extend(new[:_MAX_CANDIDATE_QUEUE])
+                logger.info("bg_growth_initial_fetch", candidates=len(self._candidate_queue))
+            except Exception as e:
+                logger.warning("bg_growth_initial_fetch_failed", error=str(e))
+
         while not self._closed:
             await asyncio.sleep(10)
             try:
@@ -840,8 +903,24 @@ class ProxyPool:
     # ── HTTP client management ─────────────────────────────────────
 
     def get_http_client(self, proxy: ProxyEntry) -> httpx.AsyncClient:
-        """Get or create a cached httpx client for this proxy."""
+        """Get or create a cached httpx client for this proxy.
+
+        Caps at 80 cached clients to limit memory (~3MB each).
+        Evicts least-recently-used clients when over cap.
+        """
+        _MAX_CLIENTS = 80
         if proxy.url not in self._http_clients:
+            # Evict oldest clients if over cap
+            if len(self._http_clients) >= _MAX_CLIENTS:
+                active_urls = {p.url for p in self._proxies if p.is_healthy}
+                stale = [u for u in self._http_clients if u not in active_urls]
+                for u in stale[:len(self._http_clients) - _MAX_CLIENTS + 1]:
+                    client = self._http_clients.pop(u, None)
+                    if client:
+                        try:
+                            asyncio.get_event_loop().create_task(client.aclose())
+                        except Exception:
+                            pass
             self._http_clients[proxy.url] = httpx.AsyncClient(
                 proxy=proxy.url,
                 timeout=httpx.Timeout(90.0, connect=15.0),

@@ -449,6 +449,7 @@ class ClaudeClient:
         tools: list[dict[str, Any]],
         target: str = "",
         max_tokens: int | None = None,
+        thinking_budget: int | None = None,
     ) -> Any:
         """Claude API call with native tool-use support.
 
@@ -510,6 +511,9 @@ class ClaudeClient:
         if "opus" in model:
             params["thinking"] = {"type": "enabled", "budget_tokens": 10000}
             params["max_tokens"] = max(max_tok, 16384)  # must exceed budget_tokens
+        elif thinking_budget and "sonnet" in model:
+            params["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+            params["max_tokens"] = max(max_tok, thinking_budget + 4096)
 
         # 4. Make the API call with aggressive retry for transient errors
         max_retries = 10

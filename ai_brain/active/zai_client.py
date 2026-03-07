@@ -712,6 +712,8 @@ class ZaiClient:
         tools: list[dict[str, Any]],
         target: str = "",
         max_tokens: int | None = None,
+        web_search: bool = False,
+        thinking_budget: int | None = None,
     ) -> ZaiResponse:
         """Send chat completion request to Z.ai — compatible with ClaudeClient.
 
@@ -815,8 +817,8 @@ class ZaiClient:
             "params": {},
             "features": {
                 "image_generation": False,
-                "web_search": False,
-                "auto_web_search": False,
+                "web_search": web_search,
+                "auto_web_search": web_search,
                 "preview_mode": False,
                 "flags": [],
                 "enable_thinking": self.enable_thinking,
@@ -1164,15 +1166,16 @@ class ZaiClient:
         self._total_output_tokens += output_tokens
 
         # Record zero cost in budget (track usage but $0)
-        self.budget.record_cost(
-            phase=phase,
-            model=f"zai-{self.model}",
-            input_tokens=estimated_input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=0,
-            cache_creation_tokens=0,
-            target=target,
-        )
+        if self.budget:
+            self.budget.record_cost(
+                phase=phase,
+                model=f"zai-{self.model}",
+                input_tokens=estimated_input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                target=target,
+            )
 
         return ZaiResponse(content=content, stop_reason=stop_reason, usage=usage)
 

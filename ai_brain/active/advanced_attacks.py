@@ -514,8 +514,8 @@ class CORSExploitTester:
                                     f"Severity: {severity}"
                                 ),
                                 "tool_used": "cors_tester",
-                                "confirmed": True,
-                                "severity": severity,
+                                "confirmed": False,
+                                "severity": "info",
                             })
                     elif origin == "null" and acao == "null":
                         findings.append({
@@ -529,7 +529,8 @@ class CORSExploitTester:
                                 "Exploitable via sandboxed iframe."
                             ),
                             "tool_used": "cors_tester",
-                            "confirmed": True,
+                            "confirmed": False,
+                            "severity": "info",
                         })
 
                 except Exception:

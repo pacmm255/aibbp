@@ -116,8 +116,34 @@ CREATE INDEX IF NOT EXISTS idx_fupdates_finding ON finding_updates(finding_id);
 """
 
 
+def _normalize_endpoint_for_dedup(ep: str) -> str:
+    """Normalize endpoint to path-only for dedup."""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(ep)
+        return (parsed.path.rstrip("/").lower()) or "/"
+    except Exception:
+        return ep.lower().strip()
+
+
+# Canonical vuln type mapping (mirrors react_tools._VULN_TYPE_CANONICAL)
+_DB_VULN_TYPE_CANONICAL: dict[str, str] = {
+    "reflected_xss": "xss", "stored_xss": "xss", "cross_site_scripting": "xss",
+    "sql_injection": "sqli", "blind_sqli": "sqli", "union_sqli": "sqli",
+    "command_injection": "cmdi", "os_command_injection": "cmdi",
+    "server_side_request_forgery": "ssrf", "open_redirect": "redirect",
+    "url_redirect": "redirect", "cors_misconfiguration": "cors",
+    "account_takeover": "ato", "path_traversal": "lfi",
+    "directory_traversal": "lfi", "local_file_inclusion": "lfi",
+    "nosql_injection": "nosqli",
+}
+
+
 def _dedup_hash(domain: str, vuln_type: str, endpoint: str, parameter: str = "") -> str:
-    raw = f"{domain}|{vuln_type}|{endpoint}|{parameter}".lower().strip()
+    # Canonicalize vuln_type and normalize endpoint for stronger dedup
+    vt = _DB_VULN_TYPE_CANONICAL.get(vuln_type.lower().strip(), vuln_type.lower().strip())
+    ep = _normalize_endpoint_for_dedup(endpoint)
+    raw = f"{domain}|{vt}|{ep}|{parameter}".lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -248,7 +274,7 @@ class FindingsDB:
                 ON CONFLICT (dedup_hash) DO UPDATE SET
                     evidence = COALESCE(EXCLUDED.evidence, findings.evidence),
                     poc_code = COALESCE(EXCLUDED.poc_code, findings.poc_code),
-                    confirmed = EXCLUDED.confirmed OR findings.confirmed,
+                    confirmed = EXCLUDED.confirmed,
                     is_false_positive = EXCLUDED.is_false_positive,
                     fp_reason = COALESCE(EXCLUDED.fp_reason, findings.fp_reason),
                     confidence = GREATEST(EXCLUDED.confidence, findings.confidence),

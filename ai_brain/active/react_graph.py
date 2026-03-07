@@ -9,8 +9,10 @@ Loop: brain → tools → compress → brain (until done or budget exhausted).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -28,7 +30,7 @@ from ai_brain.active.react_prompt import (
     build_system_prompt, get_tool_schemas, _detect_phase, CHAIN_TEMPLATES,
 )
 from ai_brain.active.react_state import PentestState
-from ai_brain.active.react_tools import ToolDeps, dispatch_tool
+from ai_brain.active.react_tools import ToolDeps, dispatch_tool, _canonicalize_vuln_type
 from ai_brain.errors import BudgetExhausted
 
 logger = structlog.get_logger()
@@ -36,6 +38,71 @@ logger = structlog.get_logger()
 # ── Reasoning & Chain Engines (module-level singletons, zero LLM cost) ──
 _reasoning_engine = AdversarialReasoningEngine()
 _chain_engine = ChainDiscoveryEngine()
+
+# ── Thompson Sampling for test prioritization ────────────────────────
+_TECHNIQUE_IMPACT_WEIGHT: dict[str, float] = {
+    "sqli": 3.0, "ssrf": 2.5, "cmdi": 2.5, "ssti": 2.5,
+    "xss": 1.5, "idor": 2.0, "authz": 2.0, "lfi": 2.0,
+    "upload": 1.5, "jwt": 2.0, "race": 1.5, "info_disc": 1.0,
+    "diff": 1.0, "js_scan": 1.0, "graphql": 1.5, "fuzz": 1.0,
+}
+
+def _thompson_sample_recommendations(
+    bandit_state: dict[str, list[float]],
+    endpoints: dict[str, Any],
+    tested: dict[str, bool],
+    n: int = 5,
+) -> list[dict[str, Any]]:
+    """Thompson Sampling: recommend untested endpoint::technique pairs.
+
+    Each pair has a Beta(alpha, beta) posterior. We sample from each
+    and return the top-N highest-priority recommendations, weighted
+    by technique impact potential.
+    """
+    from ai_brain.active.react_prompt import STANDARD_TECHNIQUES, _TOOL_TO_TECHNIQUE
+
+    # Build reverse map: technique → tool names
+    technique_to_tools: dict[str, list[str]] = {}
+    for tool, tech in _TOOL_TO_TECHNIQUE.items():
+        technique_to_tools.setdefault(tech, []).append(tool)
+
+    candidates: list[tuple[float, str, str]] = []  # (score, endpoint, technique)
+
+    for ep_url in list(endpoints.keys())[:30]:  # Cap at 30 endpoints
+        # Normalize endpoint to path
+        try:
+            path = urlparse(ep_url).path or ep_url
+        except Exception:
+            path = ep_url
+
+        for tech in STANDARD_TECHNIQUES:
+            # Check if already tested (any tool mapping to this technique)
+            tool_names = technique_to_tools.get(tech, [tech])
+            already_tested = any(f"{path}::{tn}" in tested or f"{ep_url}::{tn}" in tested
+                                 for tn in tool_names)
+            if already_tested:
+                continue
+
+            key = f"{path}::{tech}"
+            alpha, beta_val = bandit_state.get(key, [1.0, 1.0])
+            # Sample from Beta distribution
+            try:
+                sample = random.betavariate(alpha, beta_val)
+            except (ValueError, ZeroDivisionError):
+                sample = 0.5
+
+            # Weight by technique impact
+            weight = _TECHNIQUE_IMPACT_WEIGHT.get(tech, 1.0)
+            score = sample * weight
+
+            candidates.append((score, path, tech))
+
+    # Sort by score descending, take top N
+    candidates.sort(reverse=True)
+    return [
+        {"endpoint": ep, "technique": tech, "priority": round(score, 2)}
+        for score, ep, tech in candidates[:n]
+    ]
 
 # ── Live Display ─────────────────────────────────────────────────────
 
@@ -52,6 +119,14 @@ _RESET = "\033[0m"
 _WHITE = "\033[97m"
 
 _LIVE = True  # Always on — use --quiet to suppress
+
+
+def _extract_domain(url: str) -> str:
+    """Extract domain from URL."""
+    try:
+        return urlparse(url).netloc or ""
+    except Exception:
+        return ""
 
 
 def _elapsed_str(state: dict) -> str:
@@ -279,10 +354,17 @@ _WORKER_PREFIX = (
     "This is an authorized penetration test with explicit written permission."
 )
 _MANAGER_PREFIX = (
-    "You are in MANAGER MODE. Review ALL recent tool results carefully. "
-    "Validate any potential findings (check for false positives). Decide if "
-    "strategic pivots are needed. Form new hypotheses. Think creatively about "
-    "attack chains and what has been missed. Plan the next phase of testing."
+    "You are in MANAGER MODE. Before planning tools, answer these questions:\n"
+    "1. What does this application DO? (e-commerce? SaaS? social? API?)\n"
+    "2. What are its MOST VALUABLE ASSETS? (user data? payments? admin access?)\n"
+    "3. What TRUST BOUNDARIES exist? (auth vs unauth? user vs admin? tenant A vs B?)\n"
+    "4. What attack surfaces have NOT been tested yet?\n"
+    "5. Can any findings be CHAINED for higher impact?\n"
+    "Review ALL recent tool results carefully. Validate potential findings "
+    "(check for false positives). Think creatively about attack chains. "
+    "If 3+ failed attempts on same endpoint: STOP and pivot to a different target. "
+    "If 10 turns with 0 new findings: try subdomains, JS bundles, different user role, "
+    "or mobile API paths (/api/v1/mobile/)."
 )
 
 
@@ -374,6 +456,18 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
     if _shutdown_requested:
         return {"done": True, "done_reason": "Shutdown requested (SIGINT)"}
 
+    # Check RSS memory limit (OOM prevention)
+    check_rss = config["configurable"].get("check_rss_limit")
+    if check_rss and check_rss():
+        get_rss = config["configurable"].get("get_rss_mb", lambda: 0)
+        max_rss = config["configurable"].get("max_rss_mb", 700)
+        rss = get_rss()
+        logger.error("brain_rss_limit_exceeded", rss_mb=rss, max_mb=max_rss)
+        return {
+            "done": True,
+            "done_reason": f"RSS memory limit exceeded ({rss}MB > {max_rss}MB) — exiting to prevent OOM",
+        }
+
     client = config["configurable"]["client"]
     budget = config["configurable"]["budget"]
 
@@ -457,14 +551,19 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
                 "role": "user",
                 "content": (
                     f"You are starting a penetration test against {target}. "
-                    "Begin with thorough reconnaissance: crawl the site, detect "
-                    "technologies, discover hidden endpoints (use systematic_fuzz "
-                    "with common-dirs AND common-files), and analyze the attack surface. "
-                    "Check for config/source code exposure (.git, .env, Dockerfile, backup files). "
-                    "Look for S3 buckets, API endpoints, JWT tokens in cookies/responses. "
+                    "PHASE 1 (MANDATORY — spend first 20% of budget on recon):\n"
+                    "1. crawl_target with max_pages=50 — map the full attack surface\n"
+                    "2. systematic_fuzz with common-dirs AND common-files — find hidden paths\n"
+                    "3. Fetch ALL JS bundles discovered → analyze_js_bundle for secrets, API keys, internal URLs\n"
+                    "4. enumerate_subdomains — expand the attack surface\n"
+                    "5. Check: /.git/HEAD, /.env, /robots.txt, /sitemap.xml, /swagger.json, /graphql\n"
+                    "6. detect_technologies — identify framework-specific attack vectors\n"
+                    "7. If login/register exists: create account IMMEDIATELY via register_account\n"
+                    "8. If authenticated: RE-CRAWL the entire site with auth cookies\n"
+                    "ONLY after this recon checklist, begin targeted exploitation. "
                     "Form hypotheses about what might be vulnerable and why. "
                     "When you find something exploitable, create an attack chain "
-                    "with manage_chain if it needs multiple steps. Then test systematically."
+                    "with manage_chain if it needs multiple steps."
                 ),
             }
         ]
@@ -486,7 +585,9 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             "crawl_target", "systematic_fuzz", "test_sqli", "test_xss",
             "test_auth_bypass", "response_diff_analyze", "test_jwt",
             "test_file_upload", "test_idor", "blind_sqli_extract",
-            "run_content_discovery", "test_cmdi", "test_ssrf",
+            "run_content_discovery", "test_cmdi", "test_ssrf", "test_ssti",
+            "test_race_condition", "analyze_graphql", "analyze_js_bundle",
+            "test_authz_matrix",
         }
         untested = sorted(all_categories - tested_categories)
 
@@ -629,6 +730,13 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         if _LIVE:
             print(f"  {_MAGENTA}📋 Strategy checkpoint injected (turn {turn_count}){_RESET}")
 
+    # Determine thinking budget for Sonnet exploitation
+    thinking_budget = None
+    if not is_free_brain:
+        detected_phase = _detect_phase(state)
+        if detected_phase == "exploitation" and task_tier == "complex":
+            thinking_budget = 8000
+
     try:
         response = await client.call_with_tools(
             phase="active_testing",
@@ -637,6 +745,7 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
             messages=messages,
             tools=tools,
             target=state.get("target_url", ""),
+            thinking_budget=thinking_budget,
         )
     except BudgetExhausted as e:
         logger.warning("brain_budget_exhausted", error=str(e))
@@ -872,6 +981,13 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
         phase_budgets[phase]["spent"] = phase_budgets[phase].get("spent", 0.0) + turn_cost
         phase_budgets[phase]["turns_used"] = phase_budgets[phase].get("turns_used", 0) + 1
 
+    # Log RSS every 10 turns for memory monitoring
+    if (turn_count + 1) % 10 == 0:
+        _get_rss = config["configurable"].get("get_rss_mb")
+        if _get_rss:
+            logger.info("agent_rss_check", turn=turn_count + 1, rss_mb=_get_rss(),
+                        max_mb=config["configurable"].get("max_rss_mb", 700))
+
     result: dict[str, Any] = {
         "messages": new_messages,
         "turn_count": turn_count + 1,
@@ -898,6 +1014,130 @@ async def brain_node(state: PentestState, config: RunnableConfig) -> dict:
                 result["done_reason"] = "brain_decided_done"
 
     return result
+
+
+# ── Finding anti-fabrication helpers ──────────────────────────────────
+
+def _normalize_endpoint(ep: str) -> str:
+    """Normalize endpoint for dedup: extract path, lowercase, strip trailing slash."""
+    try:
+        parsed = urlparse(ep)
+        path = parsed.path.rstrip("/").lower() or "/"
+        return path
+    except Exception:
+        return ep.lower().strip()
+
+
+async def _reverify_finding(fdata: dict, target_url: str) -> tuple[bool, str]:
+    """Lightweight check: does the endpoint exist and behave as claimed?"""
+    import httpx
+
+    endpoint = fdata.get("endpoint", "")
+    if not endpoint.startswith("http"):
+        endpoint = target_url.rstrip("/") + "/" + endpoint.lstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=False) as client:
+            resp = await client.get(endpoint)
+            if resp.status_code == 404:
+                return False, "Endpoint returned 404 — does not exist"
+            # For injection vulns: check if payload_used is reflected
+            payload = fdata.get("payload_used", "")
+            vuln_type = fdata.get("vuln_type", "")
+            if payload and vuln_type in ("xss", "reflected_xss", "cross_site_scripting"):
+                if payload not in resp.text and payload.lower() not in resp.text.lower():
+                    return False, "Payload not reflected in response"
+            return True, "endpoint exists"
+    except Exception as e:
+        return False, f"Connection failed: {str(e)[:100]}"
+
+
+async def _auto_differential_test(
+    endpoint: str, parameter: str, finding: dict, target_url: str,
+) -> bool:
+    """Differential test: verify injection finding by comparing baseline vs payload vs control.
+
+    Returns True if finding appears genuine (payload response differs from both baseline and control).
+    Returns True (pass-through) if test can't be performed (missing data, connection error).
+    """
+    import httpx
+
+    # Extract payload from evidence
+    evidence = str(finding.get("evidence", ""))
+    payload = finding.get("payload_used", "")
+    if not payload:
+        # Try to extract payload from evidence text
+        # Look for common patterns: "payload: X", "injected: X", quoted strings after keywords
+        m = re.search(r'(?:payload|injected|sent|body)[:\s]+["\']?([^"\'<>\n]{5,100})', evidence, re.IGNORECASE)
+        if m:
+            payload = m.group(1).strip()
+    if not payload:
+        return True  # Can't extract payload — let it through
+
+    # Determine request method and build URL
+    method = finding.get("method", "GET").upper()
+    if not endpoint.startswith("http"):
+        endpoint = target_url.rstrip("/") + "/" + endpoint.lstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+            # Baseline: benign value
+            baseline_params = {parameter: "test123benign"}
+            # Payload: the actual exploit
+            payload_params = {parameter: payload}
+            # Control: different benign value
+            control_params = {parameter: "controlXYZ789"}
+
+            if method == "POST":
+                baseline_resp = await client.post(endpoint, data=baseline_params)
+                await asyncio.sleep(0.1)
+                payload_resp = await client.post(endpoint, data=payload_params)
+                await asyncio.sleep(0.1)
+                control_resp = await client.post(endpoint, data=control_params)
+            else:
+                baseline_resp = await client.get(endpoint, params=baseline_params)
+                await asyncio.sleep(0.1)
+                payload_resp = await client.get(endpoint, params=payload_params)
+                await asyncio.sleep(0.1)
+                control_resp = await client.get(endpoint, params=control_params)
+
+            # Compare: payload must differ from BOTH baseline and control
+            def _response_sig(resp):
+                return (resp.status_code, len(resp.content))
+
+            baseline_sig = _response_sig(baseline_resp)
+            payload_sig = _response_sig(payload_resp)
+            control_sig = _response_sig(control_resp)
+
+            def _sigs_similar(a, b, length_tolerance=0.05):
+                if a[0] != b[0]:  # Different status codes
+                    return False
+                if a[1] == 0 and b[1] == 0:
+                    return True
+                length_diff = abs(a[1] - b[1]) / max(a[1], b[1], 1)
+                return length_diff <= length_tolerance
+
+            # Payload must differ from BOTH baseline and control
+            differs_from_baseline = not _sigs_similar(payload_sig, baseline_sig)
+            differs_from_control = not _sigs_similar(payload_sig, control_sig)
+            # But baseline and control should be similar (proving it's the payload, not randomness)
+            baseline_control_similar = _sigs_similar(baseline_sig, control_sig)
+
+            if differs_from_baseline and differs_from_control and baseline_control_similar:
+                logger.info("auto_diff_test_passed", endpoint=endpoint, parameter=parameter)
+                return True
+            elif not baseline_control_similar:
+                # Responses are inherently random — can't determine, let it through
+                logger.info("auto_diff_test_inconclusive", endpoint=endpoint, reason="random_responses")
+                return True
+            else:
+                logger.info("auto_diff_test_failed", endpoint=endpoint, parameter=parameter,
+                            baseline=baseline_sig, payload=payload_sig, control=control_sig)
+                return False
+
+    except Exception as e:
+        logger.debug("auto_diff_test_error", endpoint=endpoint, error=str(e)[:100])
+        return True  # Error — let it through (best effort)
 
 
 # ── Node 2: Tool Executor ────────────────────────────────────────────
@@ -1061,6 +1301,9 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
         else:
             break
 
+    # ── Tool provenance tracking: which tools actually ran this turn ──
+    tools_executed_this_turn: set[str] = set()
+
     for tc in tool_calls:
         tool_name = tc.name
         tool_input = tc.input if hasattr(tc, "input") else {}
@@ -1111,6 +1354,9 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
 
         _tool_start = time.time()
         try:
+            # Pass provenance info to deps so update_knowledge can check it
+            deps.tools_executed_this_turn = tools_executed_this_turn
+
             import asyncio as _asyncio
             _tool_timeout = 120 if tool_name in ("run_custom_exploit", "test_sqli") else 90
             result_str = await _asyncio.wait_for(
@@ -1130,6 +1376,12 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
 
             # Track this technique as tested
             new_tested[technique_key] = True
+
+            # Track tool provenance (skip meta-tools like update_knowledge)
+            if tool_name not in ("update_knowledge", "update_working_memory",
+                                  "read_working_memory", "formulate_strategy",
+                                  "get_playbook", "manage_chain", "finish_test"):
+                tools_executed_this_turn.add(tool_name)
 
             # Check if tool returned an error result (not exception, but error in output)
             if result_data.get("error"):
@@ -1263,6 +1515,28 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     existing_tested = dict(state.get("tested_techniques", {}))
     existing_tested.update(new_tested)
     result["tested_techniques"] = existing_tested
+
+    # ── Thompson Sampling: update bandit state ──
+    bandit = dict(state.get("bandit_state", {}))
+    for tk in new_tested:
+        if "::" in tk and tk not in state.get("tested_techniques", {}):
+            parts = tk.split("::", 1)
+            ep, tool = parts[0], parts[1]
+            # Map tool to technique
+            try:
+                from ai_brain.active.react_prompt import _TOOL_TO_TECHNIQUE
+                tech = _TOOL_TO_TECHNIQUE.get(tool, tool)
+            except ImportError:
+                tech = tool
+            bkey = f"{ep}::{tech}"
+            alpha, beta_val = bandit.get(bkey, [1.0, 1.0])
+            # Check if this test found anything
+            found_something = bool(state_updates.get("findings"))
+            if found_something:
+                bandit[bkey] = [alpha + 1.0, beta_val]
+            else:
+                bandit[bkey] = [alpha, beta_val + 1.0]
+    result["bandit_state"] = bandit
 
     # Merge failed approaches
     existing_failed = dict(state.get("failed_approaches", {}))
@@ -1437,15 +1711,18 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                 existing = dict(state.get(key, {}))
                 # ── Finding deduplication at merge time ──
                 if key == "findings":
-                    # Build dedup index of existing findings: (vuln_type, endpoint) → fid
+                    # Build dedup index using canonical vuln_type + normalized endpoint
                     existing_dedup: dict[tuple[str, str], str] = {}
+                    # Per-type count for cap (3 per canonical type per session)
+                    type_counts: dict[str, int] = {}
+                    _PER_TYPE_CAP = 3
                     for efid, edata in existing.items():
                         if isinstance(edata, dict):
-                            dk = (
-                                edata.get("vuln_type", "").lower(),
-                                edata.get("endpoint", "").lower(),
-                            )
+                            cvt = _canonicalize_vuln_type(edata.get("vuln_type", ""))
+                            nep = _normalize_endpoint(edata.get("endpoint", ""))
+                            dk = (cvt, nep)
                             existing_dedup[dk] = efid
+                            type_counts[cvt] = type_counts.get(cvt, 0) + 1
                     # Filter out duplicates from new findings
                     deduped_value = {}
                     for fid, fdata in value.items():
@@ -1454,10 +1731,9 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                             deduped_value[fid] = fdata
                             continue
                         if isinstance(fdata, dict):
-                            dk = (
-                                fdata.get("vuln_type", "").lower(),
-                                fdata.get("endpoint", "").lower(),
-                            )
+                            cvt = _canonicalize_vuln_type(fdata.get("vuln_type", ""))
+                            nep = _normalize_endpoint(fdata.get("endpoint", ""))
+                            dk = (cvt, nep)
                             if dk in existing_dedup:
                                 logger.info(
                                     "finding_deduped",
@@ -1472,7 +1748,87 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                                         f"(same {dk[0]} on {dk[1]}){_RESET}"
                                     )
                                 continue  # Skip duplicate
+                            # Per-type cap: max 3 findings of the same canonical type
+                            if type_counts.get(cvt, 0) >= _PER_TYPE_CAP:
+                                logger.info(
+                                    "finding_type_capped",
+                                    finding_id=fid, vuln_type=cvt,
+                                    count=type_counts[cvt],
+                                )
+                                if _LIVE:
+                                    print(
+                                        f"  {_YELLOW}⊘ Type cap: {fid} "
+                                        f"({cvt} already has {type_counts[cvt]} findings){_RESET}"
+                                    )
+                                continue
+                            # Track this new finding's dedup key
+                            existing_dedup[dk] = fid
+                            type_counts[cvt] = type_counts.get(cvt, 0) + 1
                         deduped_value[fid] = fdata
+
+                    # ── Re-verification gate for brain-submitted findings ──
+                    # Lightweight HTTP check: does the endpoint even exist?
+                    _target_url = state.get("target_url", "")
+                    _reverify_count = 0
+                    _reverify_max = 5
+                    _reverify_rejects = []
+                    for fid, fdata in list(deduped_value.items()):
+                        if not isinstance(fdata, dict):
+                            continue
+                        # Only re-verify unconfirmed brain findings (confirmed=False)
+                        if fdata.get("confirmed", False):
+                            continue  # Tool-auto findings are already verified
+                        if _reverify_count >= _reverify_max:
+                            break
+                        # Skip unsafe vuln types — only do endpoint existence check
+                        _unsafe_types = {"ssrf", "rce", "cmdi", "command_injection"}
+                        _vt = fdata.get("vuln_type", "").lower()
+                        try:
+                            _reverify_count += 1
+                            ok, reason = await _reverify_finding(fdata, _target_url)
+                            if not ok:
+                                logger.info(
+                                    "finding_reverify_rejected",
+                                    finding_id=fid, reason=reason,
+                                )
+                                if _LIVE:
+                                    print(
+                                        f"  {_RED}✗ Re-verify rejected: {fid} — {reason}{_RESET}"
+                                    )
+                                _reverify_rejects.append(fid)
+                        except Exception:
+                            pass  # Re-verify is best-effort
+
+                    for fid in _reverify_rejects:
+                        deduped_value.pop(fid, None)
+
+                    # ── Auto-differential testing gate ──
+                    _INJECTION_TYPES = {"xss", "sqli", "ssti", "cmdi", "lfi", "xxe", "nosqli",
+                                        "reflected_xss", "stored_xss", "sql_injection",
+                                        "command_injection", "path_traversal"}
+                    _diff_rejects: list[str] = []
+                    for fid, fdata in list(deduped_value.items()):
+                        if not isinstance(fdata, dict):
+                            continue
+                        cvt = _canonicalize_vuln_type(fdata.get("vuln_type", ""))
+                        if cvt not in _INJECTION_TYPES:
+                            continue  # Skip non-injection findings
+                        ep = fdata.get("endpoint", "")
+                        param = fdata.get("parameter", "")
+                        if not ep or not param:
+                            continue  # Can't test without endpoint+parameter
+                        try:
+                            diff_ok = await _auto_differential_test(ep, param, fdata, _target_url)
+                            if not diff_ok:
+                                _diff_rejects.append(fid)
+                                if _LIVE:
+                                    print(f"  {_RED}✗ Diff-test rejected: {fid} "
+                                          f"(payload response same as baseline){_RESET}")
+                        except Exception:
+                            pass  # Best effort
+                    for fid in _diff_rejects:
+                        deduped_value.pop(fid, None)
+
                     existing.update(deduped_value)
                 else:
                     existing.update(value)
@@ -1568,7 +1924,7 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                 try:
                     await _fdb.bulk_upsert(
                         _newly_added,
-                        domain=state.get("domain", ""),
+                        domain=state.get("domain", "") or _extract_domain(state.get("target_url", "")),
                         target_url=state.get("target_url", ""),
                         session_id=state.get("session_id", ""),
                     )
@@ -1716,7 +2072,7 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
             try:
                 await _fdb_cc.bulk_upsert(
                     state.get("findings", {}),
-                    domain=state.get("domain", ""),
+                    domain=state.get("domain", "") or _extract_domain(state.get("target_url", "")),
                     target_url=state.get("target_url", ""),
                     session_id=state.get("session_id", ""),
                 )
@@ -1757,7 +2113,6 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
     wm_result: dict[str, Any] = {}
     if updated_wm != state.get("working_memory", {}):
         wm_result["working_memory"] = updated_wm
-
     # Tier 1: Keep everything
     if total_chars < 80_000:
         return wm_result
@@ -2050,6 +2405,7 @@ def _get_tool_deps(config: RunnableConfig) -> ToolDeps:
         max_turns=c.get("max_turns", 150),
         default_headers=c.get("default_headers", {}),
         captcha_solver=c.get("captcha_solver"),
+        agent_c_research=c.get("agent_c_research"),
     )
 
 

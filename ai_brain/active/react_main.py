@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
+import os
+import resource
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -70,6 +74,35 @@ def _detect_external_goja(port: int) -> str | None:
 
 # Global shutdown flag (set by SIGINT handler)
 _shutdown_requested = False
+
+# Global RSS limit in bytes (set by --max-rss)
+_max_rss_bytes: int = 700 * 1024 * 1024
+
+
+def _check_rss_limit() -> bool:
+    """Return True if current RSS exceeds the configured limit."""
+    try:
+        return get_rss_mb() * 1024 * 1024 >= _max_rss_bytes
+    except Exception:
+        return False
+
+
+def get_rss_mb() -> int:
+    """Return current RSS in MB (actual, not peak)."""
+    try:
+        # /proc/self/status VmRSS is current RSS (not peak like ru_maxrss)
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024  # kB → MB
+    except Exception:
+        pass
+    try:
+        # Fallback to peak RSS
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss_kb // 1024
+    except Exception:
+        return 0
 
 
 def _handle_sigint(signum, frame):
@@ -196,7 +229,52 @@ def parse_args() -> argparse.Namespace:
         "--max-proxies", type=int, default=100,
         help="Maximum proxies to validate (default: 100)",
     )
+    parser.add_argument(
+        "--max-rss", type=int, default=700,
+        help="Max RSS memory in MB per agent (default: 700). Agent exits gracefully when exceeded.",
+    )
+    parser.add_argument(
+        "--no-app-gate", action="store_true", default=False,
+        help="Disable app comprehension gate (allow exploitation without build_app_model)",
+    )
+    # Agent C deep research
+    parser.add_argument(
+        "--zai-research", action="store_true", default=False,
+        help="Enable Agent C deep research tool (uses Z.ai with web search + thinking). Requires --zai.",
+    )
     return parser.parse_args()
+
+
+def _acquire_target_lock(target: str, memory_dir: str = "") -> int | None:
+    """Acquire an exclusive file lock for a target URL.
+
+    Returns the lock fd on success, None if another agent already holds it.
+    Prevents duplicate agents on the same target from consuming memory.
+    The memory_dir is included in the lock name so Agent A and Agent B
+    (which use different memory dirs) can run the same target concurrently.
+    """
+    lock_dir = Path.home() / ".aibbp" / "agent_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    # Sanitize target URL to filename
+    safe = target.replace("https://", "").replace("http://", "").replace("/", "_").replace(":", "_")
+    # Include memory dir suffix so different agents (A vs B) get separate locks
+    if memory_dir and "targets_b" in memory_dir:
+        safe += "_agent_b"
+    lock_path = lock_dir / f"{safe}.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+        return fd
+    except OSError:
+        os.close(fd)
+        # Read existing PID
+        try:
+            existing_pid = lock_path.read_text().strip()
+        except Exception:
+            existing_pid = "?"
+        return None
 
 
 async def main() -> None:
@@ -207,6 +285,17 @@ async def main() -> None:
 
     # Install SIGINT handler for graceful shutdown
     signal.signal(signal.SIGINT, _handle_sigint)
+
+    # Prevent duplicate agents on the same target (OOM prevention)
+    lock_fd = _acquire_target_lock(args.target, getattr(args, "memory_dir", ""))
+    if lock_fd is None:
+        print(f"[!] Another agent is already running for {args.target} — exiting to prevent OOM")
+        sys.exit(1)
+
+    # Set RSS memory limit for OOM prevention
+    global _max_rss_bytes
+    _max_rss_bytes = args.max_rss * 1024 * 1024
+    logger.info("memory_limit_set", max_rss_mb=args.max_rss)
 
     if args.demo:
         config.demo_mode = True
@@ -266,6 +355,14 @@ async def main() -> None:
         )
         logger.info("using_zai_brain", model=args.zai_model, proxy_pool=args.enable_proxylist)
         print(f"[*] Brain: Z.ai {args.zai_model} (free, with thinking)")
+
+        # Agent C deep research tool
+        agent_c_research = None
+        if args.zai_research:
+            from ai_brain.active.agent_c_research import AgentCResearch
+            agent_c_research = AgentCResearch(zai_client=client, proxy_pool=proxy_pool)
+            print(f"[*] Agent C: deep research enabled (Z.ai web search + thinking)")
+
         # Still need a Claude client for compression (Haiku)
         rate_limiter = DualRateLimiter(
             target_rps=3.0,
@@ -289,6 +386,7 @@ async def main() -> None:
             rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
         )
         claude_client = client
+        agent_c_research = None
 
     # Scope — flatten comma-separated values (supports both --allowed-domains "a,b" and --allowed-domains a b)
     _flat_allowed = [d.strip() for raw in args.allowed_domains for d in raw.split(",") if d.strip()]
@@ -444,6 +542,10 @@ async def main() -> None:
                 "transcript": transcript,
                 "default_headers": default_headers,
                 "findings_db": findings_db,
+                "agent_c_research": agent_c_research,
+                "check_rss_limit": _check_rss_limit,
+                "get_rss_mb": get_rss_mb,
+                "max_rss_mb": args.max_rss,
             },
         }
 
@@ -486,6 +588,9 @@ async def main() -> None:
             },
             "hypothesis_budgets": {},
             "info_gain_history": [],
+            "app_model": {},
+            "bandit_state": {},
+            "_no_app_gate": args.no_app_gate,
             "phase": "running",
             "budget_spent": 0.0,
             "budget_limit": args.budget,

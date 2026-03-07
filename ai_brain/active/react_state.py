@@ -98,6 +98,13 @@ class PentestState(TypedDict, total=False):
     #             current_step, confidence, chain_type}
     attack_chains: dict[str, dict[str, Any]]
 
+    # ── Application Model (required to unlock exploitation in real-world mode) ──
+    app_model: dict[str, Any]
+
+    # ── Thompson Sampling (Bayesian bandit for test prioritization) ──
+    # "{endpoint}::{technique}" -> [alpha, beta]
+    bandit_state: dict[str, list[float]]
+
     # ── Phase-Aware Budget ────────────────────────────────────────
     # {phase_name: {allocated_pct, spent, max_turns, turns_used}}
     phase_budgets: dict[str, dict[str, Any]]

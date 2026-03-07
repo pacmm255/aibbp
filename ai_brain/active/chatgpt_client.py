@@ -687,6 +687,7 @@ class ChatGPTClient:
         tools: list[dict[str, Any]],
         target: str = "",
         max_tokens: int | None = None,
+        thinking_budget: int | None = None,
     ) -> ChatGPTResponse:
         """Send chat request to ChatGPT anonymous — compatible with ClaudeClient.
 
