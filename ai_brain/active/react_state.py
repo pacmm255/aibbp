@@ -127,6 +127,59 @@ class PentestState(TypedDict, total=False):
     # Last N tool names called (ring buffer, max 20)
     recent_tool_names: list[str]
 
+    # ── Strategic Intelligence Layers (Sonnet/Opus hooks) ───────────
+    recon_blitz_done: bool       # Hook 0: Recon blitz + Opus detection fired
+    sonnet_app_model_done: bool  # Hook 1: Sonnet app comprehension fired
+    sonnet_exploit_calls: int    # Hook 2: Sonnet exploitation strategy counter (max 2)
+    opus_chain_reasoning_done: bool  # Hook 3: Opus chain reasoning fired
+
+    # ── Hard Phase Gates ─────────────────────────────────────────────
+    # Deterministic phase: "recon" → "vuln_scan" → "exploitation" → "reporting"
+    current_phase: str  # one of "recon", "vuln_scan", "exploitation", "reporting"
+    phase_turn_count: int  # turns spent in current phase
+    phase_history: list[tuple[str, int]]  # (phase, turns_spent) for completed phases
+    consecutive_bookkeeping: int  # consecutive bookkeeping tool calls (rate limiter)
+
+    # ── Reflector Pattern (retry when brain returns text without tools) ──
+    reflector_retries: int  # Count of consecutive reflector retries (reset on tool call)
+
+    # ── Repeating Detector (block identical consecutive tool calls) ──
+    # Keys: last_tool, last_args_hash, count
+    repeat_detector_state: dict[str, Any]
+
+    # ── Subtask Plan (structured test plan) ──────────────────────────
+    # List of {id, description, priority, status, result_summary}
+    # status: "pending" | "in_progress" | "done" | "skipped"
+    subtask_plan: list[dict[str, Any]]
+
+    # ── UCB1 Coverage Queue ─────────────────────────────────────────
+    # {endpoint: {technique: {tested: bool, score: float, times: int}}}
+    coverage_queue: dict[str, dict[str, dict[str, Any]]]
+    # tested_endpoints / total_endpoints ratio (updated each turn)
+    coverage_ratio: float
+
+    # ── Work Queue (Sprint 3: replaces coverage_queue) ───────────────
+    # item_id -> serialized WorkItem
+    work_queue: dict[str, dict[str, Any]]
+    # Cached queue stats for prompt
+    work_queue_stats: dict[str, Any]
+    # Capability graph summary for prompt
+    capability_snapshot: str
+
+    # ── AuthZ & Schema Intelligence (Sprint 4) ────────────────────────
+    # role -> serialized RoleContext
+    role_contexts: dict[str, dict[str, Any]]
+    # object_id -> serialized ObjectLineage
+    object_lineage: dict[str, dict[str, Any]]
+    # workflow_name -> serialized Workflow
+    discovered_workflows: dict[str, dict[str, Any]]
+    # Parsed API schema data
+    api_schema: dict[str, Any]
+
+    # ── Tool Health & Circuit Breaker ────────────────────────────────
+    # {tool_name: "healthy"|"degraded"|"unavailable"} — set by preflight checks
+    tool_health: dict[str, str]
+
     # ── Internal (not for brain consumption) ────────────────────────
     # Pending tool calls from brain_node → tool_executor_node
     _pending_tool_calls: list[Any]

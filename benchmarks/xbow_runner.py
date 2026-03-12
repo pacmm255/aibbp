@@ -333,6 +333,9 @@ async def run_challenge(
         result.done_reason = agent_output.get("done_reason", "")
         result.findings_count = len(agent_output.get("findings", {}))
         result.endpoints_count = len(agent_output.get("endpoints", {}))
+        # Propagate errors from _run_agent_ctf exception handler
+        if agent_output.get("error"):
+            result.error = agent_output["error"]
 
         # Check if the flag was found
         flag_returned = _extract_flag(agent_output, flag)
@@ -391,7 +394,7 @@ async def _run_agent_ctf(
             if not _read_claude_credentials():
                 return {"error": "No credentials"}
 
-    active_cfg = ActiveTestingConfig(enabled=True, dry_run=False, browser_headless=True)
+    active_cfg = ActiveTestingConfig(enabled=True, dry_run=False, browser_headless=True, proxy_port=8086)
     budget_cfg = BudgetConfig(total_dollars=budget, per_target_max_dollars=budget)
     budget_mgr = BudgetManager(budget_cfg, active_testing=True)
     # CTF mode: allocate entire budget to active_testing phase
@@ -411,6 +414,8 @@ async def _run_agent_ctf(
         client = ChatGPTClient(
             budget=budget_mgr, config=config,
             model=chatgpt_model, goja_port=1082,
+            use_goja=bool(proxy_pool),  # Goja TLS + proxy pool, direct otherwise
+            proxy_pool=proxy_pool,
         )
         # Claude client for compression (Haiku)
         claude_client = ClaudeClient(
@@ -468,8 +473,16 @@ async def _run_agent_ctf(
                 "traffic_intelligence": traffic_intelligence,
                 "traffic_analyzer": traffic_analyzer,
                 "config": active_cfg,
+                "circuit_breaker": None,  # Will be lazily created by react_graph
             },
         }
+
+        # Initialize circuit breaker for xbow
+        try:
+            from ai_brain.active.react_health import ToolCircuitBreaker
+            graph_config["configurable"]["circuit_breaker"] = ToolCircuitBreaker()
+        except Exception:
+            pass
 
         # CTF-mode initial state: add flag extraction objective
         # Build the additional services info
@@ -548,6 +561,11 @@ async def _run_agent_ctf(
             "hypothesis_budgets": {},
             "info_gain_history": [],
             "phase": "running",
+            # Hard phase gates: deterministic phase progression
+            "current_phase": "recon",
+            "phase_turn_count": 0,
+            "phase_history": [],
+            "consecutive_bookkeeping": 0,
             "budget_spent": 0.0,
             "budget_limit": budget,
             "turn_count": 0,
@@ -558,6 +576,15 @@ async def _run_agent_ctf(
             "_pending_tool_calls": [],
             "start_time": time.time(),
             "errors": [],
+            "reflector_retries": 0,
+            "repeat_detector_state": {},
+            "subtask_plan": [],
+            "sonnet_app_model_done": False,
+            "sonnet_exploit_calls": 0,
+            "opus_chain_reasoning_done": False,
+            "coverage_queue": {},
+            "coverage_ratio": 0.0,
+            "tool_health": {},
         }
 
         result = await graph.ainvoke(initial_state, config=graph_config)
@@ -703,8 +730,8 @@ async def main():
                         help="Z.ai model (default: glm-5)")
     parser.add_argument("--chatgpt", action="store_true", default=False,
                         help="Use ChatGPT (free anonymous) instead of Claude for the brain")
-    parser.add_argument("--chatgpt-model", type=str, default="auto",
-                        help="ChatGPT model (default: auto, also: gpt-4o-mini)")
+    parser.add_argument("--chatgpt-model", type=str, default="gpt-5-3",
+                        help="ChatGPT model (default: gpt-5-3, also: gpt-5-2, gpt-5-1, gpt-5, auto)")
     # Proxy pool for Z.ai rate limit bypass
     parser.add_argument("--enable-proxylist", action="store_true", default=False,
                         help="Use rotating proxy pool for Z.ai calls")
@@ -744,12 +771,13 @@ async def main():
 
     # Create proxy pool if requested (shared across all challenges)
     proxy_pool = None
-    if args.enable_proxylist and args.zai:
+    if args.enable_proxylist and (args.zai or args.chatgpt):
         from ai_brain.active.proxy_pool import ProxyPool
         proxy_pool = ProxyPool(
             rate_limit_seconds=args.proxy_ratelimit,
             min_proxies=args.min_proxies,
             max_proxies=args.max_proxies,
+            validation_target="chatgpt" if args.chatgpt else "zai",
         )
         print(f"[*] Warming proxy pool (min={args.min_proxies})...")
         await proxy_pool.warm()

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIBBP Security Dashboard</title>
+
+    <!-- ApexCharts -->
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.49.0/dist/apexcharts.min.js"></script>
+
+    <!-- xterm.js -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+
+    <!-- Prism.js -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-json.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-http.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+
+    <!-- Mermaid.js -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.344.0/dist/umd/lucide.min.js"></script>
+
+    <!-- App styles -->
+    <link rel="stylesheet" href="/static/css/main.css?v=20260311b">
+    <link rel="stylesheet" href="/static/css/components.css?v=20260311b">
+</head>
+<body>
+    <div id="app-container">
+        <!-- Sidebar -->
+        <nav id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-logo">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    <span class="sidebar-title">AIBBP</span>
+                </div>
+                <button class="sidebar-toggle" id="sidebar-toggle">
+                    <i data-lucide="panel-left-close" class="icon-collapse"></i>
+                    <i data-lucide="panel-left-open" class="icon-expand"></i>
+                </button>
+            </div>
+            <div class="sidebar-nav">
+                <a href="#/dashboard" class="nav-item" data-page="dashboard">
+                    <i data-lucide="layout-dashboard"></i>
+                    <span>Dashboard</span>
+                </a>
+                <a href="#/vulnerabilities" class="nav-item" data-page="vulnerabilities">
+                    <i data-lucide="shield-alert"></i>
+                    <span>Vulnerabilities</span>
+                </a>
+                <a href="#/scans" class="nav-item" data-page="scans">
+                    <i data-lucide="scan-search"></i>
+                    <span>Scans</span>
+                </a>
+                <a href="#/proxy" class="nav-item" data-page="proxy">
+                    <i data-lucide="network"></i>
+                    <span>Proxy</span>
+                </a>
+            </div>
+            <div class="sidebar-footer">
+                <div class="ws-status" id="ws-status">
+                    <span class="ws-dot"></span>
+                    <span class="ws-label">Disconnected</span>
+                </div>
+                <div class="user-menu" id="user-menu">
+                    <i data-lucide="user-circle"></i>
+                    <span class="user-email" id="user-email"></span>
+                    <button class="btn-ghost btn-sm" id="logout-btn" title="Logout">
+                        <i data-lucide="log-out"></i>
+                    </button>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main content -->
+        <main id="main-content" class="main-content">
+            <div id="page-container"></div>
+        </main>
+    </div>
+
+    <!-- Toast container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- App scripts (modules) -->
+    <script src="/static/js/api.js?v=20260311b"></script>
+    <script src="/static/js/ws.js?v=20260311b"></script>
+    <script src="/static/js/components/toast.js?v=20260311b"></script>
+    <script src="/static/js/components/severity-badge.js?v=20260311b"></script>
+    <script src="/static/js/components/chart.js?v=20260311b"></script>
+    <script src="/static/js/components/syntax-highlight.js?v=20260311b"></script>
+    <script src="/static/js/components/terminal.js?v=20260311b"></script>
+    <script src="/static/js/components/flowchart.js?v=20260311b"></script>
+    <script src="/static/js/components/virtual-scroll.js?v=20260311b"></script>
+    <script src="/static/js/pages/login.js?v=20260311b"></script>
+    <script src="/static/js/pages/dashboard.js?v=20260311b"></script>
+    <script src="/static/js/pages/vulnerabilities.js?v=20260311b"></script>
+    <script src="/static/js/pages/scans.js?v=20260311b"></script>
+    <script src="/static/js/pages/proxy.js?v=20260311b"></script>
+    <script src="/static/js/app.js?v=20260311b"></script>
+</body>
+</html>

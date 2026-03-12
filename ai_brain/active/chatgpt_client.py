@@ -207,19 +207,26 @@ class ChatGPTClient:
         self,
         budget: Any,
         config: Any,
-        model: str = "auto",
+        model: str = "gpt-5-3",
         goja_port: int = 1082,
+        use_goja: bool = True,
+        proxy_pool: Any = None,
     ):
         self.budget = budget
         self.config = config
         self.model = model
         self.demo_mode = False
 
-        # Goja TLS proxy
+        # Goja TLS proxy — Chrome fingerprint for all outgoing requests
+        self._use_goja = use_goja
         self._goja = GojaManager(port=goja_port)
         self._goja_started = False
+        self._current_upstream: str = ""  # Current Goja upstream proxy
 
-        # Session state
+        # Proxy pool (IP rotation, same pattern as Z.ai)
+        self.proxy_pool = proxy_pool
+
+        # Session state (per-IP when using proxy pool)
         self._http: httpx.AsyncClient | None = None
         self._device_id: str = ""
         self._prod: str = ""  # Build version from HTML
@@ -228,6 +235,9 @@ class ChatGPTClient:
         self._config: list[Any] = []
         self._reacts: list[str] = []
         self._session_valid: bool = False
+
+        # Per-proxy session cache: proxy_url -> {device_id, prod, cookies, ...}
+        self._proxy_sessions: dict[str, dict[str, Any]] = {}
 
         # Conversation state
         self._conversation_id: str | None = None
@@ -256,22 +266,48 @@ class ChatGPTClient:
         except Exception:
             pass
 
-    async def _ensure_goja(self) -> None:
-        """Start Goja TLS proxy if not running."""
-        if self._goja_started:
+    async def _ensure_goja(self, upstream_proxy: str = "") -> None:
+        """Start Goja TLS proxy (with optional upstream) + create httpx client.
+
+        Chain: httpx → Goja SOCKS5 (Chrome TLS) → upstream proxy → chatgpt.com
+        """
+        # If Goja is already running with this upstream, reuse
+        if self._goja_started and self._current_upstream == upstream_proxy and self._http is not None:
             return
-        # Kill any stale process on our port (from previous unclean shutdown)
-        self._kill_stale_goja(self._goja.port)
-        await asyncio.sleep(0.3)  # Brief wait for port release
-        await self._goja.start(timeout=15)
-        self._goja_started = True
-        self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=15.0),
-            verify=False,
-            proxy=self._goja.socks5_url,
-            follow_redirects=True,
-        )
-        logger.info("chatgpt_goja_started", port=self._goja.port)
+
+        # Stop existing Goja + client if upstream changed
+        if self._goja_started:
+            await self._goja.stop()
+            self._goja_started = False
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+
+        if self._use_goja:
+            self._kill_stale_goja(self._goja.port)
+            await asyncio.sleep(0.3)
+            await self._goja.start(timeout=15, upstream_proxy=upstream_proxy)
+            self._goja_started = True
+            self._current_upstream = upstream_proxy
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0),
+                verify=False,
+                proxy=self._goja.socks5_url,
+                follow_redirects=True,
+            )
+            logger.info("chatgpt_goja_started", port=self._goja.port,
+                        upstream=upstream_proxy[:40] if upstream_proxy else "direct")
+        else:
+            # Direct httpx with optional proxy (no TLS fingerprinting)
+            proxy_arg = upstream_proxy or None
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0),
+                follow_redirects=True,
+                proxy=proxy_arg,
+            )
+            self._current_upstream = upstream_proxy
+            logger.info("chatgpt_direct_client_started",
+                        proxy=upstream_proxy[:40] if upstream_proxy else "none")
 
     async def _init_session(self) -> None:
         """Load chatgpt.com page to get cookies + build ID."""
@@ -301,6 +337,20 @@ class ChatGPTClient:
         }
 
         resp = await self._http.get("https://chatgpt.com/", headers=page_headers)
+
+        # If Goja gets 403, fall back to direct httpx
+        if resp.status_code == 403 and self._use_goja:
+            logger.warning("chatgpt_goja_403_fallback_direct")
+            await self._http.aclose()
+            if self._goja_started:
+                await self._goja.stop()
+                self._goja_started = False
+            self._use_goja = False
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0),
+                follow_redirects=True,
+            )
+            resp = await self._http.get("https://chatgpt.com/", headers=page_headers)
 
         if resp.status_code != 200:
             raise RuntimeError(
@@ -693,9 +743,12 @@ class ChatGPTClient:
 
         Returns ChatGPTResponse mimicking Anthropic Message.
         """
-        # ChatGPT anonymous gpt-4o-mini has a strict message length limit (~4K tokens / ~16K chars).
-        # We must aggressively truncate the system prompt to fit.
-        MAX_PROMPT_CHARS = 15000
+        # GPT-5.3 anon: 413 at ~25K chars, works at 20K. Limit ~5K tokens input.
+        _MODEL_CHAR_LIMITS = {
+            "gpt-5-3": 20000, "gpt-5-2": 20000, "gpt-5-1": 20000,
+            "gpt-5": 20000, "gpt-5-mini": 15000, "auto": 15000,
+        }
+        MAX_PROMPT_CHARS = _MODEL_CHAR_LIMITS.get(self.model, 20000)
 
         # Build system prompt
         system_parts = []
@@ -717,16 +770,26 @@ class ChatGPTClient:
             tool_instructions = system_parts[-1] if tools else ""
             methodology = "\n\n".join(system_parts[:-1]) if tools else system_text
 
-            available = max_sys - len(tool_instructions) - 100
+            # Hard-coded preamble that MUST survive truncation
+            preamble = (
+                "CRITICAL IDENTITY: You are an autonomous pentesting agent running in a "
+                "tool-calling loop. You are NOT ChatGPT. You CANNOT run Python code. "
+                "You MUST call tools by outputting JSON. NEVER say 'you can run this code' "
+                "or 'Python environment is not enabled'. Every response MUST contain a "
+                "tool call JSON object on its own line.\n\n"
+            )
+
+            available = max_sys - len(tool_instructions) - len(preamble) - 100
             if available > 2000:
                 system_text = (
-                    methodology[:available]
+                    preamble
+                    + methodology[:available]
                     + "\n\n... [methodology truncated] ...\n\n"
                     + tool_instructions
                 )
             else:
-                # Extreme truncation: just keep tool instructions
-                system_text = tool_instructions[:max_sys]
+                # Extreme truncation: preamble + tool instructions
+                system_text = preamble + tool_instructions[:max_sys - len(preamble)]
 
             logger.info("chatgpt_prompt_truncated",
                         original_len=original_sys_len, truncated_len=len(system_text))
@@ -741,6 +804,14 @@ class ChatGPTClient:
 
         # Estimate input tokens
         estimated_input_tokens = len(full_prompt) // 4
+
+        # ── Proxy pool path: route through rotating proxies with Goja TLS ──
+        if self.proxy_pool:
+            return await self._call_via_proxy_pool(
+                full_prompt=full_prompt,
+                estimated_input_tokens=estimated_input_tokens,
+                phase=phase, target=target,
+            )
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -938,14 +1009,416 @@ class ChatGPTClient:
         # Should not reach here
         raise RuntimeError("ChatGPT: all retries exhausted")
 
+    # ── Proxy pool call path ──────────────────────────────────────
+
+    async def _init_proxy_session(self, proxy_url: str) -> dict[str, Any]:
+        """Initialize a ChatGPT session through a specific proxy.
+
+        Uses Goja TLS fingerprinting with the proxy as upstream:
+        httpx → Goja SOCKS5 (Chrome TLS) → upstream proxy → ChatGPT.
+        Each proxy gets its own device_id and cookies since ChatGPT
+        sessions are IP-bound.
+        Returns session dict cached for this proxy.
+        """
+        if proxy_url in self._proxy_sessions:
+            # Still need to ensure Goja points to this proxy
+            await self._ensure_goja(upstream_proxy=proxy_url)
+            return self._proxy_sessions[proxy_url]
+
+        # Start/restart Goja with this proxy as upstream
+        await self._ensure_goja(upstream_proxy=proxy_url)
+
+        page_headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            'sec-ch-ua': _SEC_CH_UA,
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': _USER_AGENT,
+        }
+
+        resp = await self._http.get("https://chatgpt.com/", headers=page_headers)
+        if resp.status_code != 200:
+            raise RuntimeError(f"ChatGPT page load via proxy failed: {resp.status_code}")
+
+        # Extract build + device
+        prod = "prod-unknown"
+        if 'data-build="' in resp.text:
+            prod = resp.text.split('data-build="')[1].split('"')[0]
+        device_id = ""
+        for name, value in resp.cookies.items():
+            if name == 'oai-did':
+                device_id = value
+                break
+        if not device_id:
+            device_id = str(uuid.uuid4())
+
+        start_time = int(time.time() * 1000)
+        sid = str(uuid.uuid4())
+
+        reacts = [
+            "location",
+            "__reactContainer$" + self._gen_react(),
+            "_reactListening" + self._gen_react(),
+        ]
+
+        vm_config = [
+            4880,
+            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)"),
+            4294705152, 1, _USER_AGENT, None, prod, "en-US", "en-US,en", 0,
+            "webkitGetUserMedia\u2212function webkitGetUserMedia() { [native code] }",
+            choice(reacts), choice(_WINDOW_KEYS),
+            randint(800, 1400) + random(), sid, "", 20, start_time,
+        ]
+
+        session = {
+            "device_id": device_id,
+            "prod": prod,
+            "start_time": start_time,
+            "sid": sid,
+            "vm_config": vm_config,
+        }
+        self._proxy_sessions[proxy_url] = session
+        logger.info("chatgpt_proxy_session_ready", proxy=proxy_url[:30],
+                     device_id=device_id[:12])
+        return session
+
+    async def _get_tokens_for_proxy(self, session: dict[str, Any]) -> dict[str, str]:
+        """Run the full token pipeline using a cached proxy session."""
+        from ai_brain.active.chatgpt_reverse import Challenges, VM
+
+        vm_config = list(session["vm_config"])
+        vm_config[3] = 1
+        vm_config[9] = round(time.time() * 1000 - session["start_time"])
+        vm_token = "gAAAAAC" + Challenges.encode(vm_config)
+
+        api_h = {
+            'accept': '*/*',
+            'content-type': 'application/json',
+            'oai-client-version': session["prod"],
+            'oai-device-id': session["device_id"],
+            'oai-language': 'en-US',
+            'origin': 'https://chatgpt.com',
+            'referer': 'https://chatgpt.com/',
+            'sec-ch-ua': _SEC_CH_UA,
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': _USER_AGENT,
+        }
+
+        # Sentinel
+        sentinel = await self._http.post(
+            "https://chatgpt.com/backend-anon/sentinel/chat-requirements",
+            headers=api_h, json={"p": vm_token},
+        )
+        if sentinel.status_code != 200:
+            raise RuntimeError(f"Sentinel failed: {sentinel.status_code}")
+        reqs = sentinel.json()
+
+        if reqs.get("force_login"):
+            logger.debug("chatgpt_proxy_force_login", proxy=self._current_upstream[:30])
+
+        # PoW
+        pow_token = ""
+        pow_data = reqs.get("proofofwork", {})
+        if pow_data.get("required"):
+            config2 = list(session["vm_config"])
+            config2[3] = random()
+            config2[9] = round(time.time() * 1000 - session["start_time"])
+            pow_token = Challenges.solve_pow(pow_data["seed"], pow_data["difficulty"], config2) or ""
+
+        # Turnstile
+        turnstile_token = ""
+        turnstile_dx = reqs.get("turnstile", {}).get("dx", "")
+        if turnstile_dx:
+            turnstile_token = VM.get_turnstile(turnstile_dx, vm_token, str(["0.0.0.0", "Unknown", "Unknown", "0", "0"]))
+
+        # Conduit
+        conduit_token = ""
+        conduit_body = {
+            'action': 'next', 'fork_from_shared_post': False,
+            'parent_message_id': 'client-created-root',
+            'model': self.model,
+            'timezone_offset_min': -300, 'timezone': 'America/New_York',
+            'history_and_training_disabled': True,
+            'conversation_mode': {'kind': 'primary_assistant'},
+            'system_hints': [], 'supports_buffering': True,
+            'supported_encodings': ['v1'],
+        }
+        conduit_h = {**api_h, 'x-conduit-token': 'no-token'}
+        conduit_resp = await self._http.post(
+            "https://chatgpt.com/backend-anon/f/conversation/prepare",
+            headers=conduit_h, json=conduit_body,
+        )
+        if conduit_resp.status_code == 200:
+            try:
+                conduit_token = conduit_resp.json().get("conduit_token", "")
+            except Exception:
+                pass
+
+        return {
+            "requirements_token": reqs.get("token", ""),
+            "pow_token": pow_token,
+            "turnstile_token": turnstile_token,
+            "conduit_token": conduit_token,
+        }
+
+    async def _call_via_proxy_pool(
+        self,
+        full_prompt: str,
+        estimated_input_tokens: int,
+        phase: str,
+        target: str,
+    ) -> ChatGPTResponse:
+        """Route ChatGPT call through proxy pool with Goja TLS fingerprinting."""
+        max_retries = 5
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries):
+            proxy = None
+            try:
+                proxy = await self.proxy_pool.acquire()
+            except RuntimeError as e:
+                logger.warning("chatgpt_proxy_acquire_failed", error=str(e), attempt=attempt)
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+
+            try:
+                # Set up Goja with this proxy as upstream + get session
+                try:
+                    session = await asyncio.wait_for(
+                        self._init_proxy_session(proxy.url), timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.proxy_pool.release(proxy, success=False)
+                    # Invalidate cached session
+                    self._proxy_sessions.pop(proxy.url, None)
+                    last_error = RuntimeError(f"Session timeout via {proxy.url[:30]}")
+                    continue
+
+                # Get fresh tokens through this proxy
+                try:
+                    tokens = await asyncio.wait_for(
+                        self._get_tokens_for_proxy(session), timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.proxy_pool.release(proxy, success=False)
+                    self._proxy_sessions.pop(proxy.url, None)
+                    last_error = RuntimeError(f"Token pipeline timeout via {proxy.url[:30]}")
+                    continue
+
+                # Build chat request
+                time_1 = randint(6000, 9000)
+                chat_headers = {
+                    'accept': 'text/event-stream',
+                    'accept-language': 'en-US,en;q=0.9',
+                    'content-type': 'application/json',
+                    'oai-client-version': session["prod"],
+                    'oai-device-id': session["device_id"],
+                    'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
+                    'oai-language': 'en-US',
+                    'openai-sentinel-chat-requirements-token': tokens["requirements_token"],
+                    'openai-sentinel-proof-token': tokens["pow_token"],
+                    'openai-sentinel-turnstile-token': tokens["turnstile_token"],
+                    'origin': 'https://chatgpt.com',
+                    'referer': 'https://chatgpt.com/',
+                    'sec-ch-ua': _SEC_CH_UA,
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'sec-fetch-dest': 'empty',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-site': 'same-origin',
+                    'user-agent': _USER_AGENT,
+                }
+                if tokens["conduit_token"]:
+                    chat_headers['x-conduit-token'] = tokens["conduit_token"]
+
+                chat_body = {
+                    'action': 'next',
+                    'messages': [{
+                        'id': str(uuid.uuid4()),
+                        'author': {'role': 'user'},
+                        'create_time': round(time.time(), 3),
+                        'content': {'content_type': 'text', 'parts': [full_prompt]},
+                        'metadata': {'serialization_metadata': {'custom_symbol_offsets': []}},
+                    }],
+                    'parent_message_id': 'client-created-root',
+                    'model': self.model,
+                    'timezone_offset_min': -300,
+                    'timezone': 'America/New_York',
+                    'history_and_training_disabled': True,
+                    'conversation_mode': {'kind': 'primary_assistant'},
+                    'system_hints': [],
+                    'supports_buffering': True,
+                    'supported_encodings': ['v1'],
+                    'paragen_cot_summary_display_override': 'allow',
+                }
+
+                logger.info("chatgpt_proxy_sending", model=self.model,
+                             proxy=proxy.url[:30], attempt=attempt)
+
+                # Try both endpoints
+                resp = None
+                for ep in [
+                    "https://chatgpt.com/backend-anon/f/conversation",
+                    "https://chatgpt.com/backend-anon/conversation",
+                ]:
+                    resp = await asyncio.wait_for(
+                        self._http.post(ep, headers=chat_headers, json=chat_body),
+                        timeout=90.0,
+                    )
+                    if resp.status_code == 200:
+                        break
+                    elif resp.status_code in (401, 403):
+                        # Session invalid for this proxy — clear cache
+                        self._proxy_sessions.pop(proxy.url, None)
+                        continue
+
+                if resp is None or resp.status_code != 200:
+                    self.proxy_pool.release(proxy, success=False)
+                    self._proxy_sessions.pop(proxy.url, None)
+                    status = resp.status_code if resp else 0
+                    last_error = RuntimeError(f"ChatGPT {status} via {proxy.url[:30]}")
+                    continue
+
+                # Parse response
+                full_text = self._parse_sse(resp.text)
+                estimated_output_tokens = len(full_text) // 4
+
+                self.proxy_pool.release(proxy, success=True)
+
+                logger.info("chatgpt_proxy_response", text_len=len(full_text),
+                             proxy=proxy.url[:30])
+
+                # Extract tool calls
+                clean_text, tool_calls = _extract_tool_calls(full_text)
+
+                content: list[ChatGPTTextBlock | ChatGPTToolUseBlock] = []
+                if clean_text:
+                    content.append(ChatGPTTextBlock(clean_text))
+                content.extend(tool_calls)
+
+                self._total_calls += 1
+                self.budget.record_cost(
+                    phase=phase, model=f"chatgpt-{self.model}",
+                    input_tokens=estimated_input_tokens,
+                    output_tokens=estimated_output_tokens,
+                    cache_read_tokens=0, cache_creation_tokens=0,
+                    target=target,
+                )
+
+                return ChatGPTResponse(
+                    content=content,
+                    stop_reason="tool_use" if tool_calls else "end_turn",
+                    usage=ChatGPTUsage(estimated_input_tokens, estimated_output_tokens),
+                )
+
+            except asyncio.TimeoutError:
+                if proxy:
+                    self.proxy_pool.release(proxy, success=False)
+                    self._proxy_sessions.pop(proxy.url, None)
+                last_error = RuntimeError(f"Request timeout via {proxy.url[:30] if proxy else '?'}")
+                continue
+            except Exception as e:
+                if proxy:
+                    self.proxy_pool.release(proxy, success=False)
+                last_error = e
+                logger.warning("chatgpt_proxy_call_failed", proxy=proxy.url[:30] if proxy else "?",
+                               error=str(e), attempt=attempt)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 * (attempt + 1))
+
+        # All retries exhausted — fallback to direct (no proxy)
+        logger.warning("chatgpt_proxy_exhausted_fallback_direct", error=str(last_error))
+        try:
+            await self._ensure_goja(upstream_proxy="")  # Restart Goja without upstream
+            self._invalidate_session()
+            # Use the direct call path (no proxy pool)
+            saved_pool = self.proxy_pool
+            self.proxy_pool = None
+            try:
+                # Re-init session for direct path
+                await self._init_session()
+                tokens = await self._get_tokens()
+
+                time_1 = randint(6000, 9000)
+                chat_headers = {
+                    'accept': 'text/event-stream', 'content-type': 'application/json',
+                    'oai-client-version': self._prod, 'oai-device-id': self._device_id,
+                    'oai-echo-logs': f'0,{time_1},1,{time_1 + randint(1000, 1200)}',
+                    'oai-language': 'en-US',
+                    'openai-sentinel-chat-requirements-token': tokens["requirements_token"],
+                    'openai-sentinel-proof-token': tokens["pow_token"],
+                    'openai-sentinel-turnstile-token': tokens["turnstile_token"],
+                    'origin': 'https://chatgpt.com', 'referer': 'https://chatgpt.com/',
+                    'sec-ch-ua': _SEC_CH_UA, 'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"', 'user-agent': _USER_AGENT,
+                }
+                if tokens["conduit_token"]:
+                    chat_headers['x-conduit-token'] = tokens["conduit_token"]
+
+                chat_body = {
+                    'action': 'next',
+                    'messages': [{'id': str(uuid.uuid4()), 'author': {'role': 'user'},
+                                  'content': {'content_type': 'text', 'parts': [full_prompt]},
+                                  'metadata': {'serialization_metadata': {'custom_symbol_offsets': []}}}],
+                    'parent_message_id': 'client-created-root', 'model': self.model,
+                    'timezone_offset_min': -300, 'timezone': 'America/New_York',
+                    'history_and_training_disabled': True,
+                    'conversation_mode': {'kind': 'primary_assistant'},
+                    'system_hints': [], 'supports_buffering': True,
+                    'supported_encodings': ['v1'],
+                }
+
+                for ep in ["https://chatgpt.com/backend-anon/f/conversation",
+                           "https://chatgpt.com/backend-anon/conversation"]:
+                    resp = await self._http.post(ep, headers=chat_headers, json=chat_body)
+                    if resp.status_code == 200:
+                        break
+
+                if resp.status_code == 200:
+                    full_text = self._parse_sse(resp.text)
+                    clean_text, tool_calls = _extract_tool_calls(full_text)
+                    content = []
+                    if clean_text: content.append(ChatGPTTextBlock(clean_text))
+                    content.extend(tool_calls)
+                    self.budget.record_cost(
+                        phase=phase, model=f"chatgpt-{self.model}",
+                        input_tokens=estimated_input_tokens,
+                        output_tokens=len(full_text) // 4,
+                        cache_read_tokens=0, cache_creation_tokens=0, target=target,
+                    )
+                    return ChatGPTResponse(content=content,
+                                           stop_reason="tool_use" if tool_calls else "end_turn",
+                                           usage=ChatGPTUsage(estimated_input_tokens, len(full_text) // 4))
+            finally:
+                self.proxy_pool = saved_pool
+        except Exception as e2:
+            logger.error("chatgpt_direct_fallback_failed", error=str(e2))
+
+        return ChatGPTResponse(
+            content=[ChatGPTTextBlock(f"[ERROR: All proxy retries + direct fallback failed: {last_error}]")],
+            stop_reason="error",
+            usage=ChatGPTUsage(estimated_input_tokens, 0),
+        )
+
     def select_model(self, task_tier: str) -> str:
         """Always returns the ChatGPT model."""
         return f"chatgpt-{self.model}"
 
     async def close(self) -> None:
-        """Close HTTP client and stop Goja."""
+        """Close HTTP client and stop Goja if used."""
         if self._http:
             await self._http.aclose()
+            self._http = None
         if self._goja_started:
             await self._goja.stop()
             self._goja_started = False

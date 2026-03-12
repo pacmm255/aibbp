@@ -104,8 +104,14 @@ class GojaManager:
     def is_running(self) -> bool:
         return self._running and self._process is not None and self._process.poll() is None
 
-    async def start(self, timeout: int = 10) -> None:
-        """Start Goja proxy process."""
+    async def start(self, timeout: int = 10, upstream_proxy: str = "") -> None:
+        """Start Goja proxy process.
+
+        Args:
+            timeout: Seconds to wait for proxy to be ready.
+            upstream_proxy: Optional upstream HTTP/SOCKS proxy URL.
+                Chain: httpx → Goja (TLS fingerprint) → upstream proxy → target.
+        """
         if self._running:
             return
 
@@ -119,7 +125,7 @@ class GojaManager:
             "fingerprint": _CHROME_FINGERPRINT,
             "fingerprintPreset": "",
             "dashboard": {"enabled": False},
-            "upstreamProxy": "",
+            "upstreamProxy": upstream_proxy,
             "reuseConnections": True,
             "requestTimeoutSec": 30,
             "filters": [],

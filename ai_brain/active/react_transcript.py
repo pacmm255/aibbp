@@ -20,10 +20,10 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Cap sizes to prevent massive log lines
-_MAX_TOOL_RESULT_SIZE = 10_000
-_MAX_TOOL_INPUT_SIZE = 5_000
-_MAX_FIELD_SIZE = 2_000
+# Cap sizes — very high limits for full analytics runs
+_MAX_TOOL_RESULT_SIZE = 200_000
+_MAX_TOOL_INPUT_SIZE = 200_000
+_MAX_FIELD_SIZE = 200_000
 
 
 def _cap(text: str, limit: int) -> str:
@@ -261,3 +261,69 @@ class TranscriptLogger:
         self._write_event("memory_save", {
             "memory_path": memory_path,
         })
+
+    def log_api_response_meta(
+        self,
+        model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        cost: float = 0.0,
+        stop_reason: str = "",
+        latency_ms: float = 0.0,
+    ) -> None:
+        """Log API response metadata: tokens, cost, latency."""
+        self._write_event("api_response_meta", {
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cost": round(cost, 6),
+            "stop_reason": stop_reason,
+            "latency_ms": round(latency_ms, 1),
+        })
+
+    def log_state_snapshot(self, state: dict) -> None:
+        """Log a full state snapshot (endpoints, findings counts, budget, etc.)."""
+        snap = {}
+        for key, value in state.items():
+            if key == "messages":
+                snap["messages_count"] = len(value) if isinstance(value, list) else 0
+            elif key in ("endpoints", "findings", "hypotheses", "accounts"):
+                snap[f"{key}_count"] = len(value) if isinstance(value, (dict, list)) else 0
+                if isinstance(value, dict):
+                    snap[f"{key}_keys"] = list(value.keys())[:50]
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                snap[key] = value
+            elif isinstance(value, list):
+                snap[f"{key}_count"] = len(value)
+            elif isinstance(value, dict):
+                snap[f"{key}_count"] = len(value)
+            else:
+                snap[key] = str(value)[:200]
+        self._write_event("state_snapshot", snap)
+
+    def log_full_messages(self, messages: list) -> None:
+        """Log the complete message history sent to the API."""
+        serialized = []
+        for m in messages:
+            role = m.get("role", "?") if isinstance(m, dict) else getattr(m, "role", "?")
+            content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+            if isinstance(content, list):
+                content_str = json.dumps(content, default=str)
+            else:
+                content_str = str(content)
+            serialized.append({
+                "role": role,
+                "content": _cap(content_str, _MAX_FIELD_SIZE),
+            })
+        self._write_event("full_messages", {
+            "count": len(serialized),
+            "messages": serialized,
+        })
+
+    def log_custom(self, event_name: str, data: dict) -> None:
+        """Log any custom event for analytics."""
+        self._write_event(event_name, data)

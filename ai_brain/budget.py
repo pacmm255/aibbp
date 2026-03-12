@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import structlog
 from dataclasses import dataclass, field
 
@@ -58,6 +59,7 @@ class BudgetManager:
     phases: dict[str, PhaseSpend] = field(init=False)
     total_spent: float = field(init=False, default=0.0)
     per_target_spent: dict[str, float] = field(default_factory=dict)
+    cost_log: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         total = self.config.total_dollars
@@ -72,8 +74,8 @@ class BudgetManager:
                 "validation": PhaseSpend(allocated=total * 7 / 100),
                 "chain_discovery": PhaseSpend(allocated=total * 3 / 100),
                 "reporting": PhaseSpend(allocated=total * 5 / 100),
-                "strategy": PhaseSpend(allocated=total * 2 / 100),
-                "active_testing": PhaseSpend(allocated=total * 50 / 100),
+                "strategy": PhaseSpend(allocated=total * 10 / 100),
+                "active_testing": PhaseSpend(allocated=total * 87 / 100),
             }
         else:
             self.phases = {
@@ -142,6 +144,7 @@ class BudgetManager:
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
         target: str = "",
+        tool: str = "",
     ) -> float:
         """Record actual cost from an API call. Returns the cost in dollars."""
         cost = self._calculate_cost(
@@ -157,6 +160,21 @@ class BudgetManager:
             self.per_target_spent[target] = (
                 self.per_target_spent.get(target, 0) + cost
             )
+
+        # Append to cost log for detailed attribution
+        self.cost_log.append({
+            "timestamp": time.time(),
+            "model": model,
+            "phase": phase,
+            "tool": tool,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cost": cost,
+        })
+        # Cap cost_log at 2000 entries
+        if len(self.cost_log) > 2000:
+            self.cost_log = self.cost_log[-1500:]
 
         logger.debug(
             "cost_recorded",
@@ -234,6 +252,102 @@ class BudgetManager:
 
                 if needed <= 0:
                     break
+
+    def cost_breakdown(self) -> dict:
+        """Return detailed cost attribution breakdown."""
+        per_phase: dict[str, float] = {}
+        per_model: dict[str, float] = {}
+        per_tool: dict[str, float] = {}
+        for entry in self.cost_log:
+            c = entry["cost"]
+            phase = entry.get("phase", "unknown")
+            model = entry.get("model", "unknown")
+            tool = entry.get("tool", "") or "brain"
+            per_phase[phase] = per_phase.get(phase, 0) + c
+            per_model[model] = per_model.get(model, 0) + c
+            per_tool[tool] = per_tool.get(tool, 0) + c
+
+        call_count = len(self.cost_log)
+        avg_cost = self.total_spent / max(call_count, 1)
+
+        # Top 10 most expensive calls
+        sorted_log = sorted(self.cost_log, key=lambda x: x["cost"], reverse=True)
+        top_expensive = [
+            {"cost": round(e["cost"], 6), "model": e["model"],
+             "phase": e["phase"], "tool": e.get("tool", "")}
+            for e in sorted_log[:10]
+        ]
+
+        return {
+            "total": round(self.total_spent, 4),
+            "per_phase": {k: round(v, 4) for k, v in sorted(per_phase.items(), key=lambda x: -x[1])},
+            "per_model": {k: round(v, 4) for k, v in sorted(per_model.items(), key=lambda x: -x[1])},
+            "per_tool": {k: round(v, 4) for k, v in sorted(per_tool.items(), key=lambda x: -x[1])},
+            "call_count": call_count,
+            "avg_cost_per_call": round(avg_cost, 6),
+            "top_expensive_calls": top_expensive,
+        }
+
+    def rebalance_phases(
+        self,
+        info_gain_history: list[dict] | None = None,
+        phase_budgets: dict[str, dict] | None = None,
+    ) -> dict[str, dict]:
+        """Adaptive budget rebalance based on information gain patterns.
+
+        Returns dict of updated phase_budget entries (only changed ones).
+        """
+        if not phase_budgets:
+            return {}
+        updates: dict[str, dict] = {}
+        history = info_gain_history or []
+
+        # Rule 1: Last 5 exploitation turns = 0 gain → transfer 30% to recon
+        if len(history) >= 5:
+            last_5 = history[-5:]
+            exploit_gains = [h.get("total_gain", 0) for h in last_5]
+            if all(g == 0 for g in exploit_gains):
+                exploit_budget = phase_budgets.get("exploitation", {})
+                recon_budget = phase_budgets.get("recon", {})
+                remaining_exploit = exploit_budget.get("allocated_pct", 60) - exploit_budget.get("spent", 0)
+                if remaining_exploit > 10:
+                    transfer = remaining_exploit * 0.3
+                    updates["exploitation"] = {
+                        **exploit_budget,
+                        "allocated_pct": exploit_budget.get("allocated_pct", 60) - transfer,
+                    }
+                    updates["recon"] = {
+                        **recon_budget,
+                        "allocated_pct": recon_budget.get("allocated_pct", 20) + transfer,
+                    }
+                    logger.info("budget_rebalance_rule1", transfer_pct=round(transfer, 1))
+
+        # Rule 2: Recon productive at turn 20+ → extend recon by 5%
+        if len(history) >= 20:
+            last_10 = history[-10:]
+            new_endpoints = sum(h.get("new_endpoints", 0) for h in last_10)
+            if new_endpoints >= 3:
+                recon_budget = updates.get("recon", phase_budgets.get("recon", {}))
+                current_pct = recon_budget.get("allocated_pct", 20)
+                if current_pct < 40:
+                    updates["recon"] = {**recon_budget, "allocated_pct": current_pct + 5}
+                    logger.info("budget_rebalance_rule2", new_recon_pct=current_pct + 5)
+
+        # Rule 3: Finding cluster (3+ finding turns in last 10) → burst +10% exploit
+        if len(history) >= 10:
+            last_10 = history[-10:]
+            finding_turns = sum(1 for h in last_10 if h.get("new_findings", 0) > 0)
+            if finding_turns >= 3:
+                exploit_budget = updates.get("exploitation", phase_budgets.get("exploitation", {}))
+                current_pct = exploit_budget.get("allocated_pct", 60)
+                if current_pct < 80:
+                    updates["exploitation"] = {
+                        **exploit_budget,
+                        "allocated_pct": min(80, current_pct + 10),
+                    }
+                    logger.info("budget_rebalance_rule3", new_exploit_pct=min(80, current_pct + 10))
+
+        return updates
 
     def summary(self) -> dict:
         """Return a summary of budget status."""

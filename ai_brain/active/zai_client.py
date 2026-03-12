@@ -814,7 +814,11 @@ class ZaiClient:
             "messages": glm_messages,
             "stream": True,
             "signature_prompt": prompt_text,
-            "params": {},
+            "temperature": 1.0,  # Official recommendation for reasoning tasks
+            "max_tokens": 131072,  # GLM-5 max: 128K output tokens — no ceiling on reasoning
+            "params": {
+                "clear_thinking": False,  # Preserved Thinking: retain reasoning across turns
+            },
             "features": {
                 "image_generation": False,
                 "web_search": web_search,
@@ -822,6 +826,7 @@ class ZaiClient:
                 "preview_mode": False,
                 "flags": [],
                 "enable_thinking": self.enable_thinking,
+                "clear_thinking": False,  # Also try in features dict (undocumented API)
             },
             "variables": {},
             "session_id": None,
@@ -1218,7 +1223,7 @@ class ZaiClient:
                 # Wrap in 30s timeout to prevent hanging on dead proxies
                 try:
                     await asyncio.wait_for(
-                        self.proxy_pool.ensure_proxy_session(proxy), timeout=30.0
+                        self.proxy_pool.ensure_proxy_session(proxy), timeout=10.0
                     )
                 except asyncio.TimeoutError:
                     self.proxy_pool.release(proxy, success=False)
@@ -1388,13 +1393,94 @@ class ZaiClient:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 * (attempt + 1))
 
-        # All retries exhausted — return error response instead of crashing
-        logger.error("zai_proxy_all_retries_failed", error=str(last_error))
-        return ZaiResponse(
-            content=[{"type": "text", "text": f"[ERROR: All {max_retries} proxy retries failed: {last_error}]"}],
-            stop_reason="error",
-            usage=ZaiUsage(input_tokens=estimated_input_tokens, output_tokens=0),
-        )
+        # All retries exhausted — fallback to direct Z.ai call (with rate limiting)
+        logger.warning("zai_proxy_exhausted_fallback_direct", error=str(last_error))
+        try:
+            global _ZAI_LAST_CALL_TIME
+            async with _ZAI_SEMAPHORE:
+                elapsed_since_last = time.time() - _ZAI_LAST_CALL_TIME
+                if elapsed_since_last < _ZAI_MIN_INTERVAL:
+                    await asyncio.sleep(_ZAI_MIN_INTERVAL - elapsed_since_last)
+                _ZAI_LAST_CALL_TIME = time.time()
+
+            # Re-sign with own session (not proxy session)
+            _fb_request_id = str(uuid.uuid4())
+            _fb_ts = int(time.time() * 1000)
+            headers["Authorization"] = f"Bearer {self._token}"
+            cookie_parts = [f"token={self._token}"]
+            for k, v in self._cookies.items():
+                if k != "token":
+                    cookie_parts.append(f"{k}={v}")
+            headers["Cookie"] = "; ".join(cookie_parts)
+            query_params["requestId"] = _fb_request_id
+            query_params["user_id"] = self._user_id or ""
+            query_params["timestamp"] = str(_fb_ts)
+            query_params["signature_timestamp"] = str(_fb_ts)
+            headers["X-Signature"] = self._generate_signature(
+                prompt_text, self._user_id or "", _fb_request_id, _fb_ts,
+            )
+
+            doc_buffer = []
+            native_tool_calls = []
+            output_tokens = 0
+
+            async with self._http.stream(
+                "POST", url, params=query_params,
+                headers=headers, json=body,
+            ) as stream:
+                if stream.status_code != 200:
+                    error_body = ""
+                    async for chunk in stream.aiter_text():
+                        error_body += chunk
+                    raise RuntimeError(f"Direct fallback {stream.status_code}: {error_body[:300]}")
+
+                async for line in stream.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str in ("[DONE]", '{"data":"[DONE]"}'):
+                        break
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    event_data = event.get("data", event)
+                    if isinstance(event_data, str):
+                        if event_data == "[DONE]":
+                            break
+                        continue
+                    delta = event_data.get("delta_content", "")
+                    edit = event_data.get("edit_content", "")
+                    edit_idx = event_data.get("edit_index")
+                    phase_val = event_data.get("phase", "")
+                    if phase_val == "tool_call" and edit:
+                        doc_buffer.append(edit)
+                        output_tokens += 1
+                    if delta:
+                        doc_buffer.append(delta)
+                        output_tokens += 1
+                    if edit and edit_idx is not None and phase_val != "tool_call":
+                        current_doc = "".join(doc_buffer)
+                        if edit_idx >= len(current_doc):
+                            doc_buffer.append(edit)
+                        else:
+                            doc_buffer = [current_doc[:edit_idx] + edit]
+                        output_tokens += 1
+                    if event_data.get("done"):
+                        break
+
+            return self._parse_streamed_response(
+                doc_buffer, native_tool_calls,
+                estimated_input_tokens, output_tokens,
+                phase, target, tools,
+            )
+        except Exception as e2:
+            logger.error("zai_direct_fallback_failed", error=str(e2))
+            return ZaiResponse(
+                content=[{"type": "text", "text": f"[ERROR: All {max_retries} proxy retries + direct fallback failed: {e2}]"}],
+                stop_reason="error",
+                usage=ZaiUsage(input_tokens=estimated_input_tokens, output_tokens=0),
+            )
 
     def select_model(self, task_tier: str) -> str:
         """Always returns the Z.ai model."""

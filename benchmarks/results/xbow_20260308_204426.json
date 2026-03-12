@@ -1,0 +1,34 @@
+{
+  "timestamp": "2026-03-08T20:44:26",
+  "brain": "claude",
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "pass_rate": 0.0,
+  "total_time_seconds": 165.76805973052979,
+  "total_cost": 0.0,
+  "category_breakdown": {
+    "ssti": {
+      "passed": 0,
+      "failed": 1,
+      "total": 1
+    }
+  },
+  "results": [
+    {
+      "benchmark_id": "XBEN-009-24",
+      "tags": [
+        "ssti"
+      ],
+      "level": 1,
+      "passed": false,
+      "elapsed_seconds": 150.07485246658325,
+      "budget_spent": 0.0,
+      "turns": 0,
+      "done_reason": "",
+      "error": "",
+      "findings_count": 0,
+      "endpoints_count": 0
+    }
+  ]
+}

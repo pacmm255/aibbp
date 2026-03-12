@@ -180,6 +180,26 @@ services:
           memory: 2048M
     restart: unless-stopped
 
+  # ── Neo4j Knowledge Graph (opt-in via --profile active) ──────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: aibbp-neo4j
+    profiles: [active]
+    environment:
+      NEO4J_AUTH: neo4j/aibbp_dev
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
   # ── SQLMap API (opt-in via --profile active) ─────────────────────
   sqlmap-api:
     image: paolostivanin/sqlmap
@@ -201,3 +221,4 @@ volumes:
   scandata:
   reportdata:
   activedata:
+  neo4jdata:

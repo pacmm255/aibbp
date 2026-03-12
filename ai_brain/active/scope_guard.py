@@ -9,6 +9,7 @@ of the proven ScopeEnforcer.
 from __future__ import annotations
 
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 import structlog
@@ -62,8 +63,23 @@ class ActiveScopeGuard:
         "challenges.cloudflare.com",
     }
 
-    def __init__(self, scope_enforcer: ScopeEnforcer) -> None:
+    def __init__(self, scope_enforcer: ScopeEnforcer, policy_manifest: Any = None) -> None:
         self._scope = scope_enforcer
+        self._policy_manifest = policy_manifest
+
+    def get_asset_criticality(self, url: str) -> float:
+        """Get criticality multiplier for an asset from policy manifest."""
+        if self._policy_manifest:
+            return self._policy_manifest.get_asset_criticality(url)
+        return 0.5
+
+    def is_in_scope(self, url: str) -> bool:
+        """Check if a URL is in scope (boolean, no exception)."""
+        try:
+            self.validate_url(url)
+            return True
+        except Exception:
+            return False
 
     def validate_url(self, url: str) -> None:
         """Validate a URL before browser navigation or HTTP request.
@@ -104,6 +120,16 @@ class ActiveScopeGuard:
                     component="browser",
                 )
 
+        # Check policy manifest excluded assets
+        if self._policy_manifest and hasattr(self._policy_manifest, 'excluded_assets'):
+            for rule in self._policy_manifest.excluded_assets:
+                if hasattr(self._policy_manifest, '_matches_rule'):
+                    if self._policy_manifest._matches_rule(hostname, url, rule):
+                        raise ActiveScopeViolation(
+                            f"Asset {hostname} excluded by policy manifest",
+                            action="navigate", target=url, component="policy",
+                        )
+
         # Delegate to ScopeEnforcer for domain/IP/port validation
         try:
             self._scope.validate_action(action="active_browse", target=url)
@@ -126,6 +152,11 @@ class ActiveScopeGuard:
             ActiveScopeViolation: If the request violates scope.
         """
         self.validate_url(url)
+
+        # Check policy manifest prohibited tests (heuristic: map method to technique)
+        if self._policy_manifest and hasattr(self._policy_manifest, 'is_test_allowed'):
+            # Don't block here — technique checking is done in tool dispatch
+            pass
 
         method_upper = method.upper()
         if method_upper in self._DESTRUCTIVE_METHODS:

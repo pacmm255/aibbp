@@ -154,6 +154,10 @@ def parse_args() -> argparse.Namespace:
         help="Output JSON file path",
     )
     parser.add_argument(
+        "--report-format", type=str, default="md", choices=["md", "html", "json"],
+        help="Report format: md, html, or json (default: md)",
+    )
+    parser.add_argument(
         "--headless", action="store_true", default=True,
         help="Run browser in headless mode (default)",
     )
@@ -237,11 +241,77 @@ def parse_args() -> argparse.Namespace:
         "--no-app-gate", action="store_true", default=False,
         help="Disable app comprehension gate (allow exploitation without build_app_model)",
     )
+    parser.add_argument(
+        "--force-opus", action="store_true", default=False,
+        help="Force Opus model for ALL turns (not just strategy/validation)",
+    )
+    parser.add_argument(
+        "--force-sonnet", action="store_true", default=False,
+        help="Force Sonnet model for ALL turns (no Opus escalation)",
+    )
     # Agent C deep research
     parser.add_argument(
         "--zai-research", action="store_true", default=False,
         help="Enable Agent C deep research tool (uses Z.ai with web search + thinking). Requires --zai.",
     )
+    # Docker sandbox
+    parser.add_argument(
+        "--docker-sandbox", action="store_true", default=False,
+        help="Run security tools in Docker containers for isolation",
+    )
+    parser.add_argument(
+        "--docker-image", type=str, default="kalilinux/kali-rolling",
+        help="Docker image for sandbox containers (default: kalilinux/kali-rolling)",
+    )
+    # External tools
+    parser.add_argument(
+        "--external-tools", type=str, default="",
+        help="Path or URL to JSON file with external tool definitions",
+    )
+    # Neo4j Knowledge Graph
+    parser.add_argument(
+        "--neo4j-uri", type=str, default="",
+        help="Neo4j bolt URI (e.g., bolt://localhost:7687). Empty = disabled.",
+    )
+
+    # ChatGPT (free GPT-5.3) mode
+    parser.add_argument(
+        "--chatgpt", action="store_true", default=False,
+        help="Use ChatGPT anonymous GPT-5.3 (free) instead of Claude for the brain.",
+    )
+    parser.add_argument(
+        "--chatgpt-model", type=str, default="gpt-5-3",
+        help="ChatGPT model slug (default: gpt-5-3). Options: gpt-5-3, gpt-5-2, gpt-5-1, gpt-5, gpt-5-mini, auto",
+    )
+
+    # Policy (Sprint 2)
+    parser.add_argument(
+        "--policy", type=str, default="",
+        help="Path to policy YAML file for scope/rules/rate-limit enforcement",
+    )
+    parser.add_argument(
+        "--mode", type=str, default="", choices=["", "public_bounty", "ctf", "cooperative"],
+        help="Testing mode (default: auto-detect from budget)",
+    )
+    parser.add_argument(
+        "--prohibited-tests", type=str, nargs="*", default=[],
+        help="Prohibited test techniques (e.g., dos brute_force)",
+    )
+
+    # Dependency isolation (Sprint 5)
+    parser.add_argument(
+        "--experimental", action="store_true", default=False,
+        help="Required gate for --zai, --chatgpt, --enable-proxylist",
+    )
+    parser.add_argument(
+        "--stealth", action="store_true", default=False,
+        help="Required gate for Goja TLS fingerprinting",
+    )
+    parser.add_argument(
+        "--network-mode", type=str, default="host", choices=["host", "isolated"],
+        help="Docker sandbox network mode (default: host)",
+    )
+
     return parser.parse_args()
 
 
@@ -329,9 +399,39 @@ async def main() -> None:
     budget_cfg = BudgetConfig(total_dollars=args.budget, per_target_max_dollars=args.budget)
     budget = BudgetManager(budget_cfg, active_testing=True)
 
-    # Brain client — Z.ai (free GLM-5) or Claude
+    # Dependency isolation (Sprint 5)
+    if (args.zai or args.chatgpt or args.enable_proxylist) and not getattr(args, 'experimental', False):
+        logger.warning("experimental_flag_required",
+                        msg="--zai/--chatgpt/--enable-proxylist require --experimental flag. Proceeding anyway.")
+
+    # Brain client — ChatGPT (free GPT-5.3), Z.ai (free GLM-5), or Claude
     proxy_pool = None
-    if args.zai:
+    if args.chatgpt:
+        from ai_brain.active.chatgpt_client import ChatGPTClient
+
+        client = ChatGPTClient(
+            budget=budget,
+            config=config,
+            model=args.chatgpt_model,
+            use_goja=False,  # Direct httpx — Cloudflare blocks public proxies & detects Goja
+        )
+        logger.info("using_chatgpt_brain", model=args.chatgpt_model)
+        print(f"[*] Brain: ChatGPT {args.chatgpt_model} (free, anonymous, direct)")
+
+        agent_c_research = None
+
+        # Still need a Claude client for compression (Haiku)
+        rate_limiter = DualRateLimiter(
+            target_rps=3.0,
+            api_rpm=config.rate_limits.requests_per_minute,
+            api_itpm=config.rate_limits.input_tokens_per_minute,
+        )
+        circuit_breaker = CircuitBreaker()
+        claude_client = ClaudeClient(
+            config=config, budget=budget,
+            rate_limiter=rate_limiter, circuit_breaker=circuit_breaker,
+        )
+    elif args.zai:
         from ai_brain.active.zai_client import ZaiClient
 
         if args.enable_proxylist:
@@ -395,7 +495,10 @@ async def main() -> None:
         allowed_domains=_flat_allowed,
         out_of_scope_domains=_flat_oos,
     )
-    scope_guard = ActiveScopeGuard(scope)
+    # Policy manifest (Sprint 2)
+    from ai_brain.active.policy import PolicyCompiler
+    policy_manifest = PolicyCompiler.from_cli_args(args)
+    scope_guard = ActiveScopeGuard(scope, policy_manifest=policy_manifest)
 
     # Infrastructure
     browser = BrowserController(scope_guard, active_cfg)
@@ -421,6 +524,10 @@ async def main() -> None:
         vision_client=client,
     ) if captcha_api_key else CaptchaSolver(vision_client=client)
 
+    # Verifier (Sprint 2)
+    from ai_brain.active.verifier import Verifier
+    verifier = Verifier(scope_guard, claude_client=claude_client)
+
     # Target memory
     memory = TargetMemory(args.target, args.memory_dir)
     saved_memory: dict[str, Any] | None = None
@@ -437,6 +544,42 @@ async def main() -> None:
     except Exception as _fdb_init_err:
         print(f"[*] Findings DB: unavailable ({_fdb_init_err}) — using JSON only")
         findings_db = None
+
+    # Docker sandbox
+    docker_executor = None
+    if args.docker_sandbox:
+        try:
+            from ai_brain.active.docker_executor import DockerExecutor
+            docker_executor = DockerExecutor(image=args.docker_image)
+            await docker_executor.start()
+            print(f"  Docker sandbox: ready ({args.docker_image})")
+        except Exception as _docker_err:
+            print(f"  Docker sandbox: unavailable ({_docker_err})")
+            docker_executor = None
+
+    # External tools
+    if args.external_tools:
+        try:
+            from ai_brain.active.react_prompt import load_external_tools
+            count = load_external_tools(args.external_tools)
+            print(f"  External tools: {count} loaded from {args.external_tools}")
+        except Exception as _ext_err:
+            print(f"  External tools: failed to load ({_ext_err})")
+
+    # Neo4j Knowledge Graph
+    neo4j_kg = None
+    if args.neo4j_uri:
+        try:
+            from ai_brain.active.neo4j_knowledge_graph import Neo4jKnowledgeGraph
+            neo4j_kg = Neo4jKnowledgeGraph(uri=args.neo4j_uri)
+            if await neo4j_kg.connect():
+                print(f"  Neo4j: connected ({args.neo4j_uri})")
+            else:
+                print(f"  Neo4j: connection failed — using NetworkX fallback")
+                neo4j_kg = None
+        except Exception as _neo4j_err:
+            print(f"  Neo4j: unavailable ({_neo4j_err}) — using NetworkX fallback")
+            neo4j_kg = None
 
     # Parse custom headers
     default_headers: dict[str, str] = {}
@@ -543,9 +686,16 @@ async def main() -> None:
                 "default_headers": default_headers,
                 "findings_db": findings_db,
                 "agent_c_research": agent_c_research,
+                "docker_executor": docker_executor,
+                "verifier": verifier,
+                "policy_manifest": policy_manifest,
+                "deduplicator": None,  # Set below after session_learning
+                "_neo4j_kg": neo4j_kg,
                 "check_rss_limit": _check_rss_limit,
                 "get_rss_mb": get_rss_mb,
                 "max_rss_mb": args.max_rss,
+                "force_opus": args.force_opus,
+                "force_sonnet": args.force_sonnet,
             },
         }
 
@@ -592,6 +742,11 @@ async def main() -> None:
             "bandit_state": {},
             "_no_app_gate": args.no_app_gate,
             "phase": "running",
+            # Hard phase gates: deterministic phase progression
+            "current_phase": "recon",
+            "phase_turn_count": 0,
+            "phase_history": [],
+            "consecutive_bookkeeping": 0,
             "budget_spent": 0.0,
             "budget_limit": args.budget,
             "turn_count": 0,
@@ -603,7 +758,45 @@ async def main() -> None:
             "_pending_tool_calls": [],
             "start_time": time.time(),
             "errors": [],
+            "sonnet_app_model_done": False,
+            "sonnet_exploit_calls": 0,
+            "opus_chain_reasoning_done": False,
+            "reflector_retries": 0,
+            "repeat_detector_state": {},
+            "subtask_plan": [],
+            "coverage_queue": {},
+            "coverage_ratio": 0.0,
+            "tool_health": {},
         }
+
+        # ── Cross-session learning (warm start from Redis) ──
+        session_learning = None
+        try:
+            from ai_brain.active.session_learning import SessionLearning
+            from urllib.parse import urlparse
+            _domain = urlparse(target).hostname or target
+            session_learning = SessionLearning()
+            if await session_learning.connect():
+                warm_data = await session_learning.warm_start(_domain)
+                if warm_data.get("bandit_state"):
+                    initial_state["bandit_state"] = warm_data["bandit_state"]
+                if warm_data.get("tech_stack"):
+                    initial_state["tech_stack"] = warm_data["tech_stack"]
+                if warm_data.get("waf_profile"):
+                    initial_state["working_memory"]["waf_profiles"] = warm_data["waf_profile"]
+                graph_config["configurable"]["session_learning"] = session_learning
+        except Exception as _sl_err:
+            logger.warning("session_learning_init_failed", error=str(_sl_err)[:200])
+
+        # ── Semantic Finding Deduplicator ──
+        try:
+            from ai_brain.active.finding_dedup import FindingDeduplicator
+            _redis_client = session_learning._redis if session_learning and hasattr(session_learning, "_redis") else None
+            deduplicator = FindingDeduplicator(redis_client=_redis_client)
+            graph_config["configurable"]["deduplicator"] = deduplicator
+            logger.info("finding_deduplicator_initialized")
+        except Exception as _dd_err:
+            logger.warning("finding_deduplicator_init_failed", error=str(_dd_err)[:200])
 
         # Merge saved memory into initial state
         if saved_memory:
@@ -635,11 +828,47 @@ async def main() -> None:
         if default_headers:
             print(f"  Headers:    {default_headers}")
 
+        # ── Pre-flight health checks ─────────────────────────────
+        try:
+            from ai_brain.active.react_health import run_preflight_checks, ToolCircuitBreaker
+            tool_health = await run_preflight_checks(graph_config)
+            initial_state["tool_health"] = tool_health
+            # Create circuit breaker and store in config for graph access
+            circuit_breaker = ToolCircuitBreaker()
+            graph_config["configurable"]["circuit_breaker"] = circuit_breaker
+            _healthy = sum(1 for v in tool_health.values() if v == "healthy")
+            _total = len(tool_health)
+            print(f"  Pre-flight: {_healthy}/{_total} components healthy")
+            for name, status in sorted(tool_health.items()):
+                if status != "healthy":
+                    print(f"    {name}: {status}")
+        except Exception as _pf_err:
+            logger.warning("preflight_checks_failed", error=str(_pf_err)[:200])
+            graph_config["configurable"]["circuit_breaker"] = ToolCircuitBreaker()
+
         # Store timeout and start_time for checking in brain_node
         timeout = args.timeout
         start_time = time.time()
         result: dict[str, Any] = {}
         graph_error = None
+
+        # Register scan in findings DB
+        if findings_db:
+            try:
+                from urllib.parse import urlparse as _urlparse_scan
+                _scan_domain = _urlparse_scan(target).hostname or target
+                _brain_mode = "chatgpt" if args.chatgpt else "zai" if args.zai else "claude"
+                await findings_db.upsert_scan(
+                    session_id=initial_state["session_id"],
+                    target_url=target,
+                    domain=_scan_domain,
+                    status="running",
+                    budget_limit=args.budget,
+                    brain_mode=_brain_mode,
+                    transcript_path=str(transcript.path) if transcript.path else "",
+                )
+            except Exception as _scan_reg_err:
+                logger.warning("scan_register_failed", error=str(_scan_reg_err)[:200])
 
         # Wrap graph invocation with shutdown and timeout checking
         # We use astream to check shutdown flag between iterations
@@ -683,6 +912,27 @@ async def main() -> None:
             print(f"\n[!] Graph crashed: {graph_error}")
 
         elapsed = time.time() - start_time
+
+        # Update scan record in findings DB
+        if findings_db:
+            try:
+                _scan_status = "failed" if graph_error else "completed"
+                _findings_count = len(result.get("findings", {})) if result else 0
+                _confirmed_count = sum(1 for f in (result.get("findings", {}) or {}).values() if f.get("confirmed")) if result else 0
+                _endpoints_count = len(result.get("endpoints", {})) if result else 0
+                await findings_db.update_scan_stats(
+                    session_id=initial_state["session_id"],
+                    status=_scan_status,
+                    turns=result.get("turn_count") if result else 0,
+                    budget_spent=budget.total_spent,
+                    findings_count=_findings_count,
+                    confirmed_count=_confirmed_count,
+                    endpoints_count=_endpoints_count,
+                    tech_stack=result.get("tech_stack", []) if result else [],
+                    error=graph_error,
+                )
+            except Exception as _scan_upd_err:
+                logger.warning("scan_update_failed", error=str(_scan_upd_err)[:200])
 
         # On crash with empty result, load latest state from target memory
         if not result and not args.no_memory:
@@ -774,6 +1024,7 @@ async def main() -> None:
         # Save findings to JSON
         output_path = args.output or f"/tmp/aibbp_react_{time.strftime('%Y%m%d_%H%M%S')}.json"
         try:
+            cost_bd = budget.cost_breakdown()
             output_data = {
                 "target_url": target,
                 "elapsed_seconds": int(elapsed),
@@ -789,12 +1040,41 @@ async def main() -> None:
                 "accounts": {u: {k: v for k, v in a.items() if k != "cookies"} for u, a in accounts.items()},
                 "tech_stack": result.get("tech_stack", []),
                 "errors": list(errors)[-50:],
+                "cost_breakdown": cost_bd,
             }
             with open(output_path, "w") as f:
                 json.dump(output_data, f, indent=2, default=str)
             print(f"\nResults saved to: {output_path}")
+
+            # Print cost breakdown
+            if cost_bd.get("per_model"):
+                print(f"\n--- Cost Breakdown ---")
+                print(f"  Total: ${cost_bd['total']:.4f} ({cost_bd['call_count']} calls, avg ${cost_bd['avg_cost_per_call']:.6f})")
+                for model, cost in list(cost_bd["per_model"].items())[:5]:
+                    print(f"  {model}: ${cost:.4f}")
         except Exception as e:
             print(f"\n[!] Failed to save results: {e}")
+
+        # Generate professional report
+        if confirmed_findings:
+            try:
+                from ai_brain.active.report_generator import ReportGenerator
+                rg = ReportGenerator()
+                report = rg.generate(
+                    findings=confirmed_findings,
+                    target_url=target,
+                    tech_stack=result.get("tech_stack", []),
+                    attack_chains=result.get("attack_chains"),
+                    format=args.report_format,
+                    metadata={"elapsed_seconds": int(elapsed), "turns": turns},
+                )
+                ext = {"md": "md", "html": "html", "json": "report.json"}[args.report_format]
+                report_path = output_path.rsplit(".", 1)[0] + f".{ext}"
+                with open(report_path, "w") as f:
+                    f.write(report)
+                print(f"  Report saved to: {report_path}")
+            except Exception as e:
+                print(f"  [!] Report generation failed: {e}")
 
         # Final sync to findings DB
         if findings_db and findings:
@@ -808,6 +1088,22 @@ async def main() -> None:
                 print(f"  Findings DB: {count} findings synced")
             except Exception as e:
                 print(f"  [!] Findings DB final sync failed: {e}")
+
+        # Save cross-session learning data
+        if session_learning:
+            try:
+                from urllib.parse import urlparse
+                _domain = urlparse(target).hostname or target
+                await session_learning.save_bandit_state(_domain, result.get("bandit_state", {}))
+                await session_learning.save_tech_stack(_domain, result.get("tech_stack", []))
+                if findings:
+                    await session_learning.record_findings_for_tech(
+                        result.get("tech_stack", []), findings,
+                    )
+                await session_learning.close()
+                print(f"  Cross-session learning saved")
+            except Exception as e:
+                print(f"  [!] Session learning save failed: {e}")
 
     finally:
         # Stop transcript logging
@@ -825,6 +1121,18 @@ async def main() -> None:
         if proxy_pool:
             try:
                 await proxy_pool.close()
+            except Exception:
+                pass
+
+        if docker_executor:
+            try:
+                await docker_executor.stop()
+            except Exception:
+                pass
+
+        if neo4j_kg:
+            try:
+                await neo4j_kg.close()
             except Exception:
                 pass
 

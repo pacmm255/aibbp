@@ -218,7 +218,7 @@ class ProxyPool:
     """
 
     ZAI_BASE_URL = "https://chat.z.ai"
-    _MAX_CONSECUTIVE_FAILURES = 3
+    _MAX_CONSECUTIVE_FAILURES = 2
 
     # Phase 1: raw CONNECT check (extremely fast)
     _P1_TIMEOUT = 1.5
@@ -233,10 +233,13 @@ class ProxyPool:
         rate_limit_seconds: float = 3.0,
         min_proxies: int = 10,
         max_proxies: int = 2000,
+        validation_target: str = "zai",
     ):
         self.rate_limit_seconds = rate_limit_seconds
         self.min_proxies = min_proxies
         self.max_proxies = max_proxies
+        # "zai" validates against chat.z.ai, "chatgpt" validates against chatgpt.com
+        self._validation_target = validation_target
 
         self._proxies: list[ProxyEntry] = []
         self._lock = asyncio.Lock()
@@ -408,6 +411,10 @@ class ProxyPool:
         NOT port scanning — sends a standard HTTP CONNECT to a publicly
         advertised proxy server.
         """
+        connect_target = (
+            "chatgpt.com:443" if self._validation_target == "chatgpt"
+            else _CONNECT_TARGET
+        )
         try:
             # Parse proxy host:port
             addr = proxy.url.split("://", 1)[1]
@@ -421,8 +428,8 @@ class ProxyPool:
             try:
                 # Send CONNECT request
                 connect_req = (
-                    f"CONNECT {_CONNECT_TARGET} HTTP/1.1\r\n"
-                    f"Host: {_CONNECT_TARGET}\r\n"
+                    f"CONNECT {connect_target} HTTP/1.1\r\n"
+                    f"Host: {connect_target}\r\n"
                     f"\r\n"
                 ).encode()
                 writer.write(connect_req)
@@ -447,28 +454,36 @@ class ProxyPool:
         """Phase 2: Full HTTPS request through proxy to verify working HTTPS tunnel.
 
         Validates the proxy can actually complete a TLS handshake and transfer data.
-        Uses Z.ai auth endpoint directly so a successful check also pre-populates
-        the Z.ai session.
+        For Z.ai: uses auth endpoint to pre-populate session.
+        For ChatGPT: just checks that chatgpt.com responds (no session needed).
         """
         try:
             async with httpx.AsyncClient(
                 proxy=proxy.url,
                 timeout=httpx.Timeout(self._P2_TIMEOUT, connect=3.0),
             ) as client:
-                resp = await client.get(
-                    f"{self.ZAI_BASE_URL}/api/v1/auths/",
-                    headers={"Accept": "application/json"},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    token = data.get("token", "")
-                    if token:
-                        proxy.zai_token = token
-                        proxy.zai_user_id = data.get("id", "")
-                        for name, value in resp.cookies.items():
-                            proxy.zai_cookies[name] = value
-                        return True
-                return False
+                if self._validation_target == "chatgpt":
+                    # Just check that chatgpt.com is reachable through this proxy
+                    resp = await client.get(
+                        "https://chatgpt.com/backend-anon/models",
+                        headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+                    )
+                    return resp.status_code == 200
+                else:
+                    resp = await client.get(
+                        f"{self.ZAI_BASE_URL}/api/v1/auths/",
+                        headers={"Accept": "application/json"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        token = data.get("token", "")
+                        if token:
+                            proxy.zai_token = token
+                            proxy.zai_user_id = data.get("id", "")
+                            for name, value in resp.cookies.items():
+                                proxy.zai_cookies[name] = value
+                            return True
+                    return False
         except Exception:
             return False
 
@@ -646,9 +661,9 @@ class ProxyPool:
             self._growth_task = asyncio.create_task(self._background_growth())
 
     async def _background_refresh(self) -> None:
-        """Re-fetch proxy lists every 10 minutes and update shared cache."""
+        """Re-fetch proxy lists every 5 minutes and update shared cache."""
         while not self._closed:
-            await asyncio.sleep(10 * 60)
+            await asyncio.sleep(5 * 60)
             try:
                 logger.info("proxy_pool_refreshing")
                 raw = await self._fetch_all()
