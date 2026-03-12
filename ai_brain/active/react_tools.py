@@ -128,6 +128,35 @@ def _get_cf_cookies(deps: ToolDeps, domain: str) -> dict[str, str]:
     return cookies
 
 
+def _is_goja_502(resp: httpx.Response) -> bool:
+    """Detect Goja proxy error responses (502 with timeout/connection errors).
+
+    When Goja's internal Go HTTP client fails (timeout, DNS, connection refused),
+    it returns a 502 with a plain text body containing the Go error message.
+    These must not be passed to the brain as real target responses.
+    """
+    if resp.status_code != 502:
+        return False
+    # Goja 502s have connection: close and text/plain content type
+    ct = resp.headers.get("content-type", "")
+    if "text/plain" not in ct:
+        return False
+    body = resp.text[:500] if resp.text else ""
+    _GOJA_ERROR_PATTERNS = (
+        "Client.Timeout exceeded",
+        "net/http: request canceled",
+        "dial tcp",
+        "connection refused",
+        "no such host",
+        "TLS handshake timeout",
+        "context deadline exceeded",
+        "EOF",
+        "connection reset by peer",
+        "i/o timeout",
+    )
+    return any(p in body for p in _GOJA_ERROR_PATTERNS)
+
+
 def _httpx_kwargs(deps: ToolDeps, **extra: Any) -> dict[str, Any]:
     """Build httpx.AsyncClient kwargs with Goja SOCKS5 proxy if available."""
     kwargs: dict[str, Any] = {"verify": False, "timeout": extra.pop("timeout", 15)}
@@ -152,6 +181,20 @@ def _httpx_kwargs(deps: ToolDeps, **extra: Any) -> dict[str, Any]:
             extra["cookies"] = {**cf_cookies, **existing}  # explicit cookies win
     kwargs.update(extra)
     return kwargs
+
+
+def _make_httpx_client(deps: ToolDeps, **extra: Any) -> httpx.AsyncClient:
+    """Create an httpx client from deps with automatic Goja 502 fallback.
+
+    Same as _httpx_kwargs() but returns a client directly. When Goja proxy
+    is active, returns a client that auto-retries on Goja 502 errors.
+    """
+    kwargs = _httpx_kwargs(deps, **extra)
+    proxy = kwargs.get("proxy")
+    if proxy and deps.goja_socks5_url:
+        from ai_brain.active.deterministic_tools import _GojaFallbackClient
+        return _GojaFallbackClient(socks_proxy=deps.goja_socks5_url, **kwargs)
+    return httpx.AsyncClient(**kwargs)
 
 
 def _safe_json(obj: Any) -> str:
@@ -419,10 +462,7 @@ async def _dispatch(
 
         # Auto-auth-check: fire one unauthenticated request to tag auth requirement
         try:
-            async with httpx.AsyncClient(
-                verify=False, timeout=5,
-                **({"proxy": deps.goja_socks5_url} if deps.goja_socks5_url else {}),
-            ) as _auth_check_client:
+            async with _make_httpx_client(deps, timeout=5) as _auth_check_client:
                 anon_resp = await _auth_check_client.get(url)
                 if anon_resp.status_code in (401, 403):
                     result_data["auth_required"] = True
@@ -1082,7 +1122,7 @@ async def _dispatch(
         for method in methods:
             try:
                 await _http_rate_limit()  # Global rate limit
-                async with httpx.AsyncClient(**_httpx_kwargs(deps, no_auth=True, cf_inject_url=url)) as client:
+                async with _make_httpx_client(deps, no_auth=True, cf_inject_url=url) as client:
                     resp = await client.request(method, url, headers=headers_extra)
                     results.append({
                         "method": method,
@@ -1121,7 +1161,7 @@ async def _dispatch(
         if body or inp.get("method", "").upper() == "POST":
             test_methods.append("POST")
 
-        async with httpx.AsyncClient(**_httpx_kwargs(deps, no_auth=True, cf_inject_url=url)) as client:
+        async with _make_httpx_client(deps, no_auth=True, cf_inject_url=url) as client:
             for bh in bypass_headers:
                 for test_method in test_methods:
                     try:
@@ -1190,7 +1230,7 @@ async def _dispatch(
                 test_url = urlunparse(parsed._replace(query=new_query))
             try:
                 await _http_rate_limit()  # Global rate limit
-                async with httpx.AsyncClient(**_httpx_kwargs(deps, cf_inject_url=test_url)) as client:
+                async with _make_httpx_client(deps, cf_inject_url=test_url) as client:
                     resp = await client.request(method, test_url)
                     results.append({
                         "value": val,
@@ -1311,6 +1351,20 @@ async def _dispatch(
                 result = await _do_request(headers)
             else:
                 raise
+
+        # Detect Goja proxy 502 errors and retry without proxy
+        if proxy_url and result["status_code"] == 502 and "proxy" in client_kwargs:
+            body_snippet = result.get("body", "")[:500]
+            _goja_markers = ("Client.Timeout exceeded", "net/http: request canceled",
+                             "dial tcp", "connection refused", "no such host",
+                             "TLS handshake timeout", "context deadline exceeded",
+                             "i/o timeout", "connection reset by peer")
+            ct = result.get("headers", {}).get("content-type", "")
+            if "text/plain" in ct and any(m in body_snippet for m in _goja_markers):
+                logger.warning("goja_502_retrying_direct", url=url, error=body_snippet[:120])
+                client_kwargs.pop("proxy", None)
+                result = await _do_request(headers)
+                result["_goja_fallback"] = True
 
         # Auto-detect Cloudflare challenge and solve via browser
         if _is_cloudflare_challenge(
@@ -1959,10 +2013,7 @@ async def _dispatch(
         urls = inp.get("urls") or ([inp["url"]] if inp.get("url") else [])
         urls = urls[:15]  # Cap at 15
 
-        proxy_kwargs = {}
-        if deps.goja_socks5_url:
-            proxy_kwargs["proxy"] = deps.goja_socks5_url
-        async with httpx.AsyncClient(verify=False, timeout=15, **proxy_kwargs) as client:
+        async with _make_httpx_client(deps, timeout=15) as client:
             all_results = {"bundles_analyzed": 0, "secrets": [], "api_endpoints": [],
                           "internal_urls": [], "graphql_ops": [], "source_maps": [],
                           "debug_routes": [], "admin_paths": []}
@@ -2222,10 +2273,7 @@ async def _crawl_bfs(
                 )
             ][:10]
             if js_bundle_urls:
-                proxy_kwargs: dict[str, Any] = {}
-                if deps.goja_socks5_url:
-                    proxy_kwargs["proxy"] = deps.goja_socks5_url
-                async with httpx.AsyncClient(verify=False, timeout=10, **proxy_kwargs) as js_client:
+                async with _make_httpx_client(deps, timeout=10) as js_client:
                     for js_url in js_bundle_urls:
                         try:
                             resp = await js_client.get(js_url)

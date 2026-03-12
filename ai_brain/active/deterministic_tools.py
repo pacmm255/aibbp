@@ -22,6 +22,107 @@ from ai_brain.active.scope_guard import ActiveScopeGuard
 logger = structlog.get_logger()
 
 
+# ── Goja 502 Detection & Auto-Fallback ──────────────────────────────
+
+_GOJA_ERROR_MARKERS = (
+    "Client.Timeout exceeded",
+    "net/http: request canceled",
+    "dial tcp",
+    "connection refused",
+    "no such host",
+    "TLS handshake timeout",
+    "context deadline exceeded",
+    "i/o timeout",
+    "connection reset by peer",
+    "EOF",
+)
+
+
+def _is_goja_502(resp: httpx.Response) -> bool:
+    """Detect Goja proxy error responses (502 with Go net/http errors).
+
+    When Goja's internal Go HTTP client fails (timeout, DNS, conn refused),
+    it returns a 502 with text/plain body containing the Go error string.
+    These must NOT be treated as real target responses.
+    """
+    if resp.status_code != 502:
+        return False
+    ct = resp.headers.get("content-type", "")
+    if "text/plain" not in ct:
+        return False
+    body = resp.text[:500] if resp.text else ""
+    return any(m in body for m in _GOJA_ERROR_MARKERS)
+
+
+class _GojaFallbackClient(httpx.AsyncClient):
+    """httpx.AsyncClient wrapper that auto-retries on Goja 502 errors.
+
+    When Goja proxy returns a 502 with a Go net/http error in the body
+    (timeout, DNS failure, connection reset, etc.), this transparently
+    retries the same request WITHOUT the proxy so the real target response
+    is returned instead of the Goja error page.
+    """
+
+    def __init__(self, socks_proxy: str | None = None, **kwargs: Any):
+        self._socks_proxy = socks_proxy
+        self._base_kwargs = {k: v for k, v in kwargs.items() if k != "proxy"}
+        super().__init__(**kwargs)
+
+    async def request(self, method: str, url: Any, **kwargs: Any) -> httpx.Response:
+        resp = await super().request(method, url, **kwargs)
+        if self._socks_proxy and _is_goja_502(resp):
+            logger.warning("goja_502_fallback", url=str(url)[:120], error=resp.text[:120])
+            async with httpx.AsyncClient(**self._base_kwargs) as direct:
+                resp = await direct.request(method, url, **kwargs)
+        return resp
+
+    # Override convenience methods so they route through our request()
+    async def get(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("POST", url, **kwargs)
+
+    async def put(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("PUT", url, **kwargs)
+
+    async def patch(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("PATCH", url, **kwargs)
+
+    async def delete(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("DELETE", url, **kwargs)
+
+    async def head(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("HEAD", url, **kwargs)
+
+    async def options(self, url: Any, **kwargs: Any) -> httpx.Response:
+        return await self.request("OPTIONS", url, **kwargs)
+
+
+def _make_client(
+    socks_proxy: str | None = None,
+    timeout: int | float = 15,
+    follow_redirects: bool = True,
+    **kwargs: Any,
+) -> httpx.AsyncClient:
+    """Create an httpx.AsyncClient with automatic Goja 502 fallback.
+
+    Use this everywhere instead of httpx.AsyncClient(...) directly.
+    When socks_proxy is set, returns a _GojaFallbackClient that transparently
+    retries failed requests without the proxy.
+    """
+    client_kwargs: dict[str, Any] = {
+        "verify": False,
+        "timeout": timeout,
+        "follow_redirects": follow_redirects,
+        **kwargs,
+    }
+    if socks_proxy:
+        client_kwargs["proxy"] = socks_proxy
+        return _GojaFallbackClient(socks_proxy=socks_proxy, **client_kwargs)
+    return httpx.AsyncClient(**client_kwargs)
+
+
 # ── Blind SQL Injection Extractor ─────────────────────────────────────
 
 
@@ -44,11 +145,8 @@ class BlindSQLiExtractor:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=10, verify=False, follow_redirects=True, **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=10, follow_redirects=True,
         )
         self._request_count = 0
 
@@ -305,11 +403,8 @@ class ResponseDiffAnalyzer:
         body = base_request.get("body")
         params = base_request.get("params", {})
 
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
-        async with httpx.AsyncClient(
-            verify=False, timeout=self._timeout, follow_redirects=True, **proxy_kwargs,
+        async with _make_client(
+            socks_proxy=self._socks_proxy, timeout=self._timeout, follow_redirects=True,
         ) as client:
             # Helper: send request with proper body handling (dict=form, str=raw/JSON)
             async def _send(m: str, u: str, h: dict, b: Any, p: dict) -> httpx.Response:
@@ -969,11 +1064,8 @@ class SystematicFuzzer:
         errors = 0
         start_time = time.monotonic()
 
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
-        async with httpx.AsyncClient(
-            verify=False, timeout=15, follow_redirects=True, **proxy_kwargs,
+        async with _make_client(
+            socks_proxy=self._socks_proxy, timeout=15, follow_redirects=True,
         ) as client:
             for i, word in enumerate(words):
                 if time.monotonic() - start_time > self._timeout:
@@ -1162,12 +1254,8 @@ class SSRFTester:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            verify=False, timeout=timeout, follow_redirects=True,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
 
     async def test(
@@ -1326,12 +1414,8 @@ class SSTITester:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            verify=False, timeout=timeout, follow_redirects=True,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
 
     async def test(
@@ -1478,13 +1562,11 @@ class RaceConditionTester:
         concurrent_requests: int = 20,
     ) -> dict[str, Any]:
         """Fire N identical requests simultaneously and analyze results."""
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
+        _race_socks = self._socks_proxy
 
         async def _send_one(idx: int) -> dict[str, Any]:
-            async with httpx.AsyncClient(
-                verify=False, timeout=self._timeout, **proxy_kwargs
+            async with _make_client(
+                socks_proxy=_race_socks, timeout=self._timeout,
             ) as client:
                 start = time.time()
                 try:
@@ -1646,11 +1728,8 @@ class GraphQLAnalyzer:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            verify=False, timeout=timeout, **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout,
         )
 
     async def analyze(
@@ -1840,12 +1919,8 @@ class AuthorizationMatrixTester:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            verify=False, timeout=timeout, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
 
     async def test(
@@ -2106,12 +2181,8 @@ class InfoDisclosureScanner:
         verified: list[dict[str, Any]] = []
         scanned = 0
 
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
-
-        async with httpx.AsyncClient(
-            timeout=self._timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        async with _make_client(
+            socks_proxy=self._socks_proxy, timeout=self._timeout, follow_redirects=True,
         ) as client:
             for path, category, regex in paths_to_test:
                 scanned += 1
@@ -2290,12 +2361,8 @@ class AuthEndpointDiscovery:
             + [(p, "oauth") for p in self._OAUTH_PATHS]
         )
 
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
-
-        async with httpx.AsyncClient(
-            timeout=self._timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        async with _make_client(
+            socks_proxy=self._socks_proxy, timeout=self._timeout, follow_redirects=True,
         ) as client:
             for path, _hint in all_paths:
                 url = f"{base_url}{path}"
@@ -2561,12 +2628,8 @@ class AuthBypassScanner:
         endpoint_paths = endpoint_paths[:self._MAX_ENDPOINTS]
         endpoints_tested = len(endpoint_paths)
 
-        proxy_kwargs: dict[str, Any] = {}
-        if self._socks_proxy:
-            proxy_kwargs["proxy"] = self._socks_proxy
-
-        async with httpx.AsyncClient(
-            timeout=self._timeout, verify=False, follow_redirects=False, **proxy_kwargs,
+        async with _make_client(
+            socks_proxy=self._socks_proxy, timeout=self._timeout, follow_redirects=False,
         ) as client:
             # Step 1: Soft-404 baseline
             soft404_hash = ""
@@ -2819,11 +2882,8 @@ class CSRFScanner:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
 
     async def scan(
@@ -3187,11 +3247,8 @@ class ErrorResponseMiner:
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=True, **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
 
     async def scan(
@@ -3360,12 +3417,8 @@ class CRLFScanner:
         socks_proxy: str | None = None,
     ):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
 
     async def scan(
@@ -3511,12 +3564,8 @@ class HostHeaderScanner:
         socks_proxy: str | None = None,
     ):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
 
     async def scan(
@@ -3685,12 +3734,8 @@ class NoSQLInjectionScanner:
     def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
         self._requests_sent = 0
 
@@ -3929,12 +3974,8 @@ class XXEScanner:
     def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
         self._requests_sent = 0
 
@@ -4105,12 +4146,8 @@ class DeserializationScanner:
     def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=True,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
 
     async def scan(
@@ -4317,12 +4354,8 @@ class AppLevelDoSScanner:
     def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
         self._requests_sent = 0
 
@@ -4681,12 +4714,8 @@ class JWTDeepAnalyzer:
     def __init__(self, scope_guard: ActiveScopeGuard | None = None,
                  timeout: int = 10, socks_proxy: str | None = None):
         self._scope_guard = scope_guard
-        proxy_kwargs: dict[str, Any] = {}
-        if socks_proxy:
-            proxy_kwargs["proxy"] = socks_proxy
-        self._client = httpx.AsyncClient(
-            timeout=timeout, verify=False, follow_redirects=False,
-            **proxy_kwargs,
+        self._client = _make_client(
+            socks_proxy=socks_proxy, timeout=timeout, follow_redirects=False,
         )
 
     async def analyze(

@@ -83,13 +83,31 @@ _CHROME_FINGERPRINT = {
 
 
 class GojaManager:
-    """Manages the Goja SOCKS5 TLS fingerprint proxy lifecycle."""
+    """Manages the Goja SOCKS5 TLS fingerprint proxy lifecycle.
+
+    Includes health monitoring with automatic restart on failure:
+    - Periodic SOCKS5 connectivity checks (every 15s)
+    - Consecutive failure tracking (3 failures → auto-restart)
+    - Process crash detection via poll()
+    - Graceful restart with connection draining
+    """
+
+    _HEALTH_CHECK_INTERVAL = 15  # seconds between health checks
+    _MAX_CONSECUTIVE_FAILURES = 3  # failures before auto-restart
+    _MAX_RESTARTS = 10  # max restarts before giving up
+    _RESTART_BACKOFF_BASE = 2  # exponential backoff base (seconds)
 
     def __init__(self, port: int = _GOJA_DEFAULT_PORT) -> None:
         self._port = port
         self._process: subprocess.Popen[bytes] | None = None
         self._config_path: str | None = None
         self._running = False
+        self._upstream_proxy: str = ""
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._consecutive_failures = 0
+        self._restart_count = 0
+        self._total_health_checks = 0
+        self._total_health_failures = 0
 
     @property
     def port(self) -> int:
@@ -105,7 +123,7 @@ class GojaManager:
         return self._running and self._process is not None and self._process.poll() is None
 
     async def start(self, timeout: int = 10, upstream_proxy: str = "") -> None:
-        """Start Goja proxy process.
+        """Start Goja proxy process with health monitoring.
 
         Args:
             timeout: Seconds to wait for proxy to be ready.
@@ -114,6 +132,7 @@ class GojaManager:
         """
         if self._running:
             return
+        self._upstream_proxy = upstream_proxy
 
         binary = _GOJA_BINARY
         if not os.path.isfile(binary):
@@ -161,6 +180,7 @@ class GojaManager:
                 sock.close()
                 self._running = True
                 logger.info("goja_started", port=self._port, pid=self._process.pid)
+                self._start_health_monitor()
                 return
             except (ConnectionRefusedError, OSError):
                 continue
@@ -169,8 +189,136 @@ class GojaManager:
         self.stop_sync()
         raise TimeoutError(f"Goja failed to start on port {self._port} within {timeout}s")
 
+    def _start_health_monitor(self) -> None:
+        """Start the background health monitoring task."""
+        if self._monitor_task and not self._monitor_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._monitor_task = loop.create_task(self._health_monitor_loop())
+        except RuntimeError:
+            logger.warning("goja_no_event_loop_for_monitor")
+
+    async def _health_monitor_loop(self) -> None:
+        """Background loop that checks Goja health and auto-restarts on failure."""
+        while self._running:
+            await asyncio.sleep(self._HEALTH_CHECK_INTERVAL)
+            if not self._running:
+                break
+            try:
+                healthy = await self._health_check()
+                self._total_health_checks += 1
+                if healthy:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    self._total_health_failures += 1
+                    logger.warning(
+                        "goja_health_check_failed",
+                        consecutive=self._consecutive_failures,
+                        total_failures=self._total_health_failures,
+                    )
+                    if self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
+                        await self._auto_restart()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("goja_health_monitor_error", error=str(exc))
+
+    async def _health_check(self) -> bool:
+        """Test SOCKS5 connectivity by performing a TCP connect to the proxy port.
+
+        Also checks if the process has crashed via poll().
+        """
+        # Check process is alive
+        if self._process is None or self._process.poll() is not None:
+            logger.warning("goja_process_dead", poll=self._process.poll() if self._process else None)
+            return False
+
+        # TCP connect to SOCKS5 port
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", self._port),
+                timeout=3.0,
+            )
+            # Send SOCKS5 greeting: version=5, 1 auth method, no-auth
+            writer.write(b"\x05\x01\x00")
+            await writer.drain()
+            # Expect SOCKS5 response: version=5, method chosen
+            data = await asyncio.wait_for(reader.read(2), timeout=3.0)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if len(data) >= 2 and data[0] == 0x05:
+                return True
+            logger.warning("goja_socks5_bad_response", data=data.hex())
+            return False
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as exc:
+            logger.warning("goja_socks5_unreachable", error=str(exc))
+            return False
+
+    async def _auto_restart(self) -> None:
+        """Kill the stale Goja process and restart it."""
+        if self._restart_count >= self._MAX_RESTARTS:
+            logger.error(
+                "goja_max_restarts_reached",
+                restarts=self._restart_count,
+                msg="Goja has crashed too many times, giving up",
+            )
+            self._running = False
+            return
+
+        self._restart_count += 1
+        backoff = min(self._RESTART_BACKOFF_BASE ** self._restart_count, 30)
+        logger.warning(
+            "goja_auto_restarting",
+            restart_count=self._restart_count,
+            backoff=backoff,
+        )
+
+        # Kill the old process
+        self._kill_process()
+
+        # Backoff before restart
+        await asyncio.sleep(backoff)
+
+        # Restart
+        try:
+            self._running = False  # Allow start() to proceed
+            await self.start(timeout=10, upstream_proxy=self._upstream_proxy)
+            self._consecutive_failures = 0
+            logger.info(
+                "goja_restarted_successfully",
+                restart_count=self._restart_count,
+                pid=self._process.pid if self._process else None,
+            )
+        except Exception as exc:
+            logger.error("goja_restart_failed", error=str(exc), restart_count=self._restart_count)
+            self._running = False
+
+    def _kill_process(self) -> None:
+        """Force-kill the Goja process without cleaning up config."""
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.kill()
+                self._process.wait(timeout=5)
+            except Exception:
+                pass
+            logger.info("goja_process_killed", pid=self._process.pid)
+        self._process = None
+
     async def stop(self) -> None:
-        """Stop Goja proxy process."""
+        """Stop Goja proxy process and health monitor."""
+        # Cancel health monitor first
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
         self.stop_sync()
 
     def stop_sync(self) -> None:
