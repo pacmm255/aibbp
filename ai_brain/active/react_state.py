@@ -176,6 +176,10 @@ class PentestState(TypedDict, total=False):
     # Parsed API schema data
     api_schema: dict[str, Any]
 
+    # ── Response Baselines (fingerprints of normal responses) ────────
+    # "METHOD url" → {status, content_type, body_hash, body_length, template_hash, key_headers}
+    baselines: dict[str, dict[str, Any]]
+
     # ── Tool Health & Circuit Breaker ────────────────────────────────
     # {tool_name: "healthy"|"degraded"|"unavailable"} — set by preflight checks
     tool_health: dict[str, str]
