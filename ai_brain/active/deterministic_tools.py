@@ -2489,14 +2489,39 @@ class AuthBypassScanner:
 
     _MAX_ENDPOINTS = 100
 
+    _ERROR_INDICATORS = (
+        "not found", "unauthorized", "forbidden", "error", "exception",
+        "stack trace", "traceback", "access denied", "page not found",
+        "404", "500 internal",
+    )
+
+    _PROTECTED_INDICATORS = (
+        "email", "password", "settings", "dashboard", "admin", "profile",
+        "account", "user", "role", "permission", "configuration", "manage",
+        "api_key", "secret", "billing", "invoice", "payment", "token",
+        "private", "internal", "upload", "database",
+    )
+
     def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
                  socks_proxy: str | None = None):
         self._scope_guard = scope_guard
         self._timeout = timeout
         self._socks_proxy = socks_proxy
 
+    def _bodies_similar(self, body_a: str, body_b: str) -> bool:
+        """Check if two response bodies are essentially the same page."""
+        max_len = max(len(body_a), len(body_b))
+        if max_len == 0:
+            return True
+        len_ratio = min(len(body_a), len(body_b)) / max_len
+        if len_ratio > 0.8:
+            # Similar length — check content prefix
+            return body_a[:500] == body_b[:500]
+        return False
+
     def _classify_response(
         self, status_code: int, body: str, headers: dict[str, str],
+        baseline_body: str = "",
     ) -> str:
         """Classify response as SECURE, VULNERABLE, or INCONCLUSIVE."""
         # Explicit auth errors
@@ -2518,19 +2543,32 @@ class AuthBypassScanner:
         if self._BUSINESS_ERROR_RE.search(body[:3000]):
             return "VULNERABLE"
 
-        # 200 with substantial content (not an error stub)
-        if status_code == 200 and len(body) >= 200:
-            return "VULNERABLE"
-
-        # 500 without business error pattern
-        if status_code >= 500:
+        # Must be 200 with substantial body to proceed
+        if status_code != 200 or len(body) < 200:
+            # 500 without business error pattern
+            if status_code >= 500:
+                return "INCONCLUSIVE"
+            # 404
+            if status_code == 404:
+                return "INCONCLUSIVE"
             return "INCONCLUSIVE"
 
-        # 404
-        if status_code == 404:
-            return "INCONCLUSIVE"
+        # --- Content verification for 200 responses with body >= 200 bytes ---
 
-        return "INCONCLUSIVE"
+        # Reject if response matches baseline (same page as root / public page)
+        if baseline_body and self._bodies_similar(body, baseline_body):
+            return "NOT_VULNERABLE"
+
+        # Reject generic error/default pages
+        body_lower = body.lower()
+        if any(ind in body_lower for ind in self._ERROR_INDICATORS) and len(body) < 2000:
+            return "NOT_VULNERABLE"
+
+        # Require protected content indicators to confirm actual sensitive data
+        if not any(ind in body_lower for ind in self._PROTECTED_INDICATORS):
+            return "NOT_VULNERABLE"
+
+        return "VULNERABLE"
 
     def _build_request_dump(self, method: str, url: str,
                             extra_headers: dict[str, str] | None = None) -> str:
@@ -2574,6 +2612,7 @@ class AuthBypassScanner:
         base_url: str,
         endpoints: dict[str, Any] | None = None,
         tech_stack: list[str] | None = None,
+        spa_fingerprint: Any | None = None,
     ) -> dict[str, Any]:
         """Run systematic auth bypass scan on all endpoints."""
         import hashlib
@@ -2582,6 +2621,19 @@ class AuthBypassScanner:
         start = time.monotonic()
         findings: list[dict[str, Any]] = []
         requests_sent = 0
+
+        # SPA early exit: SPAs route everything to index.html, making
+        # auth bypass detection via HTTP response meaningless.
+        if spa_fingerprint is not None and getattr(spa_fingerprint, "is_spa", False):
+            elapsed = round(time.monotonic() - start, 1)
+            logger.info("auth_bypass_scan_skipped_spa", base_url=base_url)
+            return {
+                "findings": [],
+                "endpoints_tested": 0,
+                "requests_sent": 0,
+                "skipped_reason": "SPA detected — all routes serve index.html",
+                "elapsed_seconds": elapsed,
+            }
 
         base_url = base_url.rstrip("/")
         if self._scope_guard:
@@ -2631,7 +2683,7 @@ class AuthBypassScanner:
         async with _make_client(
             socks_proxy=self._socks_proxy, timeout=self._timeout, follow_redirects=False,
         ) as client:
-            # Step 1: Soft-404 baseline
+            # Step 1a: Soft-404 baseline
             soft404_hash = ""
             soft404_len = 0
             try:
@@ -2639,6 +2691,16 @@ class AuthBypassScanner:
                 soft404_hash = hashlib.md5(r404.text.encode(errors="replace")).hexdigest()
                 soft404_len = len(r404.text)
                 requests_sent += 1
+            except Exception:
+                pass
+
+            # Step 1b: Root page baseline (for SPA / public page detection)
+            root_baseline_body = ""
+            try:
+                root_resp = await client.get(base_url + "/")
+                requests_sent += 1
+                if root_resp.status_code == 200:
+                    root_baseline_body = root_resp.text[:5000]
             except Exception:
                 pass
 
@@ -2662,6 +2724,7 @@ class AuthBypassScanner:
                     headers_dict = {k.lower(): v for k, v in resp.headers.items()}
                     classification = self._classify_response(
                         resp.status_code, body, headers_dict,
+                        baseline_body=root_baseline_body,
                     )
 
                     if classification == "VULNERABLE":
@@ -2703,6 +2766,7 @@ class AuthBypassScanner:
                         vheaders = {k.lower(): v for k, v in vresp.headers.items()}
                         vclass = self._classify_response(
                             vresp.status_code, vbody, vheaders,
+                            baseline_body=root_baseline_body,
                         )
 
                         # Verb tampering: baseline is SECURE but this verb is VULNERABLE
@@ -2757,6 +2821,7 @@ class AuthBypassScanner:
                         pheaders = {k.lower(): v for k, v in presp.headers.items()}
                         pclass = self._classify_response(
                             presp.status_code, pbody, pheaders,
+                            baseline_body=root_baseline_body,
                         )
 
                         if (pclass == "VULNERABLE" and
@@ -2801,6 +2866,7 @@ class AuthBypassScanner:
                         hheaders = {k.lower(): v for k, v in hresp.headers.items()}
                         hclass = self._classify_response(
                             hresp.status_code, hbody, hheaders,
+                            baseline_body=root_baseline_body,
                         )
 
                         if (hclass == "VULNERABLE" and
