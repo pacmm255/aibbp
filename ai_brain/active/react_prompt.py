@@ -683,6 +683,37 @@ scanner-level tasks. Spend your budget on DEEP testing of promising attack vecto
 - **ONE finding per vuln_type per endpoint** — duplicate findings for the same vulnerability on the same endpoint are auto-rejected. Do NOT submit open_redirect on /login 5 times with different parameter variants.
 - **These are NOT real vulnerabilities** (do not submit): login pages existing, password reset existing, public APIs returning public data, version numbers in headers, generic error pages, CAPTCHA not being rate-limited, standard OAuth redirects to the same domain, pre-auth session tokens
 
+## Evidence Scoring (findings with score < 3 are AUTO-REJECTED)
+
+Score 5 (DEFINITIVE — auto-confirmed):
+- OOB callback received (Interactsh/Burp Collaborator DNS/HTTP hit)
+- Extracted system files: root:x:0:0:root, /etc/shadow content
+- Time-based blind proof: 10s delay on SLEEP(10), 0s on SLEEP(0)
+- CTF flag extracted: FLAG{...} or flag{...}
+
+Score 4 (CONFIRMED — requires HTTP transcript):
+- Reflected XSS: <script> tag IN response body with full HTTP response
+- SQL UNION: actual table data in response (usernames, emails, hashes)
+- SSTI: {{7*7}} sent → "49" appears in response body (not just claimed)
+- SSRF: internal metadata (169.254.169.254, ec2, computeMetadata) in response
+
+Score 3 (STRONG — minimum for acceptance):
+- 2+ objective signals: status code change + body size change + error keyword
+- Must include raw HTTP request AND response
+
+ALWAYS include in evidence:
+- Full HTTP request (method, URL, headers, body)
+- Full HTTP response (status line, headers, body preview)
+- The specific payload sent and where it appears in the response
+
+Per-vuln-type requirements:
+- XSS: Show reflected payload in response body HTML
+- SQLi: Show extracted data or measurable time difference
+- SSRF: Show internal/metadata content in response
+- SSTI: Show evaluated expression result in response body
+- Auth bypass: Show protected content accessible without auth
+- IDOR: Show other user's data accessible with your session
+
 ### CRITICAL: No Repetition / Be Creative
 - **NEVER repeat a technique on the same endpoint.** Check "Testing Progress" above. If it's listed, \
 it's DONE. Move on.
