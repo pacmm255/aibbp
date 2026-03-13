@@ -2876,6 +2876,11 @@ class CSRFScanner:
     3. Origin header validation (cross-origin request)
     4. Referer header validation
     5. SameSite cookie attribute check
+
+    False-positive guards:
+    - Skips endpoints using Bearer/JWT auth (browsers don't auto-send Authorization)
+    - Skips JSON-only endpoints (browser forms can't submit application/json)
+    - Downgrades to informational when SameSite=Strict/Lax cookies are present
     """
 
     def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,
@@ -2885,6 +2890,52 @@ class CSRFScanner:
         self._client = _make_client(
             socks_proxy=socks_proxy, timeout=timeout, follow_redirects=True,
         )
+
+    @staticmethod
+    def _uses_bearer_auth(proxy_traffic: list[dict[str, Any]] | None) -> bool:
+        """Check if the target uses Bearer/JWT auth (CSRF not exploitable)."""
+        if not proxy_traffic:
+            return False
+        for entry in proxy_traffic:
+            headers = entry.get("headers") or {}
+            for k, v in headers.items():
+                if k.lower() == "authorization":
+                    v_lower = v.lower().strip()
+                    if v_lower.startswith("bearer ") or v_lower.startswith("jwt "):
+                        return True
+        return False
+
+    @staticmethod
+    def _has_samesite_protection(proxy_traffic: list[dict[str, Any]] | None) -> bool:
+        """Check if cookies have SameSite=Strict or SameSite=Lax."""
+        if not proxy_traffic:
+            return False
+        for entry in proxy_traffic:
+            # Check response set-cookie headers from proxy traffic
+            resp_headers = entry.get("response_headers") or {}
+            for k, v in resp_headers.items():
+                if k.lower() == "set-cookie":
+                    cookie_lower = v.lower()
+                    if "samesite=strict" in cookie_lower or "samesite=lax" in cookie_lower:
+                        return True
+            # Also check cookies dict for samesite attribute
+            cookies_raw = entry.get("cookies_raw") or entry.get("set_cookie") or ""
+            if isinstance(cookies_raw, str):
+                cl = cookies_raw.lower()
+                if "samesite=strict" in cl or "samesite=lax" in cl:
+                    return True
+        return False
+
+    @staticmethod
+    def _is_json_only_endpoint(entry: dict[str, Any]) -> bool:
+        """Check if endpoint only accepts JSON (CSRF via browser form not possible)."""
+        headers = entry.get("headers") or {}
+        for k, v in headers.items():
+            if k.lower() == "content-type":
+                v_lower = v.lower()
+                if "application/json" in v_lower:
+                    return True
+        return False
 
     async def scan(
         self,
@@ -2906,6 +2957,24 @@ class CSRFScanner:
         requests_sent = 0
         cookie_issues: list[dict[str, str]] = []
 
+        # Gate 1: If target uses Bearer/JWT auth, CSRF is not exploitable
+        # (browsers don't auto-send Authorization headers on cross-origin requests)
+        uses_bearer = self._uses_bearer_auth(proxy_traffic)
+        if uses_bearer:
+            elapsed = round(time.monotonic() - start, 1)
+            logger.info("csrf_scan_skipped_bearer_auth", elapsed=elapsed)
+            return {
+                "findings": [],
+                "cookie_issues": [],
+                "endpoints_tested": 0,
+                "requests_sent": 0,
+                "elapsed_seconds": elapsed,
+                "skipped_reason": "Target uses Bearer/JWT authentication — CSRF not exploitable via browser",
+            }
+
+        # Check SameSite cookie protection (downgrades severity if present)
+        has_samesite = self._has_samesite_protection(proxy_traffic)
+
         # Collect state-changing requests from proxy traffic
         state_changing: list[dict[str, Any]] = []
         if proxy_traffic:
@@ -2918,6 +2987,9 @@ class CSRFScanner:
                 # Skip public/auth endpoints (not CSRF targets)
                 url_lower = url.lower()
                 if any(kw in url_lower for kw in _PUBLIC_PATH_KEYWORDS):
+                    continue
+                # Gate 2: Skip JSON-only endpoints (browser forms can't submit application/json)
+                if self._is_json_only_endpoint(entry):
                     continue
                 # Deduplicate by method+url
                 key = f"{method}|{url}"
@@ -3056,6 +3128,12 @@ class CSRFScanner:
             key = f"{f['endpoint']}|{f['csrf_type']}"
             if key not in seen:
                 seen.add(key)
+                # Gate 3: If SameSite=Strict/Lax cookies present, downgrade to informational
+                if has_samesite:
+                    f["evidence_score"] = min(f.get("evidence_score", 4), 2)
+                    f["detail"] = (
+                        f"[DOWNGRADED — SameSite cookie protection present] {f['detail']}"
+                    )
                 deduped.append(f)
 
         elapsed = round(time.monotonic() - start, 1)
@@ -3538,6 +3616,11 @@ class HostHeaderScanner:
 
     Zero LLM cost. Evidence: ``evil.burpcollaborator.net`` appears in response
     body or ``Location`` header = confirmed reflection (evidence_score 4).
+
+    False-positive guards:
+    - Baseline comparison: sends normal request first, rejects if response is identical
+    - Reflection must be in security-sensitive context (Location, Link, href/src/action attrs)
+    - Severity capped at informational for non-security-sensitive endpoints
     """
 
     _EVIL_HOST = "evil.burpcollaborator.net"
@@ -3556,6 +3639,18 @@ class HostHeaderScanner:
         "signup", "redirect", "callback", "confirm", "verify", "invite",
         "email", "activate", "auth", "oauth", "sso",
     })
+
+    # Security-sensitive headers where host reflection is dangerous
+    _SECURITY_HEADERS = frozenset({
+        "location", "link", "content-location", "refresh",
+    })
+
+    # Patterns for security-sensitive reflection in body (href, src, action, meta refresh)
+    _SENSITIVE_BODY_RE = re.compile(
+        r'(?:href|src|action|url|redirect|location|next)\s*[=:]\s*["\']?'
+        r'[^"\'>\s]*' + re.escape("evil.burpcollaborator.net"),
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -3613,6 +3708,21 @@ class HostHeaderScanner:
 
             original_host = parsed.hostname or ""
 
+            # --- Baseline request (normal Host header) ---
+            try:
+                baseline_resp = await self._client.get(url)
+                requests_sent += 1
+                baseline_body = baseline_resp.text or ""
+                baseline_status = baseline_resp.status_code
+                baseline_location = baseline_resp.headers.get("location", "")
+            except Exception:
+                requests_sent += 1
+                continue
+
+            is_sensitive_endpoint = any(
+                kw in path_key.lower() for kw in self._PRIORITY_KEYWORDS
+            )
+
             for header_name, header_value in self._HEADER_TESTS:
                 try:
                     await asyncio.sleep(0.1)
@@ -3627,56 +3737,97 @@ class HostHeaderScanner:
                     requests_sent += 1
                     continue
 
-                # Check for reflection in body or Location header
-                reflected_in_body = self._EVIL_HOST in (resp.text or "")
-                location = resp.headers.get("location", "")
-                reflected_in_location = self._EVIL_HOST in location
+                # --- Gate 1: Compare with baseline ---
+                # If the response body and status are identical to baseline,
+                # the host header is being ignored → not vulnerable
+                test_body = resp.text or ""
+                test_location = resp.headers.get("location", "")
+                if (resp.status_code == baseline_status
+                        and test_body == baseline_body
+                        and test_location == baseline_location):
+                    continue
+
+                # Check for reflection in body or security-sensitive headers
+                reflected_in_body = self._EVIL_HOST in test_body
+                reflected_in_security_header = False
+                reflected_header_name = ""
+                reflected_header_value = ""
+                for hdr_name in self._SECURITY_HEADERS:
+                    hdr_val = resp.headers.get(hdr_name, "")
+                    if self._EVIL_HOST in hdr_val:
+                        reflected_in_security_header = True
+                        reflected_header_name = hdr_name
+                        reflected_header_value = hdr_val
+                        break
 
                 # Exclude false positives: error messages about unrecognized host
-                if reflected_in_body and not reflected_in_location:
-                    body_lower = resp.text.lower()
+                if reflected_in_body and not reflected_in_security_header:
+                    body_lower = test_body.lower()
                     if any(phrase in body_lower for phrase in (
                         "no such host", "unknown host", "not found",
                         "server not found", "does not exist",
+                        "invalid host", "bad request",
                     )):
                         continue
 
-                if reflected_in_body or reflected_in_location:
-                    where = []
-                    if reflected_in_body:
-                        where.append("response body")
-                    if reflected_in_location:
-                        where.append(f"Location header ({location[:200]})")
+                # --- Gate 2: Reflection must be in security-sensitive context ---
+                sensitive_body_reflection = False
+                if reflected_in_body:
+                    sensitive_body_reflection = bool(self._SENSITIVE_BODY_RE.search(test_body))
 
-                    req_dump = (
-                        f"GET {parsed.path or '/'} HTTP/1.1\n"
-                        f"Host: {original_host}\n"
-                        f"{header_name}: {header_value}"
-                    )
-                    resp_headers = "\n".join(
-                        f"{k}: {v}" for k, v in list(resp.headers.items())[:15]
-                    )
-                    resp_dump = f"HTTP {resp.status_code}\n{resp_headers}"
-                    if reflected_in_body:
-                        idx = resp.text.find(self._EVIL_HOST)
-                        snippet_start = max(0, idx - 100)
-                        snippet_end = min(len(resp.text), idx + 200)
-                        resp_dump += f"\n\n...{resp.text[snippet_start:snippet_end]}..."
+                # Only report if reflection is in a security-sensitive context
+                if not reflected_in_security_header and not sensitive_body_reflection:
+                    # Body contains the host but NOT in a sensitive context (href, src, action, etc.)
+                    # This is just cosmetic reflection, not exploitable → skip
+                    continue
 
-                    findings.append({
-                        "endpoint": url,
-                        "header_tested": header_name,
-                        "reflected_in": ", ".join(where),
-                        "detail": (
-                            f"{header_name}: {header_value} reflected in "
-                            f"{', '.join(where)} on {parsed.path or '/'}"
-                        ),
-                        "evidence_score": 4,
-                        "status_code": resp.status_code,
-                        "request_dump": req_dump,
-                        "response_dump": resp_dump,
-                    })
-                    break  # One finding per endpoint is enough
+                # At this point, at least one of the two flags is true
+                where = []
+                if reflected_in_security_header:
+                    where.append(
+                        f"{reflected_header_name} header ({reflected_header_value[:200]})"
+                    )
+                if sensitive_body_reflection:
+                    where.append("security-sensitive body context (href/src/action)")
+
+                # --- Gate 3: Severity based on endpoint type ---
+                if reflected_in_security_header:
+                    evidence_score = 4  # Header reflection is high severity
+                elif is_sensitive_endpoint:
+                    evidence_score = 4  # Sensitive endpoint + body reflection
+                else:
+                    evidence_score = 2  # Non-sensitive endpoint → informational
+
+                req_dump = (
+                    f"GET {parsed.path or '/'} HTTP/1.1\n"
+                    f"Host: {original_host}\n"
+                    f"{header_name}: {header_value}"
+                )
+                resp_headers = "\n".join(
+                    f"{k}: {v}" for k, v in list(resp.headers.items())[:15]
+                )
+                resp_dump = f"HTTP {resp.status_code}\n{resp_headers}"
+                if reflected_in_body:
+                    idx = test_body.find(self._EVIL_HOST)
+                    snippet_start = max(0, idx - 100)
+                    snippet_end = min(len(test_body), idx + 200)
+                    resp_dump += f"\n\n...{test_body[snippet_start:snippet_end]}..."
+
+                findings.append({
+                    "endpoint": url,
+                    "header_tested": header_name,
+                    "reflected_in": ", ".join(where),
+                    "detail": (
+                        f"{header_name}: {header_value} reflected in "
+                        f"{', '.join(where)} on {parsed.path or '/'}"
+                    ),
+                    "evidence_score": evidence_score,
+                    "status_code": resp.status_code,
+                    "baseline_status": baseline_status,
+                    "request_dump": req_dump,
+                    "response_dump": resp_dump,
+                })
+                break  # One finding per endpoint is enough
 
         elapsed = round(time.monotonic() - start, 1)
         logger.info("host_header_scan_complete",
@@ -3705,6 +3856,11 @@ class NoSQLInjectionScanner:
     operator injection ([$ne]=, [$gt]=, etc.).  Compares response status
     and length against a clean baseline to identify auth bypass, data
     extraction, or blind acceptance anomalies.
+
+    False-positive guards:
+    - Control test: sends a plain garbage string to distinguish injection from generic rejection
+    - Error differentiation: 400/422/500 responses = input validation, not injection
+    - Data requirement: $ne payload must return MORE data than baseline (matching all records)
     """
 
     _JSON_PAYLOADS: list[tuple[str, Any]] = [
@@ -3717,6 +3873,11 @@ class NoSQLInjectionScanner:
         ("$in", {"$in": ["admin", "root", "test"]}),
     ]
 
+    # Control value: a plain string that should NOT trigger injection behavior.
+    # If the control also produces a different response from baseline, the endpoint
+    # is just rejecting unusual input, not being injected.
+    _CONTROL_VALUE = "BBBB_nosqli_control_test"
+
     _QS_PAYLOADS: list[tuple[str, str]] = [
         ("[$ne]", "[$ne]="),
         ("[$gt]", "[$gt]="),
@@ -3727,7 +3888,7 @@ class NoSQLInjectionScanner:
         ("[$where]", "[$where]=1==1"),
     ]
 
-    _MAX_REQUESTS = 120
+    _MAX_REQUESTS = 150  # Bumped slightly to account for control requests
     _MAX_ENDPOINTS = 15
     _RATE_LIMIT = 0.1
 
@@ -3807,6 +3968,15 @@ class NoSQLInjectionScanner:
         if method in ("POST", "PUT", "PATCH"):
             body = dict(params) if params else {"username": "test", "password": "test"}
             for param in list(body.keys())[:3]:
+                # --- Control test: send a plain garbage string ---
+                control_body = dict(body)
+                control_body[param] = self._CONTROL_VALUE
+                control_result = await self._send_json(url, method, control_body)
+                if control_result is None:
+                    continue
+                c_status, c_len, _, _ = control_result
+                await asyncio.sleep(self._RATE_LIMIT)
+
                 for payload_name, payload_val in self._JSON_PAYLOADS:
                     if self._requests_sent >= self._MAX_REQUESTS:
                         return findings
@@ -3818,6 +3988,7 @@ class NoSQLInjectionScanner:
                     t_status, t_len, req_dump, resp_dump = result
                     finding = self._detect_nosqli(
                         b_status, b_len, t_status, t_len,
+                        c_status, c_len,
                         url, param, f"json_{payload_name}", str(payload_val),
                         req_dump, resp_dump,
                     )
@@ -3827,6 +3998,15 @@ class NoSQLInjectionScanner:
 
         # Query string injection
         for param in list(params.keys())[:5]:
+            # --- Control test: send a plain garbage string in query param ---
+            control_params = dict(params)
+            control_params[param] = self._CONTROL_VALUE
+            control_result = await self._send(url, "GET", control_params)
+            if control_result is None:
+                continue
+            c_status, c_len, _, _ = control_result
+            await asyncio.sleep(self._RATE_LIMIT)
+
             for payload_name, payload_suffix in self._QS_PAYLOADS:
                 if self._requests_sent >= self._MAX_REQUESTS:
                     return findings
@@ -3839,6 +4019,7 @@ class NoSQLInjectionScanner:
                 t_status, t_len, req_dump, resp_dump = result
                 finding = self._detect_nosqli(
                     b_status, b_len, t_status, t_len,
+                    c_status, c_len,
                     url, param, f"qs_{payload_name}", payload_suffix,
                     req_dump, resp_dump,
                 )
@@ -3850,27 +4031,56 @@ class NoSQLInjectionScanner:
 
     def _detect_nosqli(
         self, b_status: int, b_len: int, t_status: int, t_len: int,
+        c_status: int, c_len: int,
         url: str, param: str, payload_type: str, payload: str,
         req_dump: str, resp_dump: str,
     ) -> dict[str, Any] | None:
         score = 0
         detail_parts: list[str] = []
 
+        # --- Gate 1: Error responses are input validation, NOT injection ---
+        # If the payload response is a 400/422/500 error, the server is rejecting
+        # the operator at the input validation layer, not executing it.
+        if t_status in (400, 422, 500):
+            return None
+
+        # --- Gate 2: Control test comparison ---
+        # If the control (plain garbage string) ALSO produces a different response
+        # from baseline, the endpoint is just rejecting unusual input generically.
+        control_also_differs = (c_status != b_status or abs(c_len - b_len) > b_len * 0.1)
+
         # Auth bypass: 401/403 → 200
         if b_status in (401, 403) and t_status == 200:
-            score = 5
-            detail_parts.append(f"Auth bypass: {b_status}→{t_status}")
+            # Only count if control did NOT also bypass auth
+            if c_status in (401, 403):
+                score = 5
+                detail_parts.append(f"Auth bypass: {b_status}→{t_status} (control stayed {c_status})")
+            else:
+                return None  # Control also got 200 → not injection
+
         # Data extraction: response >30% larger
         elif b_len > 0 and t_len > b_len * 1.3:
-            score = 5
-            detail_parts.append(
-                f"Data extraction: response {t_len}B vs baseline {b_len}B "
-                f"(+{round((t_len - b_len) / b_len * 100)}%)"
-            )
-        # Blind acceptance: different status
-        elif b_status != t_status and t_status < 500:
-            score = 4
-            detail_parts.append(f"Status diff: {b_status}→{t_status}")
+            # --- Gate 3: $ne should return MORE data (matching all records except one) ---
+            # Only count if control did NOT also return more data
+            if c_len <= b_len * 1.1:
+                score = 5
+                detail_parts.append(
+                    f"Data extraction: response {t_len}B vs baseline {b_len}B "
+                    f"(+{round((t_len - b_len) / b_len * 100)}%), "
+                    f"control {c_len}B (normal)"
+                )
+            else:
+                return None  # Control also got more data → not injection-specific
+
+        # Status diff: only report if control did NOT also differ
+        elif b_status != t_status and t_status < 400:
+            if not control_also_differs:
+                score = 4
+                detail_parts.append(
+                    f"Status diff: {b_status}→{t_status} (control stayed {c_status})"
+                )
+            else:
+                return None  # Control also differed → generic input handling
 
         if score == 0:
             return None
@@ -3884,6 +4094,7 @@ class NoSQLInjectionScanner:
             "evidence_score": score,
             "status_code": t_status,
             "baseline_status": b_status,
+            "control_status": c_status,
             "request_dump": req_dump,
             "response_dump": resp_dump,
         }
@@ -3924,8 +4135,15 @@ class NoSQLInjectionScanner:
 class XXEScanner:
     """Detect XML External Entity (XXE) injection — zero LLM cost.
 
-    Phase 1: Discover endpoints that accept XML (probe with benign XML).
-    Phase 2: Test with XXE payloads (file read, parameter entity, XInclude, SVG).
+    Phase 1: Content-type gate — only test endpoints that accept/serve XML.
+    Phase 2: Discover endpoints that accept XML (probe with benign XML).
+    Phase 3: Test with XXE payloads (file read, parameter entity, XInclude, SVG).
+
+    False-positive guards:
+    - Content-type gate: only tests endpoints whose traffic shows XML content-type
+    - SPA gate: skips entirely if spa_fingerprint.is_spa is true
+    - File content verification: verifies actual file content patterns in response
+    - SPA shell detection: rejects responses that are just SPA HTML shells
     """
 
     _FILE_PAYLOADS: list[tuple[str, str | None]] = [
@@ -3934,6 +4152,25 @@ class XXEScanner:
         ("file:///proc/self/environ", r"PATH=|HOME="),
         ("file:///FLAG", None),
     ]
+
+    # Patterns that indicate actual file content was read (not just a generic response)
+    _FILE_CONTENT_PATTERNS = re.compile(
+        r"root:x:0:0:|/bin/(?:ba)?sh|/sbin/nologin|"
+        r"PATH=|HOME=|USER=|HOSTNAME=|"
+        r"daemon:x:\d+:|nobody:x:\d+:|"
+        r"www-data:x:\d+:|"
+        r"\[boot loader\]|\[operating systems\]|"  # Windows boot.ini
+        r"AIBBP_FLAG|CTF\{|FLAG\{|flag\{",
+        re.IGNORECASE,
+    )
+
+    # Patterns indicating SPA shell HTML (not real server-side response)
+    _SPA_SHELL_RE = re.compile(
+        r'<div\s+id="(?:app|root|__next|__nuxt)"[^>]*>\s*</div>|'
+        r'<script[^>]*(?:bundle|chunk|main|app)\.[a-f0-9]+\.js|'
+        r'__NEXT_DATA__|__NUXT__|window\.__INITIAL_STATE__',
+        re.IGNORECASE,
+    )
 
     _XXE_TEMPLATES: dict[str, str] = {
         "basic": (
@@ -3962,6 +4199,13 @@ class XXEScanner:
         "application/xml", "text/xml", "application/soap+xml",
     ]
 
+    # Content types that indicate non-XML endpoints (JSON, form, multipart)
+    _NON_XML_CONTENT_TYPES = frozenset({
+        "application/json", "application/x-www-form-urlencoded",
+        "multipart/form-data", "text/html", "text/plain",
+        "text/javascript", "application/javascript",
+    })
+
     _XML_PARSER_RE = re.compile(
         r"xerces|expat|libxml|SAXParser|XMLReader|DOMParser|lxml|simplexml|xml\.etree",
         re.IGNORECASE,
@@ -3979,14 +4223,78 @@ class XXEScanner:
         )
         self._requests_sent = 0
 
+    @staticmethod
+    def _endpoint_accepts_xml(
+        url: str,
+        endpoints: dict[str, dict[str, Any]] | None,
+        proxy_traffic: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Check if endpoint has XML-related content types in its traffic."""
+        # Check endpoint metadata
+        if endpoints and url in endpoints:
+            meta = endpoints[url]
+            ct = (meta.get("content_type") or meta.get("request_content_type") or "").lower()
+            if "xml" in ct or "soap" in ct:
+                return True
+            resp_ct = (meta.get("response_content_type") or "").lower()
+            if "xml" in resp_ct or "soap" in resp_ct:
+                return True
+        # Check proxy traffic for this URL
+        if proxy_traffic:
+            for entry in proxy_traffic:
+                entry_url = entry.get("url", "")
+                if entry_url != url:
+                    continue
+                headers = entry.get("headers") or {}
+                for k, v in headers.items():
+                    if k.lower() == "content-type" and ("xml" in v.lower() or "soap" in v.lower()):
+                        return True
+                resp_headers = entry.get("response_headers") or {}
+                for k, v in resp_headers.items():
+                    if k.lower() == "content-type" and ("xml" in v.lower() or "soap" in v.lower()):
+                        return True
+        return False
+
+    @classmethod
+    def _all_endpoints_non_xml(
+        cls, candidates: list[str], endpoints: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Return True if every candidate has an explicitly non-XML content type."""
+        for url in candidates:
+            raw = endpoints.get(url)
+            meta = raw if isinstance(raw, dict) else {}
+            ct = (meta.get("content_type") or meta.get("request_content_type") or "").lower()
+            resp_ct = (meta.get("response_content_type") or "").lower()
+            if not any(nxct in ct or nxct in resp_ct for nxct in cls._NON_XML_CONTENT_TYPES):
+                return False
+        return True
+
     async def scan(
         self,
         base_url: str,
         endpoints: dict[str, dict[str, Any]] | None = None,
+        spa_fingerprint: Any | None = None,
+        proxy_traffic: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         start = time.monotonic()
         findings: list[dict[str, Any]] = []
         endpoints_tested = 0
+
+        # --- SPA Gate: SPAs don't process XML server-side in frontend routes ---
+        if spa_fingerprint is not None:
+            is_spa = getattr(spa_fingerprint, "is_spa", False)
+            if not is_spa and isinstance(spa_fingerprint, dict):
+                is_spa = spa_fingerprint.get("is_spa", False)
+            if is_spa:
+                elapsed = round(time.monotonic() - start, 1)
+                logger.info("xxe_scan_skipped_spa", elapsed=elapsed)
+                return {
+                    "findings": [],
+                    "endpoints_tested": 0,
+                    "requests_sent": 0,
+                    "elapsed_seconds": elapsed,
+                    "skipped_reason": "SPA detected — frontend routes do not process XML server-side",
+                }
 
         # Collect candidate URLs
         candidates: list[str] = []
@@ -3998,9 +4306,33 @@ class XXEScanner:
             candidates = [base_url]
         candidates = candidates[: self._MAX_ENDPOINTS]
 
-        # Phase 1: Discover XML-accepting endpoints
+        # --- Content-Type Gate: prioritize endpoints that accept/serve XML ---
+        xml_likely: list[str] = [
+            url for url in candidates
+            if self._endpoint_accepts_xml(url, endpoints, proxy_traffic)
+        ]
+
+        # If we found XML-accepting endpoints, ONLY test those.
+        # If we found none, fall back to probing all endpoints (original behavior).
+        if xml_likely:
+            probe_candidates = xml_likely
+        elif endpoints and self._all_endpoints_non_xml(candidates, endpoints):
+            # ALL endpoints are explicitly non-XML (JSON/form/HTML only) — skip
+            elapsed = round(time.monotonic() - start, 1)
+            logger.info("xxe_scan_skipped_no_xml_endpoints", elapsed=elapsed)
+            return {
+                "findings": [],
+                "endpoints_tested": 0,
+                "requests_sent": 0,
+                "elapsed_seconds": elapsed,
+                "skipped_reason": "No XML-accepting endpoints found (all JSON/form/HTML)",
+            }
+        else:
+            probe_candidates = candidates
+
+        # Phase 1: Discover XML-accepting endpoints via probing
         xml_endpoints: list[str] = []
-        for url in candidates:
+        for url in probe_candidates:
             if self._requests_sent >= self._MAX_REQUESTS:
                 break
             if await self._probe_xml_acceptance(url):
@@ -4037,6 +4369,11 @@ class XXEScanner:
                     headers={"Content-Type": ct},
                 )
                 if resp.status_code != 415:  # Not Unsupported Media Type
+                    # Additional check: if the response is a SPA shell or generic
+                    # HTML page, the server likely ignored our XML payload
+                    body = resp.text or ""
+                    if self._SPA_SHELL_RE.search(body):
+                        continue  # SPA shell — not really accepting XML
                     return True
             except Exception:
                 pass
@@ -4062,13 +4399,27 @@ class XXEScanner:
                 detail_parts: list[str] = []
                 body = resp.text
 
-                # Check for file contents
+                # --- Verify actual file content in response ---
+                # Reject SPA shell HTML as false positive
+                if self._SPA_SHELL_RE.search(body):
+                    continue
+
+                # Check for file contents with strict verification
                 if detect_re and re.search(detect_re, body):
-                    score = 5
-                    detail_parts.append(f"File contents ({file_uri}) found in response")
-                elif file_uri == "file:///FLAG" and len(body) > 10 and "error" not in body.lower():
-                    score = 5
-                    detail_parts.append("FLAG file content returned")
+                    # Double-check with broader file content patterns
+                    if self._FILE_CONTENT_PATTERNS.search(body):
+                        score = 5
+                        detail_parts.append(f"File contents ({file_uri}) verified in response")
+                    else:
+                        # detect_re matched but broader patterns didn't — suspicious
+                        score = 3
+                        detail_parts.append(f"Possible file contents ({file_uri}) in response (partial match)")
+                elif file_uri == "file:///FLAG":
+                    # For FLAG file: require actual flag-like content, not just non-error
+                    if self._FILE_CONTENT_PATTERNS.search(body):
+                        score = 5
+                        detail_parts.append("FLAG file content returned")
+                    # If no flag pattern, skip (was: any non-error 10+ char body = score 5)
                 # Check parser name in error
                 elif self._XML_PARSER_RE.search(body):
                     score = 3
