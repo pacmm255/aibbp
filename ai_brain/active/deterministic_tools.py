@@ -9,6 +9,7 @@ Zero LLM cost — pure Python algorithmic loops:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -4990,3 +4991,902 @@ class JWTDeepAnalyzer:
 
     async def close(self):
         await self._client.aclose()
+
+
+# ── Business Logic Scanner ─────────────────────────────────────────────
+
+
+def _to_number(v: Any) -> float | None:
+    """Try to convert a value to a number."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+class BusinessLogicScanner:
+    """Deterministic business logic vulnerability scanner — zero LLM cost.
+
+    Tests for creative, high-bounty business logic bugs that standard vuln
+    scanners miss: price manipulation, workflow bypass, rate limiting gaps,
+    parameter pollution, mass assignment, and sequential IDOR.
+    """
+
+    _PRICE_KEYWORDS = frozenset({
+        "price", "amount", "total", "cost", "quantity", "qty",
+        "discount", "coupon", "subtotal", "unit_price", "unitprice",
+        "item_price", "value", "fee", "charge", "rate",
+    })
+
+    _MANIPULATIONS: list[tuple[str, Any]] = [
+        ("negative_value", lambda v: -abs(_to_number(v)) if _to_number(v) else -1),
+        ("zero_value", lambda _v: 0),
+        ("fractional_value", lambda _v: 0.001),
+        ("very_large_value", lambda _v: 99999999),
+        ("integer_overflow_32bit", lambda _v: 2147483647),
+        ("negative_overflow", lambda _v: -2147483648),
+        ("string_zero", lambda _v: "0"),
+        ("negative_string", lambda _v: "-1"),
+        ("extreme_discount_100pct", lambda _v: 100),
+        ("extreme_discount_over_100pct", lambda _v: 999),
+    ]
+
+    _ERROR_KEYWORDS = (
+        "error", "denied", "unauthorized", "forbidden",
+        "invalid", "expired", "required", "must complete",
+        "previous step", "not allowed",
+    )
+
+    _ESCALATION_VALUES: dict[str, list[str]] = {
+        "role": ["admin", "administrator", "superadmin", "root"],
+        "user_role": ["admin", "administrator"],
+        "type": ["admin", "premium", "internal"],
+        "user_type": ["admin", "staff"],
+        "level": ["admin", "9999", "0"],
+        "access": ["admin", "full", "all"],
+        "is_admin": ["true", "1", "yes"],
+        "admin": ["true", "1", "yes"],
+        "verified": ["true", "1"],
+        "approved": ["true", "1"],
+        "active": ["true", "1"],
+        "status": ["admin", "active", "verified"],
+        "group": ["admin", "administrators"],
+        "privilege": ["admin", "elevated", "root"],
+    }
+    _DEFAULT_ESCALATION = ["admin", "true", "1", "root"]
+
+    _MASS_ASSIGN_FIELDS: dict[str, Any] = {
+        "is_admin": True,
+        "role": "admin",
+        "admin": True,
+        "verified": True,
+        "is_verified": True,
+        "email_verified": True,
+        "is_superuser": True,
+        "privilege": "admin",
+        "user_type": "admin",
+        "access_level": 9999,
+        "is_staff": True,
+        "is_active": True,
+        "approved": True,
+        "balance": 99999,
+        "credits": 99999,
+        "discount": 100,
+        "price": 0,
+    }
+
+    def __init__(
+        self,
+        scope_guard: ActiveScopeGuard | None,
+        timeout: int = 15,
+        socks_proxy: str | None = None,
+    ):
+        self._scope_guard = scope_guard
+        self._timeout = timeout
+        self._socks_proxy = socks_proxy
+
+    def _get_client(self, **kwargs: Any) -> httpx.AsyncClient:
+        """Create an httpx client with optional Goja 502 fallback."""
+        return _make_client(
+            socks_proxy=self._socks_proxy,
+            timeout=self._timeout,
+            follow_redirects=True,
+            **kwargs,
+        )
+
+    # ── Price Manipulation ──────────────────────────────────────────────
+
+    async def test_price_manipulation(
+        self,
+        url: str,
+        method: str = "POST",
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        price_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Modify price/quantity/discount params and compare order totals.
+
+        Detects: negative prices, zero-cost items, integer overflow discounts,
+        fractional quantities, extreme values.
+
+        Returns:
+            {vulnerable: bool, tests: [...], baseline: {...}, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        start = time.monotonic()
+        body = body or {}
+
+        # Auto-detect price-related fields from the body
+        detected_fields = price_fields or [
+            k for k in body
+            if any(kw in k.lower() for kw in self._PRICE_KEYWORDS)
+        ]
+
+        if not detected_fields:
+            return {
+                "vulnerable": False,
+                "error": "No price/quantity/discount fields detected in body. "
+                         "Provide price_fields or include fields like price, quantity, discount in body.",
+                "elapsed_s": round(time.monotonic() - start, 1),
+            }
+
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+
+        tests: list[dict[str, Any]] = []
+        vulnerable = False
+
+        async with self._get_client() as client:
+            # Send baseline using the same client as the tests
+            try:
+                baseline_resp = await self._send_with_client(
+                    client, url, method, body, **req_kwargs,
+                )
+            except Exception:
+                return {
+                    "vulnerable": False,
+                    "error": "Baseline request failed",
+                    "elapsed_s": round(time.monotonic() - start, 1),
+                }
+
+            baseline = {
+                "status_code": baseline_resp.status_code,
+                "body_length": len(baseline_resp.content),
+                "body_preview": baseline_resp.text[:500],
+            }
+
+            for field_name in detected_fields:
+                original_value = body.get(field_name)
+                for manip_name, transform in self._MANIPULATIONS:
+                    modified_body = dict(body)
+                    try:
+                        modified_body[field_name] = transform(original_value)
+                    except Exception:
+                        continue
+
+                    await asyncio.sleep(0.2)  # Rate limit
+                    try:
+                        resp = await self._send_with_client(
+                            client, url, method, modified_body, **req_kwargs,
+                        )
+                    except Exception as e:
+                        tests.append({
+                            "field": field_name,
+                            "manipulation": manip_name,
+                            "error": str(e)[:200],
+                        })
+                        continue
+
+                    accepted = resp.status_code in (200, 201, 302)
+                    body_diff = abs(len(resp.content) - baseline["body_length"])
+                    status_diff = resp.status_code != baseline["status_code"]
+
+                    # Detect if the manipulation was accepted (potential vuln)
+                    is_suspicious = accepted and (
+                        # Server accepted a negative/zero price without error
+                        manip_name in ("negative_value", "zero_value", "negative_string")
+                        or
+                        # Server accepted extreme discount
+                        manip_name.startswith("extreme_discount")
+                        or
+                        # Response differs significantly from baseline (processing happened)
+                        (body_diff > 50 and not status_diff)
+                    )
+
+                    test_result = {
+                        "field": field_name,
+                        "manipulation": manip_name,
+                        "modified_value": str(modified_body[field_name]),
+                        "original_value": str(original_value),
+                        "response_status": resp.status_code,
+                        "response_length": len(resp.content),
+                        "body_diff_bytes": body_diff,
+                        "accepted": accepted,
+                        "suspicious": is_suspicious,
+                        "response_preview": resp.text[:300] if is_suspicious else "",
+                    }
+                    tests.append(test_result)
+
+                    if is_suspicious:
+                        vulnerable = True
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "vulnerable": vulnerable,
+            "tests": tests,
+            "baseline": baseline,
+            "fields_tested": detected_fields,
+            "total_requests": len(tests) + 1,
+            "elapsed_s": elapsed,
+        }
+
+    # ── Workflow Bypass ─────────────────────────────────────────────────
+
+    async def test_workflow_bypass(
+        self,
+        steps: list[dict[str, Any]],
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Skip steps in multi-step flows (e.g., skip payment, skip email verify).
+
+        Sends the final-step request without completing prerequisites.
+        Also tests skipping intermediate steps.
+
+        Args:
+            steps: List of workflow steps, each with:
+                {url: str, method: str, body: dict|None, description: str}
+                Steps should be in order (first to last).
+            headers: Optional HTTP headers.
+            cookies: Optional cookies (e.g., session cookie).
+
+        Returns:
+            {vulnerable: bool, tests: [...], elapsed_s: float}
+        """
+        if not steps or len(steps) < 2:
+            return {
+                "vulnerable": False,
+                "error": "Need at least 2 workflow steps to test bypass.",
+            }
+
+        for step in steps:
+            if self._scope_guard:
+                self._scope_guard.validate_url(step["url"])
+
+        start = time.monotonic()
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+        tests: list[dict[str, Any]] = []
+        vulnerable = False
+
+        async with self._get_client() as client:
+            # Test 1: Skip directly to final step
+            final_step = steps[-1]
+            await asyncio.sleep(0.2)
+            try:
+                resp = await self._send_with_client(
+                    client,
+                    final_step["url"],
+                    final_step.get("method", "POST"),
+                    final_step.get("body"),
+                    **req_kwargs,
+                )
+                accepted = resp.status_code in (200, 201, 302)
+                body_lower = resp.text[:2000].lower()
+                has_error_indicator = any(kw in body_lower for kw in self._ERROR_KEYWORDS)
+                is_suspicious = accepted and not has_error_indicator
+
+                tests.append({
+                    "test": "skip_to_final_step",
+                    "skipped_steps": [s.get("description", s["url"]) for s in steps[:-1]],
+                    "target_step": final_step.get("description", final_step["url"]),
+                    "response_status": resp.status_code,
+                    "response_length": len(resp.content),
+                    "accepted": accepted,
+                    "has_error_indicator": has_error_indicator,
+                    "suspicious": is_suspicious,
+                    "response_preview": resp.text[:500] if is_suspicious else resp.text[:200],
+                })
+                if is_suspicious:
+                    vulnerable = True
+            except Exception as e:
+                tests.append({"test": "skip_to_final_step", "error": str(e)[:200]})
+
+            # Test 2: Skip intermediate steps (step 1 then jump to step N)
+            if len(steps) > 2:
+                for skip_to_idx in range(2, len(steps)):
+                    skip_step = steps[skip_to_idx]
+                    first_step = steps[0]
+                    await asyncio.sleep(0.2)
+                    try:
+                        await self._send_with_client(
+                            client,
+                            first_step["url"],
+                            first_step.get("method", "GET"),
+                            first_step.get("body"),
+                            **req_kwargs,
+                        )
+                        await asyncio.sleep(0.2)
+                        resp = await self._send_with_client(
+                            client,
+                            skip_step["url"],
+                            skip_step.get("method", "POST"),
+                            skip_step.get("body"),
+                            **req_kwargs,
+                        )
+                        accepted = resp.status_code in (200, 201, 302)
+                        body_lower = resp.text[:2000].lower()
+                        has_error_indicator = any(kw in body_lower for kw in self._ERROR_KEYWORDS)
+                        is_suspicious = accepted and not has_error_indicator
+                        skipped = [
+                            s.get("description", s["url"])
+                            for s in steps[1:skip_to_idx]
+                        ]
+
+                        tests.append({
+                            "test": f"skip_steps_1_to_{skip_to_idx}",
+                            "skipped_steps": skipped,
+                            "target_step": skip_step.get("description", skip_step["url"]),
+                            "response_status": resp.status_code,
+                            "response_length": len(resp.content),
+                            "accepted": accepted,
+                            "has_error_indicator": has_error_indicator,
+                            "suspicious": is_suspicious,
+                            "response_preview": resp.text[:500] if is_suspicious else resp.text[:200],
+                        })
+                        if is_suspicious:
+                            vulnerable = True
+                    except Exception as e:
+                        tests.append({
+                            "test": f"skip_steps_1_to_{skip_to_idx}",
+                            "error": str(e)[:200],
+                        })
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "vulnerable": vulnerable,
+            "tests": tests,
+            "total_steps": len(steps),
+            "elapsed_s": elapsed,
+        }
+
+    # ── Rate Limit Testing ──────────────────────────────────────────────
+
+    async def test_rate_limit(
+        self,
+        url: str,
+        method: str = "GET",
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        num_requests: int = 50,
+    ) -> dict[str, Any]:
+        """Send rapid requests to check if rate limiting exists.
+
+        Reports if no 429/rate-limit response after num_requests rapid requests.
+
+        Returns:
+            {rate_limited: bool, total_requests: int, status_codes: dict,
+             first_429_at: int|None, avg_response_time_s: float, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        start = time.monotonic()
+        num_requests = min(num_requests, 100)  # Cap at 100
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+
+        status_codes: dict[int, int] = {}
+        response_times: list[float] = []
+        first_429_at: int | None = None
+        rate_limited = False
+        rate_limit_headers_seen = False
+
+        async with self._get_client() as client:
+            for i in range(num_requests):
+                req_start = time.monotonic()
+                try:
+                    resp = await self._send_with_client(
+                        client, url, method, body, **req_kwargs,
+                    )
+                    elapsed_req = round(time.monotonic() - req_start, 3)
+                    response_times.append(elapsed_req)
+
+                    sc = resp.status_code
+                    status_codes[sc] = status_codes.get(sc, 0) + 1
+
+                    # Check for rate limiting indicators
+                    if sc == 429:
+                        rate_limited = True
+                        if first_429_at is None:
+                            first_429_at = i + 1
+
+                    # Check rate-limit headers
+                    rl_headers = {
+                        k: v for k, v in resp.headers.items()
+                        if any(rl in k.lower() for rl in (
+                            "x-ratelimit", "x-rate-limit", "retry-after",
+                            "ratelimit-remaining", "ratelimit-limit",
+                        ))
+                    }
+                    if rl_headers:
+                        rate_limit_headers_seen = True
+                        for hdr_val in rl_headers.values():
+                            if hdr_val.strip() == "0":
+                                rate_limited = True
+                                if first_429_at is None:
+                                    first_429_at = i + 1
+
+                except Exception:
+                    response_times.append(-1)
+                    continue
+
+                # Yield to event loop periodically (no delay — rapid-fire)
+                if i % 10 == 0:
+                    await asyncio.sleep(0)
+
+        elapsed = round(time.monotonic() - start, 1)
+        positive_times = [t for t in response_times if t > 0]
+        avg_response_time = (
+            round(sum(positive_times) / max(len(positive_times), 1), 3)
+        )
+
+        return {
+            "rate_limited": rate_limited,
+            "rate_limit_headers_seen": rate_limit_headers_seen,
+            "total_requests": num_requests,
+            "status_codes": status_codes,
+            "first_429_at": first_429_at,
+            "avg_response_time_s": avg_response_time,
+            "elapsed_s": elapsed,
+            "vulnerable": not rate_limited and not rate_limit_headers_seen,
+        }
+
+    # ── Parameter Pollution ─────────────────────────────────────────────
+
+    async def test_parameter_pollution(
+        self,
+        url: str,
+        params: dict[str, str],
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Send duplicate params (?role=user&role=admin), check which value server uses.
+
+        Tests HTTP Parameter Pollution (HPP) by sending duplicate parameters
+        with different values to see if the server uses the first, last, or
+        concatenates them.
+
+        Returns:
+            {vulnerable: bool, tests: [...], baseline: {...}, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        from urllib.parse import urlparse, urlencode, urlunparse
+
+        start = time.monotonic()
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+
+        tests: list[dict[str, Any]] = []
+        vulnerable = False
+
+        async with self._get_client() as client:
+            # Baseline: normal request
+            await asyncio.sleep(0.2)
+            baseline_resp = await self._send_with_client(
+                client, url, method, params if method == "POST" else None,
+                query_params=params if method == "GET" else None,
+                **req_kwargs,
+            )
+            baseline = {
+                "status_code": baseline_resp.status_code,
+                "body_length": len(baseline_resp.content),
+                "body_preview": baseline_resp.text[:300],
+            }
+
+            for param_name, original_value in params.items():
+                escalation_values = self._ESCALATION_VALUES.get(
+                    param_name.lower(), self._DEFAULT_ESCALATION,
+                )
+                for escalation_value in escalation_values:
+                    if escalation_value.lower() == original_value.lower():
+                        continue  # Skip if already the same
+
+                    await asyncio.sleep(0.2)
+                    try:
+                        if method == "GET":
+                            parsed = urlparse(url)
+                            # Build query with original params + duplicate
+                            pairs = [(k, v) for k, v in params.items()]
+                            pairs.append((param_name, escalation_value))
+                            new_qs = urlencode(pairs)
+                            dup_url = urlunparse(parsed._replace(query=new_qs))
+                            resp = await client.request(
+                                method, dup_url,
+                                headers=req_kwargs.get("headers"),
+                                cookies=req_kwargs.get("cookies"),
+                            )
+                        else:
+                            # POST: send form with duplicate key
+                            form_pairs = [(k, v) for k, v in params.items()]
+                            form_pairs.append((param_name, escalation_value))
+                            resp = await client.request(
+                                method, url,
+                                data=form_pairs,
+                                headers=req_kwargs.get("headers"),
+                                cookies=req_kwargs.get("cookies"),
+                            )
+
+                        accepted = resp.status_code in (200, 201, 302)
+                        body_diff = abs(len(resp.content) - baseline["body_length"])
+                        status_diff = resp.status_code != baseline["status_code"]
+
+                        # Check if escalated value appears in response
+                        escalation_in_response = (
+                            escalation_value.lower() in resp.text[:5000].lower()
+                        )
+
+                        is_suspicious = (
+                            accepted
+                            and (escalation_in_response or body_diff > 100 or status_diff)
+                        )
+
+                        tests.append({
+                            "param": param_name,
+                            "original_value": original_value,
+                            "injected_value": escalation_value,
+                            "response_status": resp.status_code,
+                            "response_length": len(resp.content),
+                            "body_diff_bytes": body_diff,
+                            "escalation_in_response": escalation_in_response,
+                            "suspicious": is_suspicious,
+                            "response_preview": resp.text[:300] if is_suspicious else "",
+                        })
+                        if is_suspicious:
+                            vulnerable = True
+
+                    except Exception as e:
+                        tests.append({
+                            "param": param_name,
+                            "injected_value": escalation_value,
+                            "error": str(e)[:200],
+                        })
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "vulnerable": vulnerable,
+            "tests": tests,
+            "baseline": baseline,
+            "params_tested": list(params.keys()),
+            "elapsed_s": elapsed,
+        }
+
+    # ── Mass Assignment ─────────────────────────────────────────────────
+
+    async def test_mass_assignment(
+        self,
+        url: str,
+        method: str = "POST",
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add extra fields to POST/PUT requests (is_admin=true, role=admin).
+
+        Tests if the server accepts and processes unexpected fields that could
+        lead to privilege escalation or state manipulation.
+
+        Returns:
+            {vulnerable: bool, tests: [...], baseline: {...}, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        start = time.monotonic()
+        body = body or {}
+        fields_to_inject = extra_fields or self._MASS_ASSIGN_FIELDS
+
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+
+        tests: list[dict[str, Any]] = []
+        vulnerable = False
+
+        async with self._get_client() as client:
+            # Baseline request (same client as tests)
+            try:
+                baseline_resp = await self._send_with_client(
+                    client, url, method, body, **req_kwargs,
+                )
+            except Exception:
+                return {
+                    "vulnerable": False,
+                    "error": "Baseline request failed",
+                    "elapsed_s": round(time.monotonic() - start, 1),
+                }
+
+            baseline = {
+                "status_code": baseline_resp.status_code,
+                "body_length": len(baseline_resp.content),
+                "body_preview": baseline_resp.text[:500],
+            }
+
+            # Test each field individually
+            for field_name, field_value in fields_to_inject.items():
+                if field_name in body:
+                    continue  # Already in the original body
+
+                modified_body = dict(body)
+                modified_body[field_name] = field_value
+
+                await asyncio.sleep(0.2)
+                try:
+                    resp = await self._send_with_client(
+                        client, url, method, modified_body, **req_kwargs,
+                    )
+                except Exception as e:
+                    tests.append({
+                        "field": field_name,
+                        "value": str(field_value),
+                        "error": str(e)[:200],
+                    })
+                    continue
+
+                accepted = resp.status_code in (200, 201, 302)
+                body_diff = abs(len(resp.content) - baseline["body_length"])
+
+                # Check if the injected field appears in the response
+                field_in_response = field_name.lower() in resp.text[:5000].lower()
+                value_in_response = str(field_value).lower() in resp.text[:5000].lower()
+
+                # If response accepted AND different from baseline, suspicious
+                is_suspicious = (
+                    accepted
+                    and (field_in_response or value_in_response or body_diff > 100)
+                    and resp.status_code == baseline["status_code"]
+                )
+
+                tests.append({
+                    "field": field_name,
+                    "value": str(field_value),
+                    "response_status": resp.status_code,
+                    "response_length": len(resp.content),
+                    "body_diff_bytes": body_diff,
+                    "field_in_response": field_in_response,
+                    "value_in_response": value_in_response,
+                    "accepted": accepted,
+                    "suspicious": is_suspicious,
+                    "response_preview": resp.text[:300] if is_suspicious else "",
+                })
+                if is_suspicious:
+                    vulnerable = True
+
+            # Test all fields at once (batch injection)
+            all_injected_body = dict(body)
+            all_injected_body.update(fields_to_inject)
+            await asyncio.sleep(0.2)
+            try:
+                resp = await self._send_with_client(
+                    client, url, method, all_injected_body, **req_kwargs,
+                )
+                accepted = resp.status_code in (200, 201, 302)
+                body_diff = abs(len(resp.content) - baseline["body_length"])
+                is_suspicious = accepted and body_diff > 100
+
+                tests.append({
+                    "field": "_ALL_FIELDS_BATCH_",
+                    "value": str(list(fields_to_inject.keys())),
+                    "response_status": resp.status_code,
+                    "response_length": len(resp.content),
+                    "body_diff_bytes": body_diff,
+                    "accepted": accepted,
+                    "suspicious": is_suspicious,
+                    "response_preview": resp.text[:300] if is_suspicious else "",
+                })
+                if is_suspicious:
+                    vulnerable = True
+            except Exception as e:
+                tests.append({
+                    "field": "_ALL_FIELDS_BATCH_",
+                    "error": str(e)[:200],
+                })
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "vulnerable": vulnerable,
+            "tests": tests,
+            "baseline": baseline,
+            "fields_injected": list(fields_to_inject.keys()),
+            "elapsed_s": elapsed,
+        }
+
+    # ── Sequential IDOR ─────────────────────────────────────────────────
+
+    async def test_idor_sequential(
+        self,
+        url: str,
+        id_param: str,
+        current_id: str | int,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Try sequential IDs (id-1, id+1, id+2), compare responses to detect IDOR.
+
+        Tests whether changing the ID parameter returns different user data,
+        indicating IDOR without auth context enforcement.
+
+        Returns:
+            {vulnerable: bool, tests: [...], baseline: {...}, elapsed_s: float}
+        """
+        if self._scope_guard:
+            self._scope_guard.validate_url(url)
+
+        start = time.monotonic()
+        req_kwargs: dict[str, Any] = {"headers": headers or {}, "cookies": cookies or {}}
+
+        try:
+            current_id_int = int(current_id)
+            is_numeric = True
+        except (ValueError, TypeError):
+            is_numeric = False
+            current_id_int = 0
+
+        # Generate test IDs
+        test_ids: list[tuple[str, str | int]] = []
+        if is_numeric:
+            test_ids = [
+                ("id_minus_1", current_id_int - 1),
+                ("id_plus_1", current_id_int + 1),
+                ("id_plus_2", current_id_int + 2),
+                ("id_zero", 0),
+                ("id_one", 1),
+                ("id_large", current_id_int + 1000),
+            ]
+        else:
+            test_ids = [
+                ("empty_id", ""),
+                ("id_zero", "0"),
+                ("id_one", "1"),
+                ("id_admin", "admin"),
+            ]
+
+        from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
+
+        # Baseline: request with the current (authorized) ID
+        baseline_body = dict(body) if body else None
+        if method == "GET":
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs[id_param] = [str(current_id)]
+            baseline_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        else:
+            baseline_url = url
+            if baseline_body is not None:
+                baseline_body[id_param] = current_id
+
+        tests: list[dict[str, Any]] = []
+        vulnerable = False
+
+        async with self._get_client() as client:
+            # Send baseline using the same client as the tests
+            try:
+                baseline_resp = await self._send_with_client(
+                    client, baseline_url, method, baseline_body, **req_kwargs,
+                )
+            except Exception:
+                return {
+                    "vulnerable": False,
+                    "error": "Baseline request failed",
+                    "elapsed_s": round(time.monotonic() - start, 1),
+                }
+
+            baseline = {
+                "status_code": baseline_resp.status_code,
+                "body_length": len(baseline_resp.content),
+                "body_hash": hashlib.md5(baseline_resp.content).hexdigest(),
+                "body_preview": baseline_resp.text[:500],
+            }
+
+            for test_name, test_id in test_ids:
+                if method == "GET":
+                    qs[id_param] = [str(test_id)]
+                    test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+                    test_body = None
+                else:
+                    test_url = url
+                    test_body = dict(body) if body else {}
+                    test_body[id_param] = test_id
+
+                await asyncio.sleep(0.2)
+                try:
+                    resp = await self._send_with_client(
+                        client, test_url, method, test_body, **req_kwargs,
+                    )
+                except Exception as e:
+                    tests.append({
+                        "test": test_name,
+                        "id_value": str(test_id),
+                        "error": str(e)[:200],
+                    })
+                    continue
+
+                resp_hash = hashlib.md5(resp.content).hexdigest()
+                body_diff = abs(len(resp.content) - baseline["body_length"])
+
+                # IDOR indicators:
+                # 1. Got 200 with different content (different user data)
+                # 2. Not a generic error page
+                is_different_data = (
+                    resp.status_code == 200
+                    and resp_hash != baseline["body_hash"]
+                    and body_diff < baseline["body_length"] * 2
+                    and len(resp.content) > 50
+                )
+                body_lower = resp.text[:2000].lower()
+                is_error = any(
+                    kw in body_lower
+                    for kw in ("not found", "404", "error", "unauthorized",
+                               "forbidden", "denied", "invalid", "no access")
+                )
+                is_suspicious = is_different_data and not is_error
+
+                tests.append({
+                    "test": test_name,
+                    "id_value": str(test_id),
+                    "response_status": resp.status_code,
+                    "response_length": len(resp.content),
+                    "response_hash": resp_hash,
+                    "body_diff_bytes": body_diff,
+                    "same_as_baseline": resp_hash == baseline["body_hash"],
+                    "suspicious": is_suspicious,
+                    "response_preview": resp.text[:500] if is_suspicious else resp.text[:200],
+                })
+                if is_suspicious:
+                    vulnerable = True
+
+        elapsed = round(time.monotonic() - start, 1)
+        return {
+            "vulnerable": vulnerable,
+            "tests": tests,
+            "baseline": baseline,
+            "id_param": id_param,
+            "current_id": str(current_id),
+            "is_numeric": is_numeric,
+            "elapsed_s": elapsed,
+        }
+
+    # ── Internal helpers ────────────────────────────────────────────────
+
+    async def _send_with_client(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        method: str,
+        body: dict[str, Any] | None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Send request using an existing client."""
+        query_params = kwargs.pop("query_params", None)
+        send_kwargs: dict[str, Any] = {}
+        if kwargs.get("headers"):
+            send_kwargs["headers"] = kwargs["headers"]
+        if kwargs.get("cookies"):
+            send_kwargs["cookies"] = kwargs["cookies"]
+        if query_params:
+            send_kwargs["params"] = query_params
+
+        method_upper = method.upper()
+        if body is not None and method_upper in ("POST", "PUT", "PATCH"):
+            content_type = (send_kwargs.get("headers") or {}).get("content-type", "")
+            if "json" in content_type.lower():
+                send_kwargs["json"] = body
+            else:
+                send_kwargs["data"] = body
+        return await client.request(method_upper, url, **send_kwargs)

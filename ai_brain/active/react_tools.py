@@ -2125,6 +2125,70 @@ async def _dispatch(
 
         return {"_state_update": {"subtask_plan": current_plan}, "updated": subtask_id}
 
+    # ── Business Logic Testing Tools ($0 cost) ─────────────────────
+    _BIZLOGIC_TOOLS = {
+        "test_price_manipulation", "test_workflow_bypass", "test_rate_limit",
+        "test_parameter_pollution", "test_mass_assignment", "test_idor_sequential",
+    }
+    if tool_name in _BIZLOGIC_TOOLS:
+        from ai_brain.active.deterministic_tools import BusinessLogicScanner
+        scanner = BusinessLogicScanner(
+            deps.scope_guard,
+            timeout=deps.config.tools_timeout if hasattr(deps.config, "tools_timeout") else 15,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        if tool_name == "test_price_manipulation":
+            return await scanner.test_price_manipulation(
+                url=inp["url"],
+                method=inp.get("method", "POST"),
+                body=inp.get("body"),
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+                price_fields=inp.get("price_fields"),
+            )
+        if tool_name == "test_workflow_bypass":
+            return await scanner.test_workflow_bypass(
+                steps=inp["steps"],
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+            )
+        if tool_name == "test_rate_limit":
+            return await scanner.test_rate_limit(
+                url=inp["url"],
+                method=inp.get("method", "GET"),
+                body=inp.get("body"),
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+                num_requests=inp.get("num_requests", 50),
+            )
+        if tool_name == "test_parameter_pollution":
+            return await scanner.test_parameter_pollution(
+                url=inp["url"],
+                params=inp["params"],
+                method=inp.get("method", "GET"),
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+            )
+        if tool_name == "test_mass_assignment":
+            return await scanner.test_mass_assignment(
+                url=inp["url"],
+                method=inp.get("method", "POST"),
+                body=inp.get("body"),
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+                extra_fields=inp.get("extra_fields"),
+            )
+        if tool_name == "test_idor_sequential":
+            return await scanner.test_idor_sequential(
+                url=inp["url"],
+                id_param=inp["id_param"],
+                current_id=inp["current_id"],
+                method=inp.get("method", "GET"),
+                headers=inp.get("headers"),
+                cookies=inp.get("cookies"),
+                body=inp.get("body"),
+            )
+
     # ── External Functions API ──────────────────────────────────────
     from ai_brain.active.react_prompt import _EXTERNAL_ENDPOINTS
     if tool_name in _EXTERNAL_ENDPOINTS:
