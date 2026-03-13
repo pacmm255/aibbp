@@ -566,6 +566,7 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
     "test_cache_poisoning": "fuzz",
     "test_ghost_params": "fuzz",
     "test_prototype_pollution": "fuzz",
+    "test_oauth_security": "oauth",
     "scan_csrf": "csrf",
     "scan_error_responses": "error_disc",
     "scan_crlf": "crlf",
@@ -1368,6 +1369,15 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         work_queue_prompt=work_queue_prompt,
         capability_snapshot=capability_snapshot,
     )
+
+    # Append persistent facts (survive compression, always visible)
+    persistent_facts = state.get("persistent_facts", {})
+    if persistent_facts:
+        pf_lines = ["\n### Persistent Facts (extracted from conversations, never compressed)"]
+        for category, values in persistent_facts.items():
+            if values:
+                pf_lines.append(f"  **{category}**: {', '.join(str(v)[:100] for v in values[:15])}")
+        dynamic += "\n".join(pf_lines)
 
     # Prepend authorized target tag
     target_url = state.get("target_url", "?")
@@ -2794,6 +2804,108 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
     },
+    {
+        "name": "test_tenant_isolation",
+        "description": (
+            "Test cross-user access control (IDOR/BAC). User A creates a resource, "
+            "User B tries to access it. Confirms IDOR vulnerabilities with multi-user "
+            "differential evidence. Requires two authenticated sessions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "endpoint": {"type": "string", "description": "Endpoint to test access on (e.g., /api/users/123/profile)"},
+                "method": {"type": "string", "description": "HTTP method (GET, POST, PUT, DELETE)"},
+                "user_a_auth": {"type": "object", "description": "User A auth: {cookies: {...}, headers: {...}}"},
+                "user_b_auth": {"type": "object", "description": "User B auth: {cookies: {...}, headers: {...}}"},
+                "create_endpoint": {"type": "string", "description": "Optional: endpoint where User A creates the resource"},
+                "create_body": {"type": "object", "description": "Optional: body for the creation request"},
+            },
+            "required": ["endpoint", "method", "user_a_auth", "user_b_auth"],
+        },
+    },
+    # ── OOB & Chain Exploitation Tools ──
+    {
+        "name": "generate_oob_url",
+        "description": (
+            "Generate a unique out-of-band callback URL for blind vulnerability testing "
+            "(SSRF, XXE, RCE, Log4j). Inject this URL in payloads to detect blind vulns "
+            "that don't return data in-band. Check results later with check_oob_results."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "test_description": {"type": "string", "description": "What this test is checking for (e.g., 'blind SSRF via url param on /api/fetch')"},
+                "vuln_class": {"type": "string", "description": "Vulnerability class: ssrf, xxe, rce, log4j, xss, ldap"},
+            },
+            "required": ["test_description", "vuln_class"],
+        },
+    },
+    {
+        "name": "check_oob_results",
+        "description": (
+            "Check if any OOB (out-of-band) callbacks were received from previously injected "
+            "payloads. Returns confirmed blind vulnerabilities with correlation data. Call this "
+            "after injecting OOB URLs and waiting a few turns."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "exploit_chain",
+        "description": (
+            "Attempt to chain existing findings into higher-impact exploits. Auto-detects "
+            "exploitable combinations: leaked AWS Cognito credentials, GraphQL introspection → "
+            "mutations, CORS with credentials, open redirect + OAuth token theft, Datadog API "
+            "keys. Call with no args for auto-detection, or specify chain_type."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chain_type": {"type": "string", "description": "Optional: cognito_identity_pool, graphql_introspection, cors_with_credentials, open_redirect_oauth, datadog_api_key. Omit for auto-detection."},
+            },
+            "required": [],
+        },
+    },
+    # ── OAuth/SSO Security Testing ──
+    {
+        "name": "test_oauth_security",
+        "description": (
+            "Test OAuth/SSO endpoints for account takeover vulnerabilities. "
+            "Tests 20 redirect_uri bypass categories (path traversal, subdomain, "
+            "parameter pollution, encoding, fragment injection, localhost, scheme "
+            "change, wildcard, unicode, backslash, null byte, open redirect chain, "
+            "IDN homograph, IPv6, dot manipulation, port bypass), plus state/CSRF, "
+            "PKCE downgrade, authorization code reuse, token leakage via Referer, "
+            "and Dynamic Client Registration abuse. $0 LLM cost — pure HTTP testing. "
+            "Auto-discovers OAuth endpoints from OIDC/.well-known and login page links."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target URL to test for OAuth/SSO vulnerabilities",
+                },
+                "auth_endpoint": {
+                    "type": "string",
+                    "description": "Known OAuth authorization endpoint URL (optional, auto-discovered if empty)",
+                },
+                "client_id": {
+                    "type": "string",
+                    "description": "Known OAuth client_id (optional, extracted from login page links if empty)",
+                },
+                "redirect_uri": {
+                    "type": "string",
+                    "description": "Known legitimate redirect_uri (optional, extracted from login page links if empty)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
 ]
 
 _UTILITY_TOOLS: list[dict[str, Any]] = [
@@ -2801,7 +2913,7 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
         "name": "browser_interact",
         "description": (
             "Perform browser interactions: click elements, fill form fields, submit "
-            "forms, check checkboxes, select options, take screenshots, execute "
+            "forms, check checkboxes, select options, take screenshots, execute"
             "JavaScript. Use this for complex multi-step interactions that require "
             "a real browser (CSRF tokens, JavaScript-rendered content, multi-step forms)."
         ),
@@ -3896,6 +4008,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "update_knowledge", "build_app_model",
         "discover_workflows", "ingest_api_schema",  # Sprint 4: schema intelligence
         "run_role_differential", "create_role_account",  # Sprint 4: authz testing
+        "test_oauth_security",  # OAuth/SSO security scanning
     } | _UNIVERSAL_TOOLS,
     "exploitation": {
         "send_http_request", "test_sqli", "test_xss", "test_cmdi",
@@ -3910,6 +4023,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "scan_auth_bypass", "scan_csrf", "scan_error_responses", "scan_crlf", "scan_host_header",
         "scan_nosqli", "scan_xxe", "scan_deserialization", "scan_dos", "scan_jwt_deep",
         "profile_endpoint_behavior", "discover_chains", "solve_captcha",
+        "test_oauth_security",
         "update_knowledge", "update_working_memory", "read_working_memory",
         "get_playbook", "get_proxy_traffic", "manage_chain", "deep_research",
         "finish_test",
@@ -3917,6 +4031,9 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "create_role_account", "run_role_differential",
         "discover_workflows", "test_workflow_invariant", "test_step_skipping",
         "track_object_ownership", "ingest_api_schema",
+        "test_tenant_isolation",
+        # OOB & Chain Exploitation
+        "generate_oob_url", "check_oob_results", "exploit_chain",
     } | _UNIVERSAL_TOOLS,
     "post_exploit": {
         "send_http_request", "run_custom_exploit", "blind_sqli_extract",
@@ -3928,6 +4045,9 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         # Sprint 4: AuthZ & Schema Intelligence
         "run_role_differential", "test_workflow_invariant",
         "test_step_skipping", "track_object_ownership",
+        "test_tenant_isolation",
+        # OOB & Chain Exploitation
+        "generate_oob_url", "check_oob_results", "exploit_chain",
     } | _UNIVERSAL_TOOLS,
     # ── Hard Phase Gate: reporting ──
     # Minimal tool set — only knowledge, submit, and finish

@@ -62,14 +62,29 @@ _GLOBAL_OBSERVATIONS: list[Observation] = []
 _MAX_OBSERVATIONS = 200
 
 
-async def _http_rate_limit() -> None:
-    """Wait if needed to enforce global HTTP rate limit."""
+async def _http_rate_limit(url: str = "") -> None:
+    """Wait if needed to enforce global HTTP rate limit.
+
+    Uses AdaptiveRateController for per-host delays when available,
+    falls back to fixed 1.0s baseline.
+    """
     global _last_http_request_time
     async with _http_rate_lock:
         now = time.monotonic()
+        # Try adaptive delay from rate controller
+        delay = _HTTP_RATE_LIMIT_SECONDS
+        if url:
+            try:
+                from urllib.parse import urlparse
+                from ai_brain.active.react_graph import _rate_controller
+                host = urlparse(url).hostname or ""
+                if host:
+                    delay = _rate_controller.get_delay(host)
+            except Exception:
+                pass  # Fall back to fixed delay
         elapsed = now - _last_http_request_time
-        if elapsed < _HTTP_RATE_LIMIT_SECONDS:
-            await asyncio.sleep(_HTTP_RATE_LIMIT_SECONDS - elapsed)
+        if elapsed < delay:
+            await asyncio.sleep(delay - elapsed)
         _last_http_request_time = time.monotonic()
 
 
@@ -106,6 +121,8 @@ class ToolDeps:
     default_headers: dict[str, str] = field(default_factory=dict)  # Custom headers for bug bounty programs
     verifier: Any | None = None  # Verifier (proof pack generator)
     policy_manifest: Any | None = None  # PolicyManifest
+    oob_manager: Any | None = None  # OOBManager (out-of-band callback detection)
+    authz_orchestrator: Any | None = None  # AuthzOrchestrator (multi-role authz testing)
     _cf_cookie_jar: dict[str, tuple[float, dict[str, str]]] = field(default_factory=dict)  # domain -> (timestamp, cookies)
 
 
@@ -589,9 +606,31 @@ async def _dispatch(
                 "evidence_score_reason": f"confirmed: verified {cat} content pattern",
             }
 
-        state_update = {}
+        state_update: dict[str, Any] = {}
         if auto_findings:
             state_update["findings"] = auto_findings
+
+        # Feed extracted paths back into endpoint list for further testing
+        extracted = result.get("extracted_paths", [])
+        if extracted:
+            base_url = inp["url"].rstrip("/")
+            ep_update: dict[str, Any] = {}
+            for ep in extracted[:200]:  # Cap at 200 to avoid state bloat
+                ep_path = ep.get("path", "")
+                source = ep.get("source", "unknown")
+                if ep_path.startswith("http"):
+                    ep_url = ep_path
+                else:
+                    ep_url = f"{base_url}{ep_path}"
+                ep_update[ep_url] = {
+                    "method": "GET",
+                    "notes": f"discovered from {source}",
+                    "auth_required": None,  # Unknown — needs probing
+                }
+            if ep_update:
+                state_update["endpoints"] = ep_update
+            logger.info("paths_fed_to_attack_surface", count=len(ep_update), sources=list({e.get("source") for e in extracted}))
+
         return {**result, "_state_update": state_update} if state_update else result
 
     if tool_name == "scan_auth_bypass":
@@ -1094,9 +1133,17 @@ async def _dispatch(
                     logger.debug("auto_waf_fingerprint_failed", error=str(e)[:80])
 
     if tool_name == "test_sqli":
+        _sqli_params = inp.get("params")
+        if isinstance(_sqli_params, str):
+            # Brain passed a string instead of dict — try to parse it
+            import json as _json
+            try:
+                _sqli_params = _json.loads(_sqli_params)
+            except (ValueError, TypeError):
+                _sqli_params = None
         return await deps.tool_runner.run_sqlmap(
             url=inp["url"],
-            params=inp.get("params"),
+            params=_sqli_params if isinstance(_sqli_params, dict) else None,
             options=inp.get("options"),
         )
 
@@ -1318,7 +1365,7 @@ async def _dispatch(
             client_kwargs["proxy"] = proxy_url
 
         async def _do_request(req_headers: dict, req_cookies: dict | None = None) -> dict:
-            await _http_rate_limit()  # Global rate limit
+            await _http_rate_limit(url)  # Adaptive per-host rate limit
             kw = dict(client_kwargs)
             if req_cookies is not None:
                 kw["cookies"] = req_cookies
@@ -1381,6 +1428,18 @@ async def _dispatch(
                     result["cloudflare_bypassed"] = False
             else:
                 result["cloudflare_bypassed"] = False
+
+        # Feed response to adaptive rate controller
+        try:
+            from urllib.parse import urlparse as _urlparse_rc
+            from ai_brain.active.react_graph import _rate_controller
+            _rc_host = _urlparse_rc(url).hostname or ""
+            if _rc_host:
+                _rate_controller.record_response(
+                    _rc_host, result.get("status_code", 0), result.get("headers", {}),
+                )
+        except Exception:
+            pass
 
         return result
 
@@ -1585,7 +1644,24 @@ async def _dispatch(
     if tool_name == "response_diff_analyze":
         from ai_brain.active.deterministic_tools import ResponseDiffAnalyzer
         analyzer = ResponseDiffAnalyzer(deps.scope_guard, socks_proxy=deps.goja_socks5_url)
-        return await analyzer.analyze(**inp)
+        # Ensure base_request and test_requests are dicts/lists (brain may pass JSON strings)
+        _base_req = inp.get("base_request", {})
+        if isinstance(_base_req, str):
+            try:
+                _base_req = json.loads(_base_req)
+            except (ValueError, TypeError):
+                return {"error": "base_request must be a JSON object, not a string"}
+        _test_reqs = inp.get("test_requests", [])
+        if isinstance(_test_reqs, str):
+            try:
+                _test_reqs = json.loads(_test_reqs)
+            except (ValueError, TypeError):
+                return {"error": "test_requests must be a JSON array, not a string"}
+        return await analyzer.analyze(
+            base_request=_base_req,
+            test_requests=_test_reqs,
+            baseline_samples=inp.get("baseline_samples", 3),
+        )
 
     if tool_name == "systematic_fuzz":
         from ai_brain.active.deterministic_tools import SystematicFuzzer
@@ -1934,6 +2010,9 @@ async def _dispatch(
         }
 
     if tool_name == "test_ssrf":
+        _ssrf_param = inp.get("param", "")
+        if not _ssrf_param:
+            return {"error": "test_ssrf requires a 'param' parameter (the URL-accepting parameter name to test, e.g. 'url', 'callback', 'redirect')"}
         from ai_brain.active.deterministic_tools import SSRFTester
         tester = SSRFTester(
             deps.scope_guard,
@@ -1943,7 +2022,7 @@ async def _dispatch(
         try:
             return await tester.test(
                 url=inp["url"],
-                param=inp["param"],
+                param=_ssrf_param,
                 method=inp.get("method", "GET"),
                 cookies=inp.get("cookies"),
                 headers=inp.get("headers"),
@@ -2045,6 +2124,508 @@ async def _dispatch(
             )
         finally:
             await tester.close()
+
+    # ── OOB & Chain Exploitation Tools ──────────────────────────────
+    if tool_name == "generate_oob_url":
+        oob_mgr = getattr(deps, "oob_manager", None)
+        if not oob_mgr:
+            return {"error": "OOB manager not available. Start agent with OOB support enabled."}
+        test_desc = inp.get("test_description", "blind test")
+        vuln_class = inp.get("vuln_class", "ssrf")
+        target = ""
+        if deps.current_state:
+            target = deps.current_state.get("target_url", "")
+        try:
+            url = oob_mgr.generate_url(test_desc, vuln_class, target=target)
+            payloads = oob_mgr.generate_payloads(test_desc, vuln_class, target=target)
+            return {
+                "oob_url": url,
+                "payloads": payloads,
+                "pending_count": oob_mgr.get_pending_count(),
+                "instruction": (
+                    f"Inject this URL in your payloads to detect blind {vuln_class}. "
+                    "After a few turns, call check_oob_results to see if any callbacks arrived."
+                ),
+            }
+        except Exception as e:
+            return {"error": f"OOB URL generation failed: {e}"}
+
+    if tool_name == "check_oob_results":
+        oob_mgr = getattr(deps, "oob_manager", None)
+        if not oob_mgr:
+            return {"error": "OOB manager not available.", "callbacks": []}
+        try:
+            callbacks = await oob_mgr.check_callbacks()
+            results = []
+            for cb in callbacks:
+                results.append({
+                    "vuln_class": cb.test.vuln_class,
+                    "test_description": cb.test.test_description,
+                    "protocol": cb.protocol,
+                    "target": cb.test.target,
+                    "parameter": cb.test.parameter,
+                    "remote_address": cb.remote_address,
+                    "confirmed": True,
+                })
+            all_confirmed = oob_mgr.get_all_confirmed()
+            return {
+                "new_callbacks": results,
+                "total_confirmed": len(all_confirmed),
+                "pending_count": oob_mgr.get_pending_count(),
+            }
+        except Exception as e:
+            return {"error": f"OOB check failed: {e}", "callbacks": []}
+
+    if tool_name == "exploit_chain":
+        from ai_brain.active.chain_exploiter import ChainExploiter
+        ce = ChainExploiter()
+        chain_type = inp.get("chain_type", "")
+        findings = {}
+        if deps.current_state:
+            findings = deps.current_state.get("findings", {})
+        if not findings:
+            return {"error": "No findings to chain. Discover vulnerabilities first."}
+
+        try:
+            if chain_type:
+                # Specific chain type
+                opportunities = await ce.check_exploitable(findings)
+                matching = [o for o in opportunities if o.chain_type == chain_type]
+                if not matching:
+                    return {"error": f"No {chain_type} chain opportunity found in current findings.",
+                            "available_chains": [o.chain_type for o in opportunities]}
+                result = await ce.exploit_chain(matching[0])
+            else:
+                # Auto-detect all chains
+                results = await ce.auto_exploit_all(findings)
+                if not results:
+                    opportunities = await ce.check_exploitable(findings)
+                    return {
+                        "message": "No exploitable chains detected.",
+                        "opportunities_checked": len(opportunities),
+                    }
+                successful = [r for r in results if r.success]
+                failed = [r for r in results if not r.success]
+                chain_findings: dict[str, Any] = {}
+                for r in successful:
+                    fid = f"chain_{r.chain_type}_{hashlib.md5(r.evidence[:50].encode()).hexdigest()[:8]}"
+                    chain_findings[fid] = {
+                        "vuln_type": r.chain_type,
+                        "endpoint": "",
+                        "parameter": "",
+                        "evidence": r.evidence,
+                        "severity": r.severity,
+                        "confirmed": True,
+                        "tool_used": "exploit_chain",
+                        "evidence_score": 5,
+                        "evidence_score_reason": f"chain_exploited: {r.chain_type}",
+                    }
+                state_update = {"findings": chain_findings} if chain_findings else {}
+                return {
+                    "successful_chains": len(successful),
+                    "failed_chains": len(failed),
+                    "results": [{"chain": r.chain_type, "success": r.success,
+                                 "evidence": r.evidence[:500], "error": r.error} for r in results],
+                    "_state_update": state_update,
+                }
+
+            # Single chain result
+            if result.success:
+                fid = f"chain_{result.chain_type}_{hashlib.md5(result.evidence[:50].encode()).hexdigest()[:8]}"
+                state_update = {"findings": {fid: {
+                    "vuln_type": result.chain_type,
+                    "endpoint": "",
+                    "parameter": "",
+                    "evidence": result.evidence,
+                    "severity": result.severity,
+                    "confirmed": True,
+                    "tool_used": "exploit_chain",
+                    "evidence_score": 5,
+                    "evidence_score_reason": f"chain_exploited: {result.chain_type}",
+                    "proof_pack": result.proof_pack,
+                }}}
+                return {
+                    "success": True,
+                    "chain_type": result.chain_type,
+                    "severity": result.severity,
+                    "evidence": result.evidence,
+                    "_state_update": state_update,
+                }
+            else:
+                return {
+                    "success": False,
+                    "chain_type": result.chain_type,
+                    "error": result.error,
+                }
+        except Exception as e:
+            return {"error": f"Chain exploitation failed: {e}"}
+
+    # ── OAuth/SSO Security Testing ─────────────────────────────────────
+    if tool_name == "test_oauth_security":
+        from ai_brain.active.oauth_attack_engine import OAuthAttackEngine
+        engine = OAuthAttackEngine(
+            scope_guard=deps.scope_guard,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        target_url = inp["url"]
+        auth_endpoint = inp.get("auth_endpoint", "")
+        client_id = inp.get("client_id", "")
+        redirect_uri = inp.get("redirect_uri", "")
+
+        scan_result = await engine.full_scan(
+            target_url,
+            auth_endpoint=auth_endpoint,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+        )
+
+        # Auto-generate findings for confirmed vulnerabilities
+        auto_findings: dict[str, Any] = {}
+        for section in [
+            "redirect_uri_bypasses", "state_parameter", "pkce_downgrade",
+            "token_leakage", "dcr_abuse",
+        ]:
+            for finding in scan_result.get(section, []):
+                if not finding.get("vulnerable"):
+                    continue
+                technique = finding.get("technique", "unknown")
+                desc = finding.get("description", "")
+                payload = finding.get("payload", "")
+                severity = finding.get("severity", "medium")
+                fid = (
+                    f"oauth_{technique}_"
+                    f"{hashlib.md5((payload or desc).encode(errors='replace')).hexdigest()[:8]}"
+                )
+                auto_findings[fid] = {
+                    "vuln_type": "oauth_misconfiguration",
+                    "endpoint": auth_endpoint or target_url,
+                    "parameter": "redirect_uri" if section == "redirect_uri_bypasses" else technique,
+                    "evidence": (
+                        f"OAuth {technique}: {desc} "
+                        f"Payload: {payload[:200]}. "
+                        f"Response: HTTP {finding.get('response_status', 'N/A')}. "
+                        f"{finding.get('evidence', '')}"
+                    ),
+                    "severity": severity,
+                    "confirmed": True,
+                    "tool_used": "test_oauth_security",
+                    "evidence_score": 4,
+                    "evidence_score_reason": f"confirmed: OAuth server accepted malicious {technique}",
+                }
+                cves = finding.get("cves", [])
+                if cves:
+                    auto_findings[fid]["evidence"] += f" Related CVEs: {', '.join(cves)}"
+
+        state_update: dict[str, Any] = {}
+        if auto_findings:
+            state_update["findings"] = auto_findings
+
+        if state_update:
+            scan_result["_state_update"] = state_update
+
+        return scan_result
+
+    # ── AuthZ & Schema Intelligence Tool Handlers ────────────────────
+    if tool_name == "create_role_account":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        from ai_brain.active.authz_orchestrator import RoleContext
+        role = inp.get("role", "user")
+        ctx = RoleContext(
+            username=inp.get("username", ""),
+            password=inp.get("password", ""),
+            role=role,
+            cookies=inp.get("cookies", {}),
+            session_token=inp.get("session_token", ""),
+            headers=inp.get("headers", {}),
+        )
+        authz_orch.register_role(role, ctx)
+        return {
+            "registered": True,
+            "role": role,
+            "username": ctx.username,
+            "capabilities_discovered": 0,
+            "_state_update": {"role_contexts": {role: ctx.to_dict()}},
+        }
+
+    if tool_name == "run_role_differential":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        from ai_brain.active.authz_orchestrator import RoleContext
+        role_a_name = inp.get("role_a", "")
+        role_b_name = inp.get("role_b", "")
+        endpoint = inp.get("endpoint", "")
+        method = inp.get("method", "GET")
+        if not role_a_name or not role_b_name:
+            return {"error": "Both role_a and role_b are required."}
+        ctx_a = authz_orch.get_role_context(role_a_name)
+        ctx_b = authz_orch.get_role_context(role_b_name)
+        if not ctx_a:
+            return {"error": f"Role '{role_a_name}' not registered. Use create_role_account first."}
+        if not ctx_b:
+            return {"error": f"Role '{role_b_name}' not registered. Use create_role_account first."}
+        try:
+            findings = await authz_orch.run_role_pair_test(
+                ctx_a, ctx_b, endpoint, method, inp.get("body"),
+            )
+            state_update: dict[str, Any] = {}
+            if findings:
+                finding_dict: dict[str, Any] = {}
+                for f in findings:
+                    fid = f"authz_{hashlib.md5(f'{endpoint}_{role_a_name}_{role_b_name}'.encode()).hexdigest()[:8]}"
+                    f["evidence_score"] = 4
+                    f["evidence_score_reason"] = "multi-role differential test"
+                    finding_dict[fid] = f
+                state_update["findings"] = finding_dict
+            return {
+                "findings_count": len(findings),
+                "findings": findings,
+                "_state_update": state_update,
+            }
+        except Exception as e:
+            return {"error": f"Role differential test failed: {e}"}
+
+    if tool_name == "discover_workflows":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        # Return currently discovered workflows
+        workflows = {name: wf.to_dict() for name, wf in authz_orch._workflows.items()}
+        # If brain provides workflow definitions, register them
+        new_workflows = inp.get("workflows", [])
+        if new_workflows:
+            from ai_brain.active.authz_orchestrator import Workflow
+            for wf_data in new_workflows:
+                wf = Workflow.from_dict(wf_data)
+                if wf.name:
+                    authz_orch.register_workflow(wf)
+                    workflows[wf.name] = wf.to_dict()
+        return {
+            "workflows": workflows,
+            "count": len(workflows),
+            "_state_update": {"discovered_workflows": workflows} if workflows else {},
+        }
+
+    if tool_name == "test_workflow_invariant":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        workflow_name = inp.get("workflow_name", "")
+        role = inp.get("role", "")
+        wf = authz_orch._workflows.get(workflow_name)
+        if not wf:
+            return {"error": f"Workflow '{workflow_name}' not found. Use discover_workflows first.",
+                    "available": list(authz_orch._workflows.keys())}
+        ctx = authz_orch.get_role_context(role) if role else None
+        if not ctx:
+            return {"error": f"Role '{role}' not registered. Use create_role_account first."}
+        try:
+            findings = await authz_orch.test_workflow_invariants(wf, ctx)
+            return {"findings_count": len(findings), "findings": findings}
+        except Exception as e:
+            return {"error": f"Workflow invariant test failed: {e}"}
+
+    if tool_name == "test_step_skipping":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        workflow_name = inp.get("workflow_name", "")
+        role = inp.get("role", "")
+        wf = authz_orch._workflows.get(workflow_name)
+        if not wf:
+            return {"error": f"Workflow '{workflow_name}' not found. Use discover_workflows first.",
+                    "available": list(authz_orch._workflows.keys())}
+        ctx = authz_orch.get_role_context(role) if role else None
+        if not ctx:
+            return {"error": f"Role '{role}' not registered. Use create_role_account first."}
+        try:
+            findings = await authz_orch.test_step_skipping(wf, ctx)
+            state_update = {}
+            if findings:
+                finding_dict = {}
+                for f in findings:
+                    _ep = f.get("endpoint", "")
+                    fid = f"stepskip_{hashlib.md5(f'{workflow_name}_{_ep}'.encode()).hexdigest()[:8]}"
+                    f["evidence_score"] = 3
+                    f["evidence_score_reason"] = "step skipping succeeded"
+                    finding_dict[fid] = f
+                state_update["findings"] = finding_dict
+            return {
+                "findings_count": len(findings),
+                "findings": findings,
+                "_state_update": state_update,
+            }
+        except Exception as e:
+            return {"error": f"Step skipping test failed: {e}"}
+
+    if tool_name == "track_object_ownership":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        role = inp.get("role", "")
+        endpoint = inp.get("endpoint", "")
+        object_id = inp.get("object_id", "")
+        if not role or not endpoint:
+            return {"error": "Both role and endpoint are required."}
+        if object_id:
+            # Direct registration
+            lineage = authz_orch.track_object_lineage(
+                role, endpoint, {"body": {"id": object_id}},
+            )
+            if lineage:
+                return {
+                    "tracked": True,
+                    "object_id": lineage.object_id,
+                    "resource_type": lineage.resource_type,
+                    "_state_update": {"object_lineage": {lineage.object_id: lineage.to_dict()}},
+                }
+        return {"tracked": False, "note": "No object ID provided or extracted."}
+
+    if tool_name == "ingest_api_schema":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        schema_url = inp.get("schema_url", "")
+        schema_data = inp.get("schema", {})
+        if not schema_url and not schema_data:
+            # Auto-probe common spec URLs
+            target_url = ""
+            if deps.current_state:
+                target_url = deps.current_state.get("target_url", "")
+            if not target_url:
+                return {"error": "No schema_url or schema provided, and no target_url in state."}
+            from urllib.parse import urljoin
+            probe_paths = [
+                "/openapi.json", "/swagger.json", "/api-docs", "/v2/api-docs",
+                "/api/openapi.json", "/api/swagger.json", "/.well-known/openapi",
+                "/graphql", "/api/graphql",
+            ]
+            found_schema = None
+            for path in probe_paths:
+                try:
+                    await _http_rate_limit(target_url)
+                    async with httpx.AsyncClient(verify=False, timeout=10) as c:
+                        resp = await c.get(urljoin(target_url, path))
+                        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith(("application/json", "text/json")):
+                            found_schema = resp.json()
+                            schema_url = urljoin(target_url, path)
+                            break
+                except Exception:
+                    continue
+            if not found_schema:
+                return {"probed": len(probe_paths), "found": False, "note": "No API schema found at common paths."}
+            schema_data = found_schema
+
+        # Extract endpoints from schema
+        endpoints_found = []
+        paths = schema_data.get("paths", {})
+        for path, methods in paths.items():
+            if isinstance(methods, dict):
+                for method in methods:
+                    if method.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                        endpoints_found.append({"path": path, "method": method.upper()})
+        return {
+            "schema_url": schema_url,
+            "endpoints_found": len(endpoints_found),
+            "endpoints": endpoints_found[:50],  # Cap at 50
+            "_state_update": {"api_schema": schema_data} if schema_data else {},
+        }
+
+    if tool_name == "test_tenant_isolation":
+        authz_orch = getattr(deps, "authz_orchestrator", None)
+        if not authz_orch:
+            return {"error": "AuthZ orchestrator not available."}
+        endpoint = inp.get("endpoint", "")
+        method = inp.get("method", "GET")
+        user_a_auth = inp.get("user_a_auth", {})
+        user_b_auth = inp.get("user_b_auth", {})
+        create_endpoint = inp.get("create_endpoint", "")
+        create_body = inp.get("create_body", {})
+
+        if not endpoint:
+            return {"error": "endpoint is required."}
+        if not user_a_auth or not user_b_auth:
+            return {"error": "Both user_a_auth and user_b_auth are required (cookies/headers)."}
+
+        try:
+            await _http_rate_limit(endpoint)
+            async with httpx.AsyncClient(verify=False, timeout=15) as tc:
+                # Step 1: User A creates resource (if create_endpoint provided)
+                resource_id = None
+                create_dump = ""
+                if create_endpoint:
+                    deps.scope_guard.validate_url(create_endpoint)
+                    a_headers = user_a_auth.get("headers", {})
+                    a_cookies = user_a_auth.get("cookies", {})
+                    create_resp = await tc.request(
+                        "POST", create_endpoint, json=create_body,
+                        headers=a_headers, cookies=a_cookies,
+                    )
+                    create_dump = f"POST {create_endpoint}\nStatus: {create_resp.status_code}\n{create_resp.text[:1000]}"
+                    # Extract resource ID from response
+                    try:
+                        create_json = create_resp.json()
+                        resource_id = str(create_json.get("id", create_json.get("_id", "")))
+                    except Exception:
+                        pass
+
+                # Step 2: User A accesses resource
+                deps.scope_guard.validate_url(endpoint)
+                a_headers = user_a_auth.get("headers", {})
+                a_cookies = user_a_auth.get("cookies", {})
+                resp_a = await tc.request(method, endpoint, headers=a_headers, cookies=a_cookies)
+                dump_a = f"{method} {endpoint}\nUser A Status: {resp_a.status_code}\n{resp_a.text[:1000]}"
+
+                # Step 3: User B tries the same endpoint
+                await _http_rate_limit(endpoint)
+                b_headers = user_b_auth.get("headers", {})
+                b_cookies = user_b_auth.get("cookies", {})
+                resp_b = await tc.request(method, endpoint, headers=b_headers, cookies=b_cookies)
+                dump_b = f"{method} {endpoint}\nUser B Status: {resp_b.status_code}\n{resp_b.text[:1000]}"
+
+            # Analysis
+            is_idor = False
+            if resp_a.status_code < 400 and resp_b.status_code < 400:
+                # Both can access — check body similarity
+                len_a, len_b = len(resp_a.text), len(resp_b.text)
+                if len_a > 0 and len_b > 0:
+                    ratio = min(len_a, len_b) / max(len_a, len_b)
+                    if ratio > 0.8:
+                        is_idor = True
+            elif resp_a.status_code < 400 and resp_b.status_code >= 400:
+                is_idor = False  # Properly denied
+
+            result_data: dict[str, Any] = {
+                "user_a_status": resp_a.status_code,
+                "user_b_status": resp_b.status_code,
+                "is_idor": is_idor,
+                "request_dump_a": dump_a,
+                "request_dump_b": dump_b,
+            }
+            if create_dump:
+                result_data["create_dump"] = create_dump
+                result_data["resource_id"] = resource_id
+
+            if is_idor:
+                fid = f"idor_{hashlib.md5(f'{endpoint}_{method}'.encode()).hexdigest()[:8]}"
+                result_data["_state_update"] = {"findings": {fid: {
+                    "vuln_type": "idor",
+                    "endpoint": endpoint,
+                    "method": method,
+                    "severity": "high",
+                    "evidence": f"Cross-user access confirmed. User A ({resp_a.status_code}) and User B ({resp_b.status_code}) both access {endpoint}.",
+                    "confirmed": True,
+                    "tool_used": "test_tenant_isolation",
+                    "evidence_score": 4,
+                    "evidence_score_reason": "multi-user differential test",
+                    "request_dump": dump_a,
+                    "response_dump": dump_b,
+                }}}
+            return result_data
+        except Exception as e:
+            return {"error": f"Tenant isolation test failed: {e}"}
 
     if tool_name == "finish_test":
         # In indefinite mode, reject finish and tell brain to keep going
@@ -2620,6 +3201,10 @@ _REAL_TOOL_NAMES = frozenset({
     "discover_auth_endpoints",
     "build_app_model",
     "recon_blitz_opus",
+    "generate_oob_url", "check_oob_results", "exploit_chain",
+    "create_role_account", "run_role_differential", "discover_workflows",
+    "test_workflow_invariant", "test_step_skipping", "track_object_ownership",
+    "ingest_api_schema", "test_tenant_isolation", "oob_auto_poll", "authz_orchestrator",
 })
 
 # ── Anti-fabrication: reject summary/meta vuln types ──
@@ -2776,6 +3361,19 @@ def _score_evidence(finding: dict) -> tuple[int, str]:
         if entropy_signals >= 3 and len(val) >= 16:
             return 5, f"definitive: high-entropy secret ({len(val)} chars)"
 
+    # Score 4 for leaked API keys/tokens in KEY_NAME: value format
+    # Matches patterns like SEGMENT_KEY: xxx, DD_CLIENT_TOKEN: xxx, AWS_IDENTITY_POOL_ID: xxx
+    _api_key_patterns = re.findall(
+        r"(?:_KEY|_TOKEN|_SECRET|_ID|_APIKEY|POOL_ID|CLIENT_TOKEN)\s*[:=]\s*(\S{10,})",
+        evidence, re.IGNORECASE,
+    )
+    if len(_api_key_patterns) >= 2:
+        return 4, f"confirmed_data: {len(_api_key_patterns)} API keys/tokens leaked"
+    elif len(_api_key_patterns) == 1:
+        val = _api_key_patterns[0].strip("\"',")
+        if len(val) >= 16 and re.search(r"[a-zA-Z]", val) and re.search(r"[0-9]", val):
+            return 4, f"confirmed_data: API key leaked ({len(val)} chars)"
+
     # Score 4: Confirmed indicators — actual data content (hard to fabricate)
     # These patterns match on actual response DATA, not narrative claims
     _CONFIRMED_DATA = [
@@ -2784,7 +3382,7 @@ def _score_evidence(finding: dict) -> tuple[int, str]:
         re.compile(r"<\?php|<\?=", re.IGNORECASE),
         re.compile(r"(?:total|drwx|lrwx)[\s\-]", re.IGNORECASE),  # directory listing
         re.compile(r"(?:BEGIN|-----BEGIN)\s+(?:RSA|CERTIFICATE|PRIVATE)", re.IGNORECASE),
-        re.compile(r"(?:DB_|API_|SECRET|AWS_)[A-Z_]+=\S+", re.IGNORECASE),  # env file
+        re.compile(r"(?:DB_|API_|SECRET|AWS_)[A-Z_]+[=:]\s*\S+", re.IGNORECASE),  # env file or config leak
         re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT token
         re.compile(r"flag\{[^}]+\}", re.IGNORECASE),  # CTF flag
     ]
@@ -2861,6 +3459,105 @@ def _score_evidence(finding: dict) -> tuple[int, str]:
         return 1, "weak: narrative claims without raw HTTP data"
 
     return 1, "weak: no concrete response signals detected"
+
+
+def _verify_claim_against_transcript(finding: dict) -> tuple[bool, str]:
+    """Deterministic per-vuln-type verification of claims against HTTP data.
+
+    Checks that the claimed vulnerability is actually evidenced in the
+    request_dump / response_dump / evidence text.  Returns (passed, reason).
+    """
+    vuln_type = _canonicalize_vuln_type(str(finding.get("vuln_type", "")))
+    evidence = str(finding.get("evidence", ""))
+    response_dump = str(finding.get("response_dump", ""))
+    transcript = response_dump if response_dump else evidence
+
+    # Split evidence into raw portion (after "--- RAW TOOL OUTPUT ---") and narrative
+    raw_section = ""
+    if "--- RAW TOOL OUTPUT ---" in evidence:
+        raw_section = evidence.split("--- RAW TOOL OUTPUT ---", 1)[1]
+    elif response_dump:
+        raw_section = response_dump
+
+    if not raw_section and not response_dump:
+        # No HTTP data at all — can't verify
+        return True, "no_transcript_to_verify"
+
+    body = raw_section or transcript
+
+    if vuln_type in ("ssti", "template_injection"):
+        # SSTI: "49" must appear in response body, and "{{7*7}}" should NOT be in response
+        # (if template is interpreted, input is consumed)
+        if "49" in body and "{{7*7}}" not in body:
+            return True, "ssti_verified: 49 in response without template syntax"
+        if "${7*7}" in evidence and "49" in body:
+            return True, "ssti_verified: 49 in response"
+        return False, "ssti_unverified: no evidence of template evaluation in response"
+
+    if vuln_type in ("xss", "cross_site_scripting"):
+        # XSS: unescaped payload must appear in HTML response with text/html content-type
+        if re.search(r'<script[^>]*>.*?</script>', body, re.IGNORECASE | re.DOTALL):
+            return True, "xss_verified: unescaped script tag in response"
+        if re.search(r'on\w+\s*=\s*["\']', body, re.IGNORECASE):
+            return True, "xss_verified: event handler in response"
+        # Check for reflected payload markers
+        if "<img" in body.lower() and "onerror" in body.lower():
+            return True, "xss_verified: img onerror in response"
+        return False, "xss_unverified: no unescaped payload in response body"
+
+    if vuln_type in ("sqli", "sql_injection"):
+        # SQLi: SQL error syntax or extracted rows in response
+        sql_error_patterns = [
+            r"SQL syntax.*?near", r"mysql_fetch", r"pg_query",
+            r"ORA-\d{5}", r"SQLITE_ERROR", r"syntax error.*?at.*?line",
+            r"Unclosed quotation mark", r"quoted string not properly terminated",
+        ]
+        for pat in sql_error_patterns:
+            if re.search(pat, body, re.IGNORECASE):
+                return True, f"sqli_verified: SQL error pattern in response"
+        # Check for data extraction evidence
+        if re.search(r'(?:root|admin|user).*?(?:password|passwd|hash)', body, re.IGNORECASE):
+            return True, "sqli_verified: extracted credentials in response"
+        return False, "sqli_unverified: no SQL error or extracted data in response"
+
+    if vuln_type in ("ssrf", "server_side_request_forgery"):
+        # SSRF: internal IP/metadata in response
+        ssrf_indicators = [
+            r"169\.254\.169\.254", r"127\.0\.0\.1", r"localhost",
+            r"10\.\d+\.\d+\.\d+", r"172\.(?:1[6-9]|2\d|3[01])\.",
+            r"192\.168\.\d+\.\d+", r"ami-id", r"instance-id",
+        ]
+        for pat in ssrf_indicators:
+            if re.search(pat, body, re.IGNORECASE):
+                return True, f"ssrf_verified: internal data in response"
+        return False, "ssrf_unverified: no internal IP/metadata in response"
+
+    if vuln_type == "xxe":
+        # XXE: file content (not SPA HTML) in response
+        if re.search(r'root:x:0:0', body):
+            return True, "xxe_verified: /etc/passwd content in response"
+        if re.search(r'\[boot loader\]|\[operating systems\]', body, re.IGNORECASE):
+            return True, "xxe_verified: boot.ini content in response"
+        # Check it's not just SPA HTML
+        if '<div id="root"' in body or '<div id="__next"' in body:
+            return False, "xxe_unverified: response is SPA HTML, not file content"
+        return True, "xxe_passthrough"  # Can't definitively reject
+
+    if vuln_type == "information_disclosure":
+        # Info disclosure: actual secret content in response, not just path match
+        secret_patterns = [
+            r'(?:password|secret|api_key|private_key|access_token)\s*[=:]\s*\S{8,}',
+            r'-----BEGIN (?:RSA )?PRIVATE KEY-----',
+            r'AKIA[A-Z0-9]{16}',  # AWS access key
+            r'sk-[a-zA-Z0-9]{20,}',  # OpenAI key
+        ]
+        for pat in secret_patterns:
+            if re.search(pat, body, re.IGNORECASE):
+                return True, "info_disclosure_verified: actual secret in response"
+        return True, "info_disclosure_passthrough"  # Too varied to reject definitively
+
+    # Default: pass-through for vuln types without specific verification
+    return True, f"passthrough: no specific verification for {vuln_type}"
 
 
 def _get_matching_tool_result(finding: dict, deps: ToolDeps | None) -> str:
@@ -3532,6 +4229,41 @@ async def _validate_findings(
             info["evidence_score"] = score
             info["evidence_score_reason"] = score_reason
             min_score = 4 if severity in ("critical", "high") else 3
+
+            # ── Anti-fabrication gate 3c: HTTP transcript grounding ──
+            # Reject findings with no HTTP data unless from tool_auto source
+            request_dump = str(info.get("request_dump", ""))
+            response_dump = str(info.get("response_dump", ""))
+            has_any_http = (
+                bool(request_dump.strip()) or
+                bool(response_dump.strip()) or
+                _has_raw_http_artifacts(evidence)
+            )
+            if not has_any_http and score < 5:
+                # Try to enrich from tool results first
+                if deps:
+                    _enrich_findings_with_tool_results({fid: info}, deps)
+                    # Re-check after enrichment
+                    has_any_http = (
+                        bool(str(info.get("request_dump", "")).strip()) or
+                        bool(str(info.get("response_dump", "")).strip()) or
+                        _has_raw_http_artifacts(str(info.get("evidence", "")))
+                    )
+                if not has_any_http:
+                    logger.warning(
+                        "finding_rejected_no_http_transcript",
+                        finding_id=fid, vuln_type=vuln_type,
+                    )
+                    continue
+
+            # ── Anti-fabrication gate 3d: verify claims against transcript ──
+            claim_ok, claim_reason = _verify_claim_against_transcript(info)
+            if not claim_ok:
+                # Don't reject outright — clamp score to max 2
+                score = min(score, 2)
+                info["evidence_score"] = score
+                info["evidence_score_reason"] = f"claim_unverified: {claim_reason}"
+                logger.info("finding_claim_unverified", finding_id=fid, reason=claim_reason)
 
             # ── Hybrid validation: ALL findings go through 3-tier check ──
             # Tier 1: score >= 5 (definitive — OOB, root:x:0:0) → auto-pass
