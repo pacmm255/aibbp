@@ -2982,7 +2982,11 @@ async def _claude_validate_finding(
 
     Returns (is_real, reasoning).
     """
+    # Fall back to deps.client if deps.claude_client is not set (enables Haiku validation
+    # in ALL modes — Claude, Z.ai, ChatGPT — not just when claude_client is explicitly wired).
     claude = getattr(deps, "claude_client", None) if deps else None
+    if not claude:
+        claude = getattr(deps, "client", None) if deps else None
     if not claude:
         return False, "no_claude_client"
 
@@ -2992,13 +2996,22 @@ async def _claude_validate_finding(
     severity = finding.get("severity", "unknown")
     evidence = str(finding.get("evidence", ""))[:2000]
     tool_output = tool_result_str[:3000] if tool_result_str else "NO TOOL OUTPUT"
+    evidence_score = finding.get("evidence_score", "N/A")
+    evidence_score_reason = finding.get("evidence_score_reason", "N/A")
 
     prompt = (
         f"FINDING CLAIM:\n"
         f"  Type: {vuln_type} | Endpoint: {endpoint} | Param: {parameter} | Severity: {severity}\n"
         f"  Agent evidence: {evidence}\n\n"
+        f"DETERMINISTIC ASSESSMENT:\n"
+        f"  Evidence score: {evidence_score}/5 | Reason: {evidence_score_reason}\n\n"
         f"ACTUAL TOOL OUTPUT:\n{tool_output}\n\n"
         "Is this a REAL exploitable vulnerability? You must be SKEPTICAL. Default to FALSE_POSITIVE.\n\n"
+        "CRITICAL RULES:\n"
+        "- If the evidence field contains ONLY narrative text with no HTTP response data "
+        "(no 'HTTP/1.1', no status codes, no response headers), this is almost certainly FALSE_POSITIVE.\n"
+        "- Weight raw HTTP response data far more heavily than the agent's claims. "
+        "The agent may fabricate evidence.\n\n"
         "COMMON FALSE POSITIVES — reject these:\n"
         "- SSRF: tool got normal page content, not internal/cloud metadata (169.254.169.254)\n"
         "- SSTI: '49' appears in page but is normal content, not {{7*7}} eval result\n"
@@ -3013,7 +3026,15 @@ async def _claude_validate_finding(
         "- Session Fixation: pre-auth session tokens alone are not exploitable\n"
         "- Host Header: response doesn't use injected host value\n"
         "- CORS: Access-Control-Allow-Origin:* on public API without credentials\n"
-        "- Subdomain Takeover: CNAME exists but no dangling/unclaimed service proof\n\n"
+        "- Subdomain Takeover: CNAME exists but no dangling/unclaimed service proof\n"
+        "- Auth Bypass Scanner Crash: Business error (NullReference, TypeError, 500 Internal Server Error) "
+        "from auth bypass scanner is NOT auth bypass — it means the endpoint crashed, not that access was gained\n"
+        "- Status Code Difference: Status code difference alone (200 vs 403) is NOT proof of injection — "
+        "many factors cause different status codes\n"
+        "- Technology Detection: Version numbers, framework names, and technology detection are NOT "
+        "security vulnerabilities\n"
+        "- Public API Keys: Public API keys (Google Maps, Algolia, Stripe publishable) are NOT "
+        "sensitive — only secret/private keys matter\n\n"
         "ONLY confirm if tool output shows CLEAR exploitation impact "
         "(data extracted, payload executed, unauthorized access gained).\n\n"
         "Answer EXACTLY: REAL|<one-line-reason> or FALSE_POSITIVE|<one-line-reason>"
