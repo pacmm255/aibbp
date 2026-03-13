@@ -126,21 +126,29 @@ real money. If a finding wouldn't get paid on HackerOne/Bugcrowd, DON'T REPORT I
 - Subdomain takeover candidates you haven't actually taken over
 
 ### How to find real bugs on hardened targets:
-1. **CREATE ACCOUNTS** — register, login, explore authenticated surfaces. 80% of bounties \
+1. **UNDERSTAND THE APP FIRST** — Before testing anything, understand what this app DOES. \
+What is its core business function? What data is valuable? What actions are irreversible? \
+What would the developer be terrified of a user doing? THAT is where the real bugs live.
+2. **CREATE ACCOUNTS** — register, login, explore authenticated surfaces. 80% of bounties \
 are behind authentication. Use the email system to verify accounts.
-2. **DEEP JS ANALYSIS** — use `analyze_js_bundle` on every .js file. Finds API keys, \
+3. **MAP TRUST BOUNDARIES** — Where does the app trust user input? Where does it assume \
+a request came from the UI? Where does it assume sequential workflow? Every assumption is a bug.
+4. **TEST BUSINESS LOGIC** — The highest bounties come from logic bugs, not injection. \
+Can you buy at $0? Transfer to yourself twice via race condition? Skip verification steps? \
+Access another user's data by changing an ID? Escalate from user to admin via mass assignment?
+5. **CHAIN VULNS** — a low-severity SSRF + internal API access = critical. Chain everything. \
+Info disclosure + credential extraction + privilege escalation = one devastating chain.
+6. **DEEP JS ANALYSIS** — use `analyze_js_bundle` on every .js file. Finds API keys, \
 internal URLs, hardcoded secrets, debug endpoints, hidden admin routes, GraphQL schemas ($0)
-3. **TEST BUSINESS LOGIC** — use `test_race_condition` on payment/transfer/vote endpoints. \
-Test price manipulation, order modification, coupon abuse, withdrawal logic flaws
-4. **CHAIN VULNS** — a low-severity SSRF + internal API access = critical. Chain everything.
-5. **FUZZ DEEP** — don't just test obvious params. Test HTTP method override (X-HTTP-Method), \
+7. **AUTHORIZATION EVERYWHERE** — use `test_authz_matrix` across all roles. Test every \
+state-changing endpoint as a different role. The developer protected the UI, not the API.
+8. **FUZZ DEEP** — don't just test obvious params. Test HTTP method override (X-HTTP-Method), \
 JSON key injection, prototype pollution, parameter pollution, verb tampering
-6. **TEST LESS-PROTECTED SUBDOMAINS** — staging, dev, internal tools are often misconfigured
-7. **WebSocket testing** — WS endpoints often lack auth checks that HTTP endpoints have
-8. **GraphQL** — use `analyze_graphql` for introspection + unprotected mutation detection ($0)
-9. **Mobile API endpoints** — often have weaker auth than web, look for /api/v1/mobile/
-10. **SSRF/SSTI** — use `test_ssrf` and `test_ssti` on every URL/template parameter ($0)
-11. **Authorization matrix** — use `test_authz_matrix` across all roles ($0)
+9. **TEST LESS-PROTECTED SUBDOMAINS** — staging, dev, internal tools are often misconfigured
+10. **SECOND-ORDER EFFECTS** — Store a payload via one feature, trigger it in another. \
+Profile name with XSS that fires in admin user list. Address with SSTI that fires in PDF export.
+11. **FINANCIAL/PREMIUM BYPASS** — Can free users access premium endpoints? Can you reset \
+trial periods? Redeem coupons multiple times? Modify subscription tier in API calls?
 
 ## Attack Decision Trees
 
@@ -505,14 +513,38 @@ _PHASE_CONTEXTS: dict[str, str] = {
         "GOAL: Identify all potential vulnerability candidates before targeted exploitation."
     ),
     "exploitation": (
-        "### Phase Context: EXPLOITATION\n"
-        "FOCUS: Test specific hypotheses with targeted attacks.\n"
+        "### Phase Context: EXPLOITATION — Bug Bounty Hunter Mindset\n"
+        "STOP thinking in vulnerability categories (XSS, SQLi, SSRF). START thinking about "
+        "what this application DOES and what the developers assumed you would NOT do.\n\n"
+        "**Your mental model:** You are not a scanner running through OWASP categories. "
+        "You are a creative attacker who understands this specific application's BUSINESS LOGIC. "
+        "Every endpoint tells a story — what is it protecting? What happens when that protection fails?\n\n"
+        "**Ask yourself these questions BEFORE each test:**\n"
+        "- What would the developer NOT want me to do with this endpoint?\n"
+        "- What implicit trust assumptions does this workflow make?\n"
+        "- If I break the expected sequence, what state does the app enter?\n"
+        "- Which user action would cause the most damage if I could do it as someone else?\n"
+        "- What happens if I repeat a one-time action? Skip a step? Go backwards?\n\n"
+        "**High-bounty attack patterns (these pay $10K-$100K+):**\n"
+        "- Privilege escalation: Can a regular user become admin by modifying request fields? "
+        "Mass assignment (role=admin, is_staff=true) on profile/settings endpoints.\n"
+        "- Payment/financial bypass: Negative quantities, zero-price items, race conditions "
+        "on transfers, manipulating totals between cart and checkout.\n"
+        "- Multi-tenant data leakage: Access Tenant B's data as Tenant A by swapping IDs, "
+        "org slugs, or API keys across endpoints.\n"
+        "- Workflow state abuse: Skip email verification, bypass approval workflows, "
+        "complete purchases without payment, download content without subscription.\n"
+        "- Rate limit bypass on sensitive ops: Password reset flooding, OTP brute-force, "
+        "API key generation abuse, invitation spam.\n"
+        "- Second-order effects: Store a payload in one place (profile name, address), "
+        "trigger it when admin views a report, exports CSV, or generates PDF.\n"
+        "- Auth token manipulation: JWT claim tampering, session fixation across roles, "
+        "OAuth redirect_uri manipulation for token theft.\n\n"
+        "**Execution priorities:**\n"
         "- Use $0 deterministic tools FIRST (systematic_fuzz, response_diff_analyze, etc.)\n"
         "- Test each parameter INDIVIDUALLY for injection (Parameter Isolation Protocol)\n"
-        "- For blind injection: confirm with time delay, then use blind_sqli_extract\n"
-        "- Chain vulnerabilities for maximum impact\n"
-        "- Create attack chains for multi-step exploits\n"
-        "- Validate every finding before recording"
+        "- Chain vulnerabilities for maximum impact — a single low-sev + another low-sev = critical chain\n"
+        "- Validate every finding with raw HTTP evidence before recording"
     ),
     "post_exploit": (
         "### Phase Context: POST-EXPLOITATION\n"
@@ -588,6 +620,8 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
 # ── Dynamic State Template (changes every turn, NOT cached) ──────
 DYNAMIC_STATE_TEMPLATE = """\
 {situational_hints}
+
+{bounty_mindset}
 
 {attack_chains_display}
 
@@ -956,6 +990,236 @@ def build_free_brain_prompt() -> str:
     worked examples that teach the exact tool calling format.
     """
     return STATIC_SYSTEM_PROMPT + FREE_BRAIN_FEW_SHOT
+
+
+def _build_bug_bounty_mindset(state: dict[str, Any], phase: str = "") -> str:
+    """Generate target-specific bug bounty mindset hints based on app model and tech stack.
+
+    Analyzes what the application IS and suggests creative, business-logic-aware
+    attack strategies rather than generic OWASP checklists. Each hint is under 500 chars.
+    Only included during exploitation and post_exploit phases.
+
+    Args:
+        state: Current pentest state dict.
+        phase: Pre-computed phase string (avoids redundant _detect_phase call).
+    """
+    if not phase:
+        phase = _detect_phase(state)
+    if phase not in ("exploitation", "post_exploit", "vuln_scan"):
+        return ""
+
+    app_model = state.get("app_model", {})
+    tech_stack = [t.lower() for t in state.get("tech_stack", [])]
+    endpoints = state.get("endpoints", {})
+    all_urls = " ".join(endpoints.keys()).lower()
+    all_notes = " ".join(
+        str(info.get("notes", "")) for info in endpoints.values()
+    ).lower()
+    context = all_urls + " " + all_notes + " " + " ".join(tech_stack)
+
+    lines: list[str] = []
+
+    # ── App-type-specific creative attack strategies ──
+
+    # E-commerce / payments
+    if any(kw in context for kw in (
+        "cart", "checkout", "payment", "price", "order", "product", "shop",
+        "invoice", "billing", "stripe", "paypal", "discount", "coupon",
+    )):
+        lines.append(
+            "E-COMMERCE APP: Think about money flow. Can you buy items at $0? "
+            "Modify price between add-to-cart and checkout? Apply coupons after "
+            "payment is calculated? Race-condition a limited stock item to buy 10x? "
+            "Change currency mid-transaction? Add negative-quantity items to get a refund?"
+        )
+
+    # User profiles / social
+    if any(kw in context for kw in (
+        "profile", "account", "settings", "user", "avatar", "bio",
+    )):
+        lines.append(
+            "USER PROFILES: IDOR on profile endpoints (swap user ID). Mass assignment: "
+            "add role=admin or is_staff=true to profile update requests. "
+            "Stored XSS in display_name that fires when admin views user list. "
+            "Profile picture upload: path traversal in filename, polyglot PHP/image."
+        )
+
+    # File upload
+    if any(kw in context for kw in (
+        "upload", "file", "attachment", "document", "import", "media",
+    )):
+        lines.append(
+            "FILE HANDLING: Do not just test extension bypass. Think: what PROCESSES "
+            "the file? CSV import with formula injection. Image resize with ImageMagick "
+            "(SVG SSRF). PDF generation from user HTML (SSRF via <img src>). "
+            "ZIP upload with symlinks (../../etc/passwd). XLSX with XXE in internal XML."
+        )
+
+    # Multi-tenant / SaaS
+    if any(kw in context for kw in (
+        "workspace", "team", "org", "tenant", "organization", "company",
+    )):
+        lines.append(
+            "MULTI-TENANT: Cross-tenant data access is critical-severity. Try: swap "
+            "org_id/tenant_id in every API call. Access shared resources (files, reports) "
+            "across org boundaries. Invitation link reuse across organizations. "
+            "Admin actions on org A executed as member of org B."
+        )
+
+    # API / REST / GraphQL
+    if any(kw in context for kw in (
+        "api", "graphql", "rest", "swagger", "openapi", "v1", "v2",
+    )):
+        lines.append(
+            "API-HEAVY APP: Test API versioning (/v1/ locked down but /v2/ open?). "
+            "Batch/array operations: [{action:delete, id:1}, {action:delete, id:2}] "
+            "bypassing per-request auth checks. Parameter pollution: send same param "
+            "twice with different values. Try internal/debug/admin API prefixes."
+        )
+
+    # Authentication / SSO / OAuth
+    if any(kw in context for kw in (
+        "oauth", "sso", "saml", "redirect_uri", "callback", "token",
+        "openid", "oidc",
+    )):
+        lines.append(
+            "AUTH/SSO PRESENT: OAuth redirect_uri manipulation (open redirect to steal "
+            "auth code). State parameter CSRF. Token leakage in referrer headers. "
+            "SAML signature wrapping. Can you link attacker's SSO to victim's account? "
+            "Password reset flow: change Host header to attacker domain for link theft."
+        )
+
+    # Subscription / premium / paywall
+    if any(kw in context for kw in (
+        "subscription", "premium", "plan", "trial", "license", "upgrade",
+        "downgrade", "quota",
+    )):
+        lines.append(
+            "SUBSCRIPTION MODEL: Can you access premium features on free plan by "
+            "calling premium API endpoints directly? Reset trial period by re-registering? "
+            "Bypass download/usage quotas via race condition? Downgrade plan but keep "
+            "premium features active? Manipulate plan_id in upgrade request?"
+        )
+
+    # Admin / dashboard
+    if any(kw in context for kw in (
+        "admin", "dashboard", "manage", "panel", "backoffice", "cms",
+    )):
+        lines.append(
+            "ADMIN SURFACE FOUND: Test horizontal privilege escalation (regular user "
+            "hitting admin endpoints). CSRF on admin actions (password change, user "
+            "deletion, config modification). Admin stored XSS via user-controlled fields "
+            "they view (usernames, support tickets, logs). Can you create admin users?"
+        )
+
+    # Messaging / notifications / email
+    if any(kw in context for kw in (
+        "message", "chat", "notification", "email", "smtp", "webhook",
+        "slack", "sms",
+    )):
+        lines.append(
+            "MESSAGING SYSTEM: IDOR on messages (read other users' DMs by changing "
+            "message_id). Notification injection: can you trigger notifications to "
+            "arbitrary users? Email header injection via name/subject fields. "
+            "Webhook URL SSRF. Notification preferences: mass assignment to receive "
+            "admin alerts."
+        )
+
+    # Search / data export
+    if any(kw in context for kw in (
+        "search", "export", "download", "report", "csv", "pdf", "print",
+    )):
+        lines.append(
+            "SEARCH/EXPORT: Blind injection via search (boolean/time-based SQLi). "
+            "CSV export formula injection (=cmd|...). PDF generation SSRF (inject "
+            "<iframe src=http://internal> in fields rendered to PDF). Export all users' "
+            "data by manipulating export scope. Unrestricted search returning other tenants' data."
+        )
+
+    # Framework-specific insights from tech stack
+    if any("laravel" in t for t in tech_stack):
+        lines.append(
+            "LARAVEL: Debug mode (APP_DEBUG=true) exposes .env via /_ignition. "
+            "Mass assignment on Eloquent models (add hidden fields to POST). "
+            "Insecure deserialization via signed cookies if APP_KEY leaked. "
+            "Test /telescope, /horizon for exposed debug dashboards."
+        )
+    elif any("django" in t for t in tech_stack):
+        lines.append(
+            "DJANGO: Debug=True exposes tracebacks with source. ORM filter injection "
+            "via query params (field__startswith, field__in). Admin at /admin/ may have "
+            "weak auth. SSTI in template rendering of user input. Check /static/ for "
+            "source maps revealing internal paths."
+        )
+    elif any("express" in t or "node" in t for t in tech_stack):
+        lines.append(
+            "NODE/EXPRESS: Prototype pollution via __proto__ or constructor.prototype "
+            "in JSON bodies. NoSQL injection if MongoDB (operator injection: $ne, $gt). "
+            "Path traversal via ../ in route params. SSRF in url-accepting endpoints. "
+            "Check for exposed /debug, /health, /metrics endpoints."
+        )
+    elif any("spring" in t or "java" in t for t in tech_stack):
+        lines.append(
+            "JAVA/SPRING: Actuator endpoints (/actuator/env, /actuator/heapdump). "
+            "SpEL injection in error messages or template rendering. "
+            "Deserialization attacks via Java serialized objects. "
+            "Path traversal via /..;/ (Spring-specific normalization bypass)."
+        )
+    elif any("rails" in t or "ruby" in t for t in tech_stack):
+        lines.append(
+            "RUBY/RAILS: Mass assignment via unpermitted params in JSON body. "
+            "SSTI via ERB template injection. Insecure deserialization in Marshal.load. "
+            "Debug console at /rails/info/routes. Check for exposed Sidekiq dashboard."
+        )
+
+    # ── Sonnet app model insights ──
+    if app_model and app_model.get("_sonnet_generated"):
+        hvt = app_model.get("high_value_targets", [])
+        if hvt:
+            targets_desc = []
+            for t in hvt[:3]:
+                if isinstance(t, dict):
+                    ep = t.get("endpoint", t.get("url", "?"))
+                    reason = t.get("reasoning", t.get("reason", ""))[:80]
+                    targets_desc.append(f"{ep} ({reason})")
+                else:
+                    targets_desc.append(str(t)[:100])
+            lines.append(
+                "STRATEGIC TARGETS (from app analysis): "
+                + "; ".join(targets_desc)
+                + ". Focus exploitation here — these have the highest bounty potential."
+            )
+
+        abuse = app_model.get("abuse_scenarios", [])
+        if abuse:
+            scenarios = []
+            for s in abuse[:3]:
+                if isinstance(s, dict):
+                    scenarios.append(
+                        s.get("description", s.get("scenario", str(s)))[:100]
+                    )
+                else:
+                    scenarios.append(str(s)[:100])
+            lines.append(
+                "ABUSE SCENARIOS (from app analysis): " + " | ".join(scenarios)
+            )
+
+    # ── Real-world bounty examples for inspiration ──
+    # Only show a couple when no findings yet and some endpoints explored
+    findings = state.get("findings", {})
+    if not findings and len(endpoints) >= 5:
+        lines.append(
+            "INSPIRATION (real $10K+ bounties): "
+            "Shopify $25K: race condition on gift card redemption applied balance 2x. "
+            "GitLab $20K: IDOR on merge request approvals let any user approve. "
+            "Uber $10K: changing driver_id in ride request showed other drivers' info. "
+            "Think: what is the HIGHEST VALUE action in THIS app? Now test if you can "
+            "do it as someone else, do it twice, or skip the authorization check."
+        )
+
+    if not lines:
+        return ""
+    return "## Bug Bounty Mindset\n" + "\n".join(f"- {line}" for line in lines)
 
 
 def build_dynamic_prompt(state: dict[str, Any]) -> str:
@@ -1338,6 +1602,9 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         work_queue_prompt = f"## Work Queue\n{work_queue_prompt}"
     capability_snapshot = state.get("capability_snapshot", "")
 
+    # Bug bounty mindset (target-specific creative attack hints)
+    bounty_mindset = _build_bug_bounty_mindset(state, phase=phase)
+
     dynamic = DYNAMIC_STATE_TEMPLATE.format(
         target_url=state.get("target_url", "?"),
         tech_stack=", ".join(state.get("tech_stack", [])) or "(unknown)",
@@ -1363,6 +1630,7 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         playbook_summary=playbook_summary,
         compressed_context=compressed_context,
         situational_hints=situational_hints,
+        bounty_mindset=bounty_mindset,
         attack_chains_display=attack_chains_display,
         policy_summary=policy_summary,
         work_queue_prompt=work_queue_prompt,
@@ -3658,53 +3926,9 @@ def _generate_situational_hints(state: dict) -> str:
                     )
                     break  # One hint per template
 
-    # ── Application-type-specific attack strategies ──
-    all_endpoint_text = " ".join(endpoints.keys()).lower()
-    all_notes = " ".join(str(info.get("notes", "")) for info in endpoints.values()).lower()
-    app_context = all_endpoint_text + " " + all_notes + " " + " ".join(t.lower() for t in tech_stack)
-
-    _ecommerce_kw = ("cart", "checkout", "payment", "price", "order", "product", "shop", "invoice", "billing")
-    _saas_kw = ("workspace", "team", "org", "tenant", "account", "invite", "subscription", "plan")
-    _api_kw = ("graphql", "/api/", "swagger", "openapi", "/rest/", "api-docs")
-    _social_kw = ("profile", "post", "comment", "upload", "message", "share", "feed", "follow")
-
-    if any(kw in app_context for kw in _ecommerce_kw):
-        hints.append(
-            "E-COMMERCE DETECTED — PRIORITY ATTACKS: "
-            "1) Price manipulation (modify price/quantity in POST body), "
-            "2) Race conditions on checkout (use `test_race_condition` on payment endpoint), "
-            "3) Coupon abuse (replay/stack codes), "
-            "4) IDOR on order IDs and invoices, "
-            "5) Payment callback URL manipulation (SSRF via webhook/callback param)"
-        )
-    if any(kw in app_context for kw in _saas_kw):
-        hints.append(
-            "SaaS/MULTI-TENANT DETECTED — PRIORITY ATTACKS: "
-            "1) Cross-tenant IDOR (access tenant B resources as tenant A), "
-            "2) Invitation link manipulation, "
-            "3) API key scope bypass, "
-            "4) Webhook URL SSRF (use `test_ssrf`), "
-            "5) Export injection (CSV formula, PDF SSRF), "
-            "6) Role escalation via invite / mass assignment"
-        )
-    if any(kw in app_context for kw in _api_kw):
-        hints.append(
-            "API/GRAPHQL DETECTED — PRIORITY ATTACKS: "
-            "1) Use `analyze_graphql` for introspection + unprotected mutation detection, "
-            "2) Test every mutation as anonymous, "
-            "3) Batch query brute force, "
-            "4) Field-level authorization gaps, "
-            "5) API versioning bypass (/v1/ protected → /v2/ open?)"
-        )
-    if any(kw in app_context for kw in _social_kw):
-        hints.append(
-            "SOCIAL/UGC DETECTED — PRIORITY ATTACKS: "
-            "1) Stored XSS in user content (profile, comments), "
-            "2) IDOR on private messages/DMs, "
-            "3) File upload to webshell, "
-            "4) Mass assignment on profile (role=admin), "
-            "5) Second-order XSS (store in profile, trigger in admin/export view)"
-        )
+    # NOTE: Application-type-specific attack strategies (e-commerce, SaaS, API,
+    # social) are now in _build_bug_bounty_mindset() with richer, more creative
+    # advice. Removed from here to avoid duplicate hints in the prompt.
 
     # ── Pivot guidance: detect tunnel vision ──
     # Count consecutive attempts on same endpoint
@@ -3747,7 +3971,11 @@ def _generate_situational_hints(state: dict) -> str:
         )
 
     ssti_tested = any("test_ssti" in k or "ssti" in k.lower() for k in tested)
-    if not ssti_tested and any("template" in app_context for _ in [1]):
+    # Build context string for template detection (lightweight — only used here)
+    _all_ep_text = " ".join(endpoints.keys()).lower()
+    _all_notes_text = " ".join(str(info.get("notes", "")) for info in endpoints.values()).lower()
+    _app_context = _all_ep_text + " " + _all_notes_text + " " + " ".join(t.lower() for t in tech_stack)
+    if not ssti_tested and "template" in _app_context:
         hints.append(
             "TEMPLATE ENGINE detected. Use `test_ssti` — tests 11 polyglot probes for "
             "Jinja2, Twig, Freemarker, Mako, ERB and auto-escalates to RCE. Zero LLM cost."
