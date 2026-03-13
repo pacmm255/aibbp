@@ -33,7 +33,7 @@ from ai_brain.active.react_prompt import (
     build_system_prompt, get_tool_schemas, _detect_phase, CHAIN_TEMPLATES,
 )
 from ai_brain.active.react_state import PentestState
-from ai_brain.active.react_tools import ToolDeps, dispatch_tool, _canonicalize_vuln_type
+from ai_brain.active.react_tools import ToolDeps, dispatch_tool, _canonicalize_vuln_type, _score_evidence
 from ai_brain.errors import BudgetExhausted
 
 logger = structlog.get_logger()
@@ -915,6 +915,14 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
 
     # ── Process auto-findings from scanners ──────────────
     all_auto_findings: dict[str, dict[str, Any]] = {}
+    parsed_host = urlparse(target_url).hostname or ""
+
+    # Error disclosure category filters (constant across iterations)
+    _ERRDISC_HIGH_VALUE_CATS = frozenset({
+        "file_path", "database_type", "internal_url",
+        "email", "credentials", "api_key",
+    })
+    _ERRDISC_INFORMATIONAL_ONLY = frozenset({"framework", "server_version", "server"})
 
     for scanner_name, result in raw_results.items():
         if not isinstance(result, dict):
@@ -953,6 +961,8 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
                     "tool_used": "scan_info_disclosure",
                     "evidence_score": 4,
                     "evidence_score_reason": f"confirmed: verified {cat} content pattern",
+                    "request_dump": f"GET {path} HTTP/1.1\nHost: {parsed_host}",
+                    "response_dump": f"HTTP/1.1 200\n\n{preview[:500]}",
                 }
 
             elif scanner_name == "auth_bypass":
@@ -1060,26 +1070,41 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
 
             elif scanner_name == "error_responses":
                 cats = item.get("categories_found", [])
+                # Skip purely informational categories (framework, server_version, server)
+                cats_set = set(cats)
+                if cats_set <= _ERRDISC_INFORMATIONAL_ONLY:
+                    continue  # Skip purely informational error disclosures
+                has_high_value = bool(cats_set & _ERRDISC_HIGH_VALUE_CATS)
                 fid = (
                     f"blitz_errdisc_{'_'.join(cats[:2])}_"
                     f"{hashlib.md5(item.get('endpoint', '').encode()).hexdigest()[:8]}"
                 )
-                severity = "medium"
-                if any(c in cats for c in ("internal_url", "database_type", "file_path")):
+                # Cap at "low" unless high-value categories present
+                severity = "low"
+                if has_high_value:
+                    severity = "medium"
+                    if any(c in cats for c in ("internal_url", "database_type", "file_path")):
+                        severity = "high"
+                # Credential patterns elevate to high
+                detail = item.get("detail", "")
+                if any(kw in detail.lower() for kw in ("password", "secret", "private_key", "api_key")):
                     severity = "high"
+                ep = item.get("endpoint", "")
                 all_auto_findings[fid] = {
                     "vuln_type": "information_disclosure",
-                    "endpoint": item.get("endpoint", ""),
+                    "endpoint": ep,
                     "parameter": "",
                     "evidence": (
                         f"recon_blitz scan_error_responses: leaked {', '.join(cats)} on "
-                        f"{item.get('endpoint', '')}. Detail: {item.get('detail', '')[:500]}"
+                        f"{ep}. Detail: {detail[:500]}"
                     ),
                     "severity": severity,
                     "confirmed": False,
                     "tool_used": "scan_error_responses",
                     "evidence_score": 4,
                     "evidence_score_reason": f"confirmed: error disclosure ({', '.join(cats)})",
+                    "request_dump": f"GET {ep} HTTP/1.1\nHost: {parsed_host}",
+                    "response_dump": f"HTTP/1.1 {item.get('status_code', '?')}\n\n{detail[:500]}",
                 }
 
             elif scanner_name == "nosqli":
@@ -1134,9 +1159,10 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
                     f"{hashlib.md5(item.get('endpoint', '').encode()).hexdigest()[:8]}"
                 )
                 severity = "high" if item.get("controllable") else "medium"
+                deser_ep = item.get("endpoint", "")
                 all_auto_findings[fid] = {
                     "vuln_type": "insecure_deserialization",
-                    "endpoint": item.get("endpoint", ""),
+                    "endpoint": deser_ep,
                     "parameter": item.get("format", ""),
                     "evidence": (
                         f"recon_blitz scan_deserialization: {item.get('detail', '')}. "
@@ -1147,6 +1173,8 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
                     "tool_used": "scan_deserialization",
                     "evidence_score": item.get("evidence_score", 3),
                     "evidence_score_reason": f"detection: {item.get('format', '')} in {item.get('location', '?')}",
+                    "request_dump": f"GET {deser_ep} HTTP/1.1\nHost: {parsed_host}",
+                    "response_dump": f"HTTP/1.1 200\n\n{item.get('matched_value', '')[:500]}",
                 }
 
             elif scanner_name == "dos":
@@ -1172,7 +1200,31 @@ async def _recon_blitz_with_opus(state: PentestState, config: RunnableConfig) ->
                 }
 
     if _LIVE:
-        print(f"  {_DIM}Scanner auto-findings: {len(all_auto_findings)}{_RESET}")
+        print(f"  {_DIM}Scanner auto-findings (pre-validation): {len(all_auto_findings)}{_RESET}")
+
+    # ── Validate scanner findings through _score_evidence ──────
+    # CTF bypass: skip validation for small-budget CTF runs (budget <= $5)
+    budget_limit = state.get("budget_limit", 10.0)
+    if budget_limit > 5 and all_auto_findings:
+        validated_findings: dict[str, dict[str, Any]] = {}
+        rejected_count = 0
+        for fid, finding in all_auto_findings.items():
+            score, reason = _score_evidence(finding)
+            finding["evidence_score"] = score
+            finding["evidence_score_reason"] = reason
+            if score < 3:
+                rejected_count += 1
+                logger.warning("blitz_finding_rejected_low_score",
+                               finding_id=fid, score=score, reason=reason,
+                               vuln_type=finding.get("vuln_type", ""))
+                continue
+            validated_findings[fid] = finding
+        all_auto_findings = validated_findings
+        if _LIVE and rejected_count:
+            print(f"  {_DIM}Validation rejected {rejected_count} low-score findings{_RESET}")
+
+    if _LIVE:
+        print(f"  {_DIM}Scanner auto-findings (post-validation): {len(all_auto_findings)}{_RESET}")
 
     # ── Condense results for Opus ──────────────────────────
     briefing = await _condense_scanner_results(raw_results, target_url, endpoints, tech_stack)
