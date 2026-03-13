@@ -3947,6 +3947,71 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     except Exception:
         pass  # Chain discovery is best-effort; never break the tool flow
 
+    # ── Auto-populate working memory from tool results ────────────
+    # Extract credentials, endpoints, and lessons directly from structured
+    # tool outputs (more reliable than scanning raw conversation messages).
+    try:
+        wm = dict(state.get("working_memory", {}))
+        # Deep-copy the sections we will modify
+        for _wm_sec in ("credentials", "attack_surface", "lessons"):
+            wm[_wm_sec] = dict(wm.get(_wm_sec, {}))
+
+        wm_changed = False
+
+        for tc in tool_calls:
+            _tn = tc.name if hasattr(tc, "name") else ""
+            _tid = tc.id if hasattr(tc, "id") else "unknown"
+            # Find the matching tool_result content for this call
+            _tr_content = ""
+            _tr_is_error = False
+            for _tr in tool_results:
+                if isinstance(_tr, dict) and _tr.get("tool_use_id") == _tid:
+                    _tr_content = str(_tr.get("content", ""))
+                    _tr_is_error = _tr.get("is_error", False)
+                    break
+
+            if not _tr_content:
+                continue
+
+            # Skip meta-tools (they manage memory themselves)
+            if _tn in _BOOKKEEPING_TOOLS or _tn == "finish_test":
+                continue
+
+            # Credentials extraction
+            creds = _auto_extract_credentials(_tr_content)
+            if creds:
+                wm["credentials"].update(creds)
+                wm_changed = True
+
+            # Endpoint / attack surface extraction
+            endpoints_found = _auto_extract_endpoints(_tr_content)
+            if endpoints_found:
+                wm["attack_surface"].update(endpoints_found)
+                wm_changed = True
+
+            # Lesson extraction from errors and unexpected results
+            lessons = _auto_extract_lessons(_tn, _tr_content, _tr_is_error)
+            if lessons:
+                wm["lessons"].update(lessons)
+                wm_changed = True
+
+        if wm_changed:
+            # Cap each section to 5 entries, total ≤ 1500 chars
+            wm = _cap_all_working_memory(wm, max_per_section=5, max_total_chars=1500)
+            # Merge into result (nested dict merge with existing state updates)
+            if "working_memory" in result:
+                for _ws, _wd in wm.items():
+                    if isinstance(_wd, dict):
+                        result["working_memory"].setdefault(_ws, {}).update(_wd)
+                # Re-cap after merge
+                result["working_memory"] = _cap_all_working_memory(
+                    result["working_memory"], max_per_section=5, max_total_chars=1500
+                )
+            else:
+                result["working_memory"] = wm
+    except Exception:
+        pass  # Working memory auto-population is best-effort
+
     return result
 
 
@@ -4095,6 +4160,45 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
         working_memory[section] = dict(working_memory.get(section, {}))
     updated_wm = _auto_extract_to_memory(messages, working_memory)
 
+    # ── Auto-populate vuln_findings section from confirmed findings ──
+    try:
+        all_findings = state.get("findings", {})
+        if all_findings:
+            vf_section = updated_wm.setdefault("vuln_findings", {})
+            for fid, fdata in all_findings.items():
+                if not isinstance(fdata, dict):
+                    continue
+                vtype = fdata.get("vuln_type", "unknown")
+                ep = fdata.get("endpoint", "?")
+                sev = fdata.get("severity", "?")
+                confirmed = fdata.get("confirmed", False)
+                tag = "CONFIRMED" if confirmed else "unconfirmed"
+                # Include chain potential hint
+                chain_from = fdata.get("chained_from", "")
+                chain_hint = f" [chains from {chain_from}]" if chain_from else ""
+                vf_section[fid] = f"{vtype} on {ep} ({sev}, {tag}){chain_hint}"
+    except Exception:
+        pass
+
+    # ── Auto-populate attack_chain section from chain builder ──
+    try:
+        attack_chains = state.get("attack_chains", {})
+        if attack_chains:
+            ac_section = updated_wm.setdefault("attack_chain", {})
+            for chain_id, cdata in attack_chains.items():
+                if not isinstance(cdata, dict):
+                    continue
+                goal = cdata.get("goal", "?")
+                steps = cdata.get("steps", [])
+                current = cdata.get("current_step", 0)
+                total = len(steps)
+                conf = cdata.get("confidence", 0)
+                ac_section[chain_id] = (
+                    f"{goal} (step {current + 1}/{total}, conf={conf:.0%})"
+                )
+    except Exception:
+        pass
+
     # Persist chain engine state into working_memory so chains survive compression
     try:
         chains = _chain_engine.get_chains()
@@ -4115,6 +4219,9 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
             updated_wm.setdefault("chain_evidence", {}).update(chain_data)
     except Exception:
         pass
+
+    # ── Cap working memory sections (5 entries each, ≤1500 chars total) ──
+    updated_wm = _cap_all_working_memory(updated_wm, max_per_section=5, max_total_chars=1500)
 
     # Build capability graph from findings
     try:
@@ -4557,6 +4664,189 @@ def _auto_extract_to_memory(messages: list[dict], working_memory: dict) -> dict:
         ):
             key = f"waf_{hash(waf_match) % 10000}"
             working_memory.setdefault("waf_profiles", {})[key] = waf_match[:200]
+
+    return working_memory
+
+
+# ── Working Memory Auto-Population Helpers ─────────────────────────────
+
+# Regex patterns for credential extraction from tool results
+_CREDENTIAL_PATTERNS = [
+    # JWT tokens
+    (r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+', "jwt"),
+    # API keys (common formats)
+    (r'(?:api[_-]?key|apikey)\s*[:=]\s*["\']?([A-Za-z0-9_\-]{16,64})', "api_key"),
+    # Bearer tokens
+    (r'[Bb]earer\s+([A-Za-z0-9_\-\.]{20,})', "bearer"),
+    # Passwords in key-value context
+    (r'(?:password|passwd|pwd)\s*[:=]\s*["\']?([^\s"\'<>,]{4,60})', "password"),
+    # Secret keys
+    (r'(?:secret|secret[_-]?key)\s*[:=]\s*["\']?([^\s"\'<>,]{8,80})', "secret"),
+    # Session cookies / tokens
+    (r'(?:session|sess_id|PHPSESSID|JSESSIONID|connect\.sid)\s*[:=]\s*["\']?([A-Za-z0-9_\-\.%]{8,120})', "session"),
+    # Cookie headers
+    (r'[Ss]et-[Cc]ookie:\s*([^\n;]{8,120})', "cookie"),
+]
+
+
+def _auto_extract_credentials(tool_result: str) -> dict[str, str]:
+    """Extract credentials/secrets from a tool result string.
+
+    Returns dict of {key: value} to merge into working_memory["credentials"].
+    """
+    found: dict[str, str] = {}
+    for pattern, label in _CREDENTIAL_PATTERNS:
+        for match in re.finditer(pattern, tool_result):
+            value = match.group(1) if match.lastindex else match.group(0)
+            # Skip very short or generic values
+            if len(value) < 6:
+                continue
+            key = f"{label}_{hash(value) % 100000}"
+            found[key] = f"{label}: {value[:80]}"
+    return found
+
+
+def _auto_extract_endpoints(tool_result: str) -> dict[str, str]:
+    """Extract new endpoints/URLs from a tool result string.
+
+    Returns dict of {key: value} to merge into working_memory["attack_surface"].
+    """
+    found: dict[str, str] = {}
+
+    # Full URLs
+    for url in re.findall(r'https?://[^\s"\'<>,\]}{)]+', tool_result):
+        # Skip very long URLs (likely base64 or encoded data)
+        if len(url) > 200:
+            continue
+        key = f"url_{hash(url) % 100000}"
+        found[key] = url[:150]
+
+    # Relative API/path endpoints
+    for path in re.findall(r'(?:^|[\s"\'=])(/(?:api|admin|auth|v[0-9]|internal|graphql|debug|actuator|\.well-known)[a-zA-Z0-9/_\-.]*)', tool_result):
+        key = f"path_{hash(path) % 100000}"
+        found[key] = path[:100]
+
+    return found
+
+
+def _auto_extract_lessons(tool_name: str, tool_result: str, is_error: bool) -> dict[str, str]:
+    """Generate lessons from tool failures or unexpected results.
+
+    Returns dict of {key: value} to merge into working_memory["lessons"].
+    """
+    found: dict[str, str] = {}
+    result_lower = tool_result.lower()
+
+    if is_error:
+        # Extract concise lesson from error
+        lesson = f"{tool_name} failed: {tool_result[:120]}"
+        found[f"err_{tool_name}_{hash(tool_result) % 10000}"] = lesson
+        return found
+
+    # Shared helper: extract endpoint reference from tool result
+    _ep_re = re.compile(r'(?:url|endpoint|path|target)\s*[:=]\s*["\']?([^\s"\'<>,]+)')
+
+    # WAF / blocking signals
+    waf_signals = ["403", "406", "waf", "blocked", "firewall", "mod_security",
+                   "cloudflare", "akamai", "rate limit", "too many requests", "429"]
+    for sig in waf_signals:
+        if sig in result_lower:
+            ep_match = _ep_re.search(tool_result)
+            ep = ep_match.group(1)[:60] if ep_match else "unknown"
+            found[f"waf_{tool_name}_{hash(sig + ep) % 10000}"] = (
+                f"{ep} returned {sig} — need WAF bypass or different approach"
+            )
+            break
+
+    # Authentication required
+    auth_signals = ["401", "unauthorized", "login required", "authentication required",
+                    "not authenticated", "access denied"]
+    for sig in auth_signals:
+        if sig in result_lower:
+            ep_match = _ep_re.search(tool_result)
+            ep = ep_match.group(1)[:60] if ep_match else "unknown"
+            found[f"auth_{tool_name}_{hash(ep) % 10000}"] = (
+                f"{ep} requires auth — test after login or with valid session"
+            )
+            break
+
+    # Timeout signals
+    if any(s in result_lower for s in ["timeout", "timed out", "connection refused"]):
+        found[f"timeout_{tool_name}"] = (
+            f"{tool_name} timed out — endpoint may be slow, down, or filtered"
+        )
+
+    return found
+
+
+def _cap_working_memory_section(section: dict, max_entries: int = 5) -> dict:
+    """Cap a working memory section to max_entries using FIFO (keep newest).
+
+    Args:
+        section: dict of {key: value} entries
+        max_entries: maximum number of entries to keep (default 5)
+
+    Returns:
+        Trimmed dict with at most max_entries items (keeps last N inserted).
+    """
+    if len(section) <= max_entries:
+        return section
+    # dict preserves insertion order in Python 3.7+; keep the last N entries
+    keys = list(section.keys())
+    trimmed_keys = keys[-max_entries:]
+    return {k: section[k] for k in trimmed_keys}
+
+
+def _cap_all_working_memory(working_memory: dict, max_per_section: int = 5,
+                             max_total_chars: int = 1500) -> dict:
+    """Cap all working memory sections and enforce total character limit.
+
+    Args:
+        working_memory: full working memory dict {section_name: {key: value}}
+        max_per_section: max entries per section (default 5)
+        max_total_chars: max total chars across all sections (default 1500)
+
+    Returns:
+        Trimmed working memory dict.
+    """
+    # First pass: cap each section to max_per_section entries
+    for section_name in list(working_memory):
+        section = working_memory.get(section_name, {})
+        if isinstance(section, dict):
+            working_memory[section_name] = _cap_working_memory_section(
+                section, max_per_section
+            )
+
+    # Second pass: enforce total character limit
+    # Pre-compute per-section sizes to avoid repeated json.dumps in the loop
+    section_sizes: dict[str, int] = {}
+    for sname, sdata in working_memory.items():
+        if isinstance(sdata, dict):
+            section_sizes[sname] = len(json.dumps(sdata, default=str))
+    total = sum(section_sizes.values())
+    if total <= max_total_chars:
+        return working_memory
+
+    # Trim oldest entries from largest sections until under limit
+    while total > max_total_chars:
+        # Find the largest section with >1 entry
+        largest_section = ""
+        largest_size = 0
+        for sname, ssize in section_sizes.items():
+            sdata = working_memory.get(sname, {})
+            if isinstance(sdata, dict) and len(sdata) > 1 and ssize > largest_size:
+                largest_size = ssize
+                largest_section = sname
+        if not largest_section:
+            break
+        # Remove the oldest entry (first key) from the largest section
+        keys = list(working_memory[largest_section].keys())
+        if keys:
+            del working_memory[largest_section][keys[0]]
+            # Recompute only the changed section's size
+            new_size = len(json.dumps(working_memory[largest_section], default=str))
+            total -= (section_sizes[largest_section] - new_size)
+            section_sizes[largest_section] = new_size
 
     return working_memory
 
