@@ -539,6 +539,7 @@ STANDARD_TECHNIQUES: list[str] = [
     "upload", "jwt", "race", "info_disc", "diff", "js_scan", "graphql", "fuzz",
     "csrf", "error_disc", "crlf", "header_injection",
     "nosqli", "xxe", "deser", "dos", "jwt_deep",
+    "business_logic", "rate_limit", "hpp", "mass_assign",
 ]
 
 _TOOL_TO_TECHNIQUE: dict[str, str] = {
@@ -583,6 +584,13 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
     "test_step_skipping": "fuzz",
     "track_object_ownership": "authz",
     "ingest_api_schema": "fuzz",
+    # Business Logic Testing Tools
+    "test_price_manipulation": "business_logic",
+    "test_workflow_bypass": "business_logic",
+    "test_rate_limit": "rate_limit",
+    "test_parameter_pollution": "hpp",
+    "test_mass_assignment": "mass_assign",
+    "test_idor_sequential": "idor",
 }
 
 # ── Dynamic State Template (changes every turn, NOT cached) ──────
@@ -2794,6 +2802,258 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
     },
+    # ── Business Logic Testing Tools ($0 cost) ──────────────────────────
+    {
+        "name": "test_price_manipulation",
+        "description": (
+            "Test for price/quantity/discount manipulation vulnerabilities. "
+            "Modifies numeric fields in order/payment requests with negative values, "
+            "zero, integer overflow, and extreme discounts. Compares responses to "
+            "baseline to detect if server accepts tampered values. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL (e.g., /api/orders, /checkout, /cart/update)",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["POST", "PUT", "PATCH"],
+                    "description": "HTTP method (default: POST)",
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body with price/quantity fields (e.g., {\"product_id\": \"1\", \"quantity\": \"1\", \"price\": \"29.99\"})",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies (e.g., session cookie)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "price_fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Explicit list of fields to manipulate (auto-detected from body if omitted)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "test_workflow_bypass",
+        "description": (
+            "Test multi-step workflow bypass by skipping steps. Sends final-step "
+            "requests without completing prerequisites (e.g., skip payment in "
+            "checkout, skip email verification, skip CAPTCHA step). Also tests "
+            "skipping intermediate steps. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "Step URL"},
+                            "method": {"type": "string", "description": "HTTP method (default: POST)"},
+                            "body": {"type": "object", "description": "Request body for this step"},
+                            "description": {"type": "string", "description": "Human-readable step description"},
+                        },
+                        "required": ["url"],
+                    },
+                    "description": "Workflow steps in order (first to last). At least 2 required.",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers (shared across all step requests)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies (e.g., session cookie)",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["steps"],
+        },
+    },
+    {
+        "name": "test_rate_limit",
+        "description": (
+            "Test if an endpoint has rate limiting by sending rapid requests. "
+            "Sends up to 50-100 requests quickly and checks for 429 status codes "
+            "or rate-limit headers. Reports as vulnerable if no rate limiting is "
+            "detected on sensitive endpoints (login, API, payment). Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL to test for rate limiting",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "DELETE"],
+                    "description": "HTTP method (default: GET)",
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body (for POST/PUT)",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+                "num_requests": {
+                    "type": "integer",
+                    "description": "Number of rapid requests to send (default: 50, max: 100)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "test_parameter_pollution",
+        "description": (
+            "Test HTTP Parameter Pollution (HPP) by sending duplicate parameters "
+            "with privilege escalation values (e.g., ?role=user&role=admin). "
+            "Checks which value the server uses and whether it leads to privilege "
+            "escalation. Tests both GET query params and POST form data. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameters to test with their normal values (e.g., {\"role\": \"user\", \"action\": \"view\"})",
+                    "additionalProperties": {"type": "string"},
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST"],
+                    "description": "HTTP method (default: GET)",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["url", "params"],
+        },
+    },
+    {
+        "name": "test_mass_assignment",
+        "description": (
+            "Test for mass assignment / object injection by adding extra fields "
+            "to POST/PUT requests (is_admin=true, role=admin, verified=true, "
+            "balance=99999, etc.). Tests each field individually and as a batch. "
+            "Detects if the server processes unexpected fields. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL (e.g., /api/profile, /api/register, /api/update)",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["POST", "PUT", "PATCH"],
+                    "description": "HTTP method (default: POST)",
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Normal request body (the fields the endpoint expects)",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies",
+                    "additionalProperties": {"type": "string"},
+                },
+                "extra_fields": {
+                    "type": "object",
+                    "description": "Custom fields to inject (overrides defaults). Default: is_admin, role, verified, balance, etc.",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "test_idor_sequential",
+        "description": (
+            "Test for IDOR by trying sequential IDs (id-1, id+1, id+2, 0, 1). "
+            "Compares responses to the baseline (current user's ID) to detect if "
+            "other users' data is accessible. Works with numeric and string IDs. "
+            "Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target endpoint URL (e.g., /api/users/5 or /api/profile?id=5)",
+                },
+                "id_param": {
+                    "type": "string",
+                    "description": "Name of the ID parameter (e.g., 'id', 'user_id', 'account_id')",
+                },
+                "current_id": {
+                    "type": "string",
+                    "description": "The current user's ID value (used as baseline)",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT"],
+                    "description": "HTTP method (default: GET)",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers",
+                    "additionalProperties": {"type": "string"},
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Optional cookies (e.g., session cookie for authenticated testing)",
+                    "additionalProperties": {"type": "string"},
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body (for POST/PUT methods)",
+                },
+            },
+            "required": ["url", "id_param", "current_id"],
+        },
+    },
 ]
 
 _UTILITY_TOOLS: list[dict[str, Any]] = [
@@ -3896,6 +4156,9 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "update_knowledge", "build_app_model",
         "discover_workflows", "ingest_api_schema",  # Sprint 4: schema intelligence
         "run_role_differential", "create_role_account",  # Sprint 4: authz testing
+        # Business logic testing ($0 cost)
+        "test_price_manipulation", "test_workflow_bypass", "test_rate_limit",
+        "test_parameter_pollution", "test_mass_assignment", "test_idor_sequential",
     } | _UNIVERSAL_TOOLS,
     "exploitation": {
         "send_http_request", "test_sqli", "test_xss", "test_cmdi",
@@ -3917,6 +4180,9 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "create_role_account", "run_role_differential",
         "discover_workflows", "test_workflow_invariant", "test_step_skipping",
         "track_object_ownership", "ingest_api_schema",
+        # Business logic testing ($0 cost)
+        "test_price_manipulation", "test_workflow_bypass", "test_rate_limit",
+        "test_parameter_pollution", "test_mass_assignment", "test_idor_sequential",
     } | _UNIVERSAL_TOOLS,
     "post_exploit": {
         "send_http_request", "run_custom_exploit", "blind_sqli_extract",
@@ -3928,6 +4194,9 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         # Sprint 4: AuthZ & Schema Intelligence
         "run_role_differential", "test_workflow_invariant",
         "test_step_skipping", "track_object_ownership",
+        # Business logic testing ($0 cost)
+        "test_price_manipulation", "test_workflow_bypass", "test_rate_limit",
+        "test_parameter_pollution", "test_mass_assignment", "test_idor_sequential",
     } | _UNIVERSAL_TOOLS,
     # ── Hard Phase Gate: reporting ──
     # Minimal tool set — only knowledge, submit, and finish
