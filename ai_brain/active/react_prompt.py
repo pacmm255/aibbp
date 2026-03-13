@@ -614,6 +614,8 @@ DYNAMIC_STATE_TEMPLATE = """\
 ### Traffic Intelligence
 {traffic_intelligence}
 
+{observations_display}
+
 ### Strategic Insights (auto-derived from knowledge graph)
 {graph_insights}
 
@@ -1049,6 +1051,29 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
     else:
         traffic_intelligence = "  (no traffic analyzed yet — use analyze_traffic after browsing)"
 
+    # Observations (pattern-detected hypotheses from tool results)
+    obs_list = state.get("observations", [])
+    if obs_list:
+        obs_lines = ["### Observations (auto-detected patterns — investigate actionable items)"]
+        for obs_item in obs_list[:10]:
+            marker = ">>>" if obs_item.get("actionable") else "   "
+            conf = obs_item.get("confidence", 0)
+            obs_type = obs_item.get("type", "?")
+            detail = obs_item.get("detail", "?")
+            # Truncate long details
+            if len(detail) > 200:
+                detail = detail[:200] + "..."
+            obs_lines.append(f"  [{marker}] ({obs_type}, conf={conf:.1f}) {detail}")
+        actionable_count = sum(1 for o in obs_list if o.get("actionable"))
+        if actionable_count:
+            obs_lines.append(
+                f"  {actionable_count} actionable observation(s) — "
+                "use these to guide your next tests"
+            )
+        observations_display = "\n".join(obs_lines)
+    else:
+        observations_display = ""
+
     # Compressed context
     compressed = state.get("compressed_summary", "")
     compressed_context = f"\n### Previous Context Summary\n{compressed}" if compressed else ""
@@ -1354,6 +1379,7 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         hypotheses_summary=hypotheses_summary,
         accounts_summary=accounts_summary,
         traffic_intelligence=traffic_intelligence,
+        observations_display=observations_display,
         graph_insights=graph_insights,
         available_tools=available_tools,
         dedup_summary=dedup_summary,

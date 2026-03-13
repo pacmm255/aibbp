@@ -66,6 +66,11 @@ class PentestState(TypedDict, total=False):
     # ── Traffic Intelligence ────────────────────────────────────────
     traffic_intelligence: dict[str, Any]
 
+    # ── Observation-Driven Hypothesis Generator ──────────────────────
+    # List of {type, detail, confidence, actionable, turn} dicts
+    # Produced every 5 turns by _analyze_observations() in context_compressor
+    observations: list[dict[str, Any]]
+
     # ── Dedup Tracking (prevents circular testing) ──────────────────
     # Set of "endpoint::technique" strings already tested
     tested_techniques: dict[str, bool]  # key → True (using dict as set for LangGraph)

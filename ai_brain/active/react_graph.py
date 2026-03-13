@@ -3950,6 +3950,255 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     return result
 
 
+# ── Observation-Driven Hypothesis Generator ────────────────────────────
+
+# Module-level constants for observation analysis (avoid re-creation per call)
+_OBS_ERROR_PATTERNS: dict[str, list[tuple[str, str]]] = {
+    "stack_trace": [
+        (r"Traceback \(most recent call last\)", "Python stack trace — framework: Python"),
+        (r"at [A-Za-z0-9_$.]+\.(java|kt):\d+", "Java/Kotlin stack trace"),
+        (r"at Object\.<anonymous>.*\.js:\d+", "Node.js stack trace"),
+        (r"#\d+ [\w\\/:]+\.php\(\d+\)", "PHP stack trace"),
+    ],
+    "sql_error": [
+        (r"(SQL syntax|mysql_|pg_query|ORA-\d{5}|sqlite3\.)", "SQL error — DB type exposed"),
+        (r"SQLSTATE\[", "PDO SQL error — database driver exposed"),
+    ],
+    "path_disclosure": [
+        (r"(/var/www/|/home/\w+/|C:\\inetpub\\|/app/|/opt/)", "File path disclosed in response"),
+    ],
+    "debug_info": [
+        (r"(DEBUG|DJANGO_SETTINGS_MODULE|APP_ENV\s*=\s*development)", "Debug mode or dev env detected"),
+        (r"X-Debug-Token", "Symfony debug toolbar active"),
+    ],
+}
+
+_OBS_SECURITY_HEADERS = frozenset({
+    "strict-transport-security", "content-security-policy",
+    "x-content-type-options", "x-frame-options", "x-xss-protection",
+    "referrer-policy", "permissions-policy",
+})
+
+_OBS_COMMON_X_HEADERS = frozenset({
+    "x-request-id", "x-powered-by", "x-content-type-options",
+    "x-frame-options", "x-xss-protection", "x-cache",
+    "x-cache-hits", "x-served-by", "x-timer",
+})
+
+
+def _analyze_observations(state: PentestState) -> list[dict[str, Any]]:
+    """Analyze patterns across recent tool observations to generate hypotheses.
+
+    Runs every 5 turns in context_compressor. Scans _GLOBAL_OBSERVATIONS for:
+    - Response pattern groups (same template = same handler)
+    - Auth inconsistencies (some sub-paths unprotected)
+    - Error message intelligence (stack traces, SQL errors, path disclosure)
+    - Header fingerprinting (unusual X- headers, missing security headers, server versions)
+    - Timing anomalies (endpoints that are significantly slower)
+
+    Returns list of {type, detail, confidence, actionable, turn} dicts. Max 10 kept.
+    """
+    observations: list[dict[str, Any]] = list(state.get("observations", []))
+    turn = state.get("turn_count", 0)
+
+    # Snapshot current global observations
+    obs_list: list[Observation] = list(_GLOBAL_OBSERVATIONS)
+
+    # ── 1. Response pattern analysis ─────────────────────────────────
+    # Group endpoints by response structure (status + content-length bucket)
+    response_groups: dict[str, list[str]] = {}
+    for obs in obs_list:
+        if obs.type != "http_response" or not obs.subject:
+            continue
+        raw = obs.raw_result
+        status = raw.get("status_code", raw.get("status", 0))
+        body = raw.get("body", raw.get("output", ""))
+        # Bucket by status + body length bucket (within 20% bands)
+        body_len = len(str(body)) if body else 0
+        bucket = body_len // max(1, body_len // 5 + 1) if body_len > 100 else body_len
+        key = f"{status}_{bucket}"
+        response_groups.setdefault(key, []).append(obs.subject)
+
+    for key, urls in response_groups.items():
+        if len(urls) >= 3:
+            sample = urls[:3]
+            detail = (
+                f"Endpoints share response pattern ({key}): "
+                + ", ".join(sample)
+                + (f" (+{len(urls)-3} more)" if len(urls) > 3 else "")
+                + " — likely same handler; test one, apply findings to all"
+            )
+            _add_observation(observations, "response_pattern", detail, 0.7, True, turn)
+
+    # ── 2. Auth pattern detection ────────────────────────────────────
+    # Find auth inconsistencies: parent requires auth but child doesn't
+    auth_required: set[str] = set()
+    no_auth: set[str] = set()
+    endpoints = state.get("endpoints", {})
+    for url, info in endpoints.items():
+        if isinstance(info, dict):
+            if info.get("auth_required"):
+                auth_required.add(url)
+            else:
+                no_auth.add(url)
+
+    for protected_url in auth_required:
+        for open_url in no_auth:
+            # Check if open_url is a sub-path of protected_url
+            if open_url.startswith(protected_url.rstrip("/") + "/") and open_url != protected_url:
+                detail = (
+                    f"Auth inconsistency: {protected_url} requires auth but "
+                    f"{open_url} does not — possible auth bypass"
+                )
+                _add_observation(observations, "auth_inconsistency", detail, 0.8, True, turn)
+
+    # Also check sibling paths: /api/admin requires auth but /api/admin/export doesn't
+    for open_url in no_auth:
+        for protected_url in auth_required:
+            # Sibling path detection — same parent but different leaf
+            open_parts = open_url.rstrip("/").rsplit("/", 1)
+            prot_parts = protected_url.rstrip("/").rsplit("/", 1)
+            if (
+                len(open_parts) == 2
+                and len(prot_parts) == 2
+                and open_parts[0] == prot_parts[0]
+                and open_parts[1] != prot_parts[1]
+            ):
+                detail = (
+                    f"Sibling auth gap: {protected_url} needs auth, "
+                    f"but sibling {open_url} is open — test for data leakage"
+                )
+                _add_observation(observations, "auth_inconsistency", detail, 0.7, True, turn)
+
+    # ── 3. Error message mining ──────────────────────────────────────
+    for obs in obs_list:
+        raw = obs.raw_result
+        body = str(raw.get("body", raw.get("output", raw.get("stdout", ""))))
+        headers_raw = raw.get("headers", raw.get("response_headers", {}))
+        headers_str = json.dumps(headers_raw, default=str) if isinstance(headers_raw, dict) else str(headers_raw)
+        combined = body + " " + headers_str
+
+        for category, patterns in _OBS_ERROR_PATTERNS.items():
+            for regex, description in patterns:
+                if re.search(regex, combined, re.IGNORECASE):
+                    subject = obs.subject or "(unknown endpoint)"
+                    detail = f"{description} at {subject}"
+                    _add_observation(observations, category, detail, 0.8, True, turn)
+                    break  # One match per category per observation is enough
+
+    # ── 4. Header fingerprinting ─────────────────────────────────────
+    missing_security_counts: dict[str, int] = {}
+    custom_headers: dict[str, list[str]] = {}
+    server_versions: set[str] = set()
+
+    for obs in obs_list:
+        raw = obs.raw_result
+        headers = raw.get("headers", raw.get("response_headers", {}))
+        if not isinstance(headers, dict):
+            continue
+
+        lower_headers = {k.lower(): v for k, v in headers.items()}
+
+        # Missing security headers
+        for sh in _OBS_SECURITY_HEADERS:
+            if sh not in lower_headers:
+                missing_security_counts[sh] = missing_security_counts.get(sh, 0) + 1
+
+        # Custom X- headers (excluding common ones)
+        for hdr_name in lower_headers:
+            if hdr_name.startswith("x-") and hdr_name not in _OBS_COMMON_X_HEADERS:
+                custom_headers.setdefault(hdr_name, []).append(
+                    obs.subject or "(unknown)"
+                )
+
+        # Server version disclosure
+        server = lower_headers.get("server", "")
+        if server and re.search(r"[\d.]+", server):
+            server_versions.add(server)
+
+        # X-Powered-By disclosure
+        powered = lower_headers.get("x-powered-by", "")
+        if powered:
+            server_versions.add(f"X-Powered-By: {powered}")
+
+    # Report consistently missing security headers (seen in >50% of responses)
+    total_responses = max(1, sum(1 for o in obs_list if o.type == "http_response"))
+    for hdr, count in missing_security_counts.items():
+        if count > total_responses * 0.5:
+            detail = f"Security header '{hdr}' missing from {count}/{total_responses} responses"
+            _add_observation(observations, "missing_header", detail, 0.5, False, turn)
+
+    # Unusual custom headers
+    for hdr_name, urls in custom_headers.items():
+        detail = (
+            f"Custom header '{hdr_name}' found on: "
+            + ", ".join(urls[:3])
+            + " — may reveal internal routing or debug info"
+        )
+        _add_observation(observations, "custom_header", detail, 0.6, True, turn)
+
+    # Server versions
+    for sv in list(server_versions)[:3]:
+        detail = f"Server version disclosed: {sv}"
+        _add_observation(observations, "server_version", detail, 0.5, False, turn)
+
+    # ── 5. Timing anomalies ──────────────────────────────────────────
+    timing_data: list[tuple[str, float]] = []
+    for obs in obs_list:
+        raw = obs.raw_result
+        elapsed = raw.get("elapsed", raw.get("response_time", raw.get("duration", 0)))
+        if isinstance(elapsed, (int, float)) and elapsed > 0 and obs.subject:
+            timing_data.append((obs.subject, float(elapsed)))
+
+    if len(timing_data) >= 3:
+        times = [t for _, t in timing_data]
+        avg_time = sum(times) / len(times)
+        # Flag endpoints >3x the average response time
+        threshold = max(avg_time * 3, 2.0)  # At least 2 seconds
+        for url, elapsed in timing_data:
+            if elapsed > threshold:
+                detail = (
+                    f"Slow endpoint: {url} took {elapsed:.1f}s "
+                    f"(avg {avg_time:.1f}s) — possible heavy DB query, "
+                    f"file access, or external call (test for blind injection)"
+                )
+                _add_observation(observations, "timing_anomaly", detail, 0.7, True, turn)
+
+    # ── Deduplicate and cap at 10 ────────────────────────────────────
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for obs_dict in observations:
+        key = f"{obs_dict.get('type', '')}:{obs_dict.get('detail', '')[:100]}"
+        if key not in seen:
+            seen.add(key)
+            deduped.append(obs_dict)
+    # Keep the 10 highest-confidence, most recent observations
+    deduped.sort(key=lambda x: (x.get("confidence", 0), x.get("turn", 0)), reverse=True)
+    return deduped[:10]
+
+
+def _add_observation(
+    observations: list[dict[str, Any]],
+    obs_type: str,
+    detail: str,
+    confidence: float,
+    actionable: bool,
+    turn: int,
+) -> None:
+    """Append an observation dict, avoiding exact duplicates."""
+    # Skip if already present (same type + detail prefix)
+    for existing in observations:
+        if existing.get("type") == obs_type and existing.get("detail", "")[:80] == detail[:80]:
+            return
+    observations.append({
+        "type": obs_type,
+        "detail": detail,
+        "confidence": confidence,
+        "actionable": actionable,
+        "turn": turn,
+    })
+
+
 # ── Node 3: Context Compressor ───────────────────────────────────────
 
 
@@ -4084,6 +4333,21 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
             strategic_updates.update(hook3)
     except Exception as _h3_err:
         logger.warning("hook3_opus_chain_failed", error=str(_h3_err)[:200])
+
+    # ── Observation-Driven Hypothesis Generator (every 5 turns) ──────
+    if turn_count > 0 and turn_count % 5 == 0:
+        try:
+            new_observations = _analyze_observations(state)
+            if new_observations:
+                strategic_updates["observations"] = new_observations
+                logger.info(
+                    "observations_updated",
+                    count=len(new_observations),
+                    turn=turn_count,
+                    actionable=sum(1 for o in new_observations if o.get("actionable")),
+                )
+        except Exception as _obs_err:
+            logger.debug("observation_analysis_failed", error=str(_obs_err)[:200])
 
     messages = state.get("messages", [])
     total_chars = sum(len(json.dumps(m, default=str)) for m in messages)
