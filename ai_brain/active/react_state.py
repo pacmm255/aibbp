@@ -180,6 +180,10 @@ class PentestState(TypedDict, total=False):
     # {tool_name: "healthy"|"degraded"|"unavailable"} — set by preflight checks
     tool_health: dict[str, str]
 
+    # ── Adversarial Reasoning (auto-generated hypothesis summary) ──
+    # Compact text summary of adversarial hypotheses, injected into prompt
+    _adversarial_hypothesis_summary: str
+
     # ── Internal (not for brain consumption) ────────────────────────
     # Pending tool calls from brain_node → tool_executor_node
     _pending_tool_calls: list[Any]

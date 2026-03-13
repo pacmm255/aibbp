@@ -3282,13 +3282,15 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                 if new_hypotheses:
                     # Append hypotheses as a supplementary JSON note to the
                     # last tool_result content so the brain sees them
+                    prioritized = _reasoning_engine.prioritize_hypotheses(new_hypotheses)
                     hints = [
                         {
+                            "id": h.get("id", ""),
                             "hypothesis": h["hypothesis"],
                             "priority": h.get("priority", "medium"),
                             "suggested_tool": h.get("suggested_tool", ""),
                         }
-                        for h in new_hypotheses[:5]  # Cap at 5 per tool call
+                        for h in prioritized[:5]  # Cap at 5, best-first
                     ]
                     addendum = json.dumps(
                         {"_adversarial_hints": hints}, default=str,
@@ -4115,6 +4117,22 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
             updated_wm.setdefault("chain_evidence", {}).update(chain_data)
     except Exception:
         pass
+
+    # ── Adversarial hypothesis generation from full state ──────────
+    try:
+        merged_for_hyp = {**state, **strategic_updates} if strategic_updates else state
+        new_state_hypotheses = _reasoning_engine.generate_hypotheses(merged_for_hyp)
+        if new_state_hypotheses:
+            logger.info(
+                "adversarial_state_hypotheses_injected",
+                count=len(new_state_hypotheses),
+            )
+        # Always refresh the summary so the prompt shows current state
+        adv_summary = _reasoning_engine.get_hypothesis_summary(max_items=10)
+        if adv_summary:
+            strategic_updates["_adversarial_hypothesis_summary"] = adv_summary
+    except Exception as _hyp_err:
+        logger.debug("adversarial_hypothesis_gen_failed", error=str(_hyp_err)[:200])
 
     # Build capability graph from findings
     try:

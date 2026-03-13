@@ -3,6 +3,10 @@
 Evaluates finding combinations for escalation potential and generates
 novel hypotheses from observed behavior. Zero LLM cost for chain
 evaluation; uses heuristic rules for chain scoring.
+
+The AdversarialReasoningEngine dynamically generates testable hypotheses
+from actual observations (endpoints, findings, tech stack, traffic
+intelligence) rather than relying solely on static pattern matching.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -398,6 +403,53 @@ class ChainDiscoveryEngine:
         return hashlib.md5(key.encode()).hexdigest()
 
 
+# ── Impact weights for hypothesis prioritization ──────────────────────
+
+_IMPACT_WEIGHTS: dict[str, int] = {
+    "rce": 10,
+    "sqli": 9,
+    "ssrf": 8,
+    "auth_bypass": 8,
+    "credential_theft": 8,
+    "privilege_escalation": 7,
+    "account_takeover": 7,
+    "idor": 6,
+    "ssti": 7,
+    "file_upload": 6,
+    "path_traversal": 6,
+    "command_injection": 9,
+    "xss": 5,
+    "open_redirect": 4,
+    "user_enumeration": 3,
+    "info_disclosure": 3,
+    "csrf": 4,
+    "race_condition": 5,
+    "jwt_vulnerability": 7,
+    "mass_assignment": 6,
+    "prototype_pollution": 6,
+    "http_smuggling": 7,
+    "cors_misconfiguration": 3,
+    "header_injection": 4,
+    "broken_access_control": 7,
+}
+
+# Testability scores: how easy is it to verify this hypothesis?
+_TESTABILITY: dict[str, int] = {
+    "send_http_request": 9,  # Simple HTTP request — easy
+    "systematic_fuzz": 8,    # Automated fuzzing — easy
+    "test_sqli": 8,
+    "test_xss": 7,
+    "test_idor": 7,
+    "test_jwt": 7,
+    "test_file_upload": 6,
+    "test_auth_bypass": 6,
+    "response_diff_analyze": 8,
+    "blind_sqli_extract": 5,  # Time-based — harder to confirm
+    "run_custom_exploit": 4,  # Requires manual script — least testable
+    "navigate_and_extract": 7,
+}
+
+
 # ── Adversarial Reasoning Engine ────────────────────────────────────────
 
 class AdversarialReasoningEngine:
@@ -405,12 +457,24 @@ class AdversarialReasoningEngine:
 
     After each tool execution, analyzes what the result implies about the
     target system and generates new attack hypotheses. Zero LLM cost.
+
+    Enhanced with:
+    - ``generate_hypotheses(state)`` — derives testable hypotheses from full
+      pentesting state (endpoints, findings, tech stack, traffic intel)
+    - ``prioritize_hypotheses()`` — ranks by testability, impact, novelty
+    - ``update_hypothesis_status()`` — lifecycle tracking
+    - Dynamic rule generation from cross-referencing observations
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._observations: list[dict[str, Any]] = []
         self._hypotheses: list[dict[str, Any]] = []
         self._hypothesis_hashes: set[str] = set()
+        # Track which observation-derived rules have already fired,
+        # keyed by a short descriptor so we don't repeat ourselves.
+        self._fired_dynamic_rules: set[str] = set()
+
+    # ── Public API ──────────────────────────────────────────────────
 
     def analyze_tool_result(
         self,
@@ -439,8 +503,11 @@ class AdversarialReasoningEngine:
             "timestamp": time.time(),
         }
         self._observations.append(observation)
+        # Cap observations to prevent unbounded memory growth
+        if len(self._observations) > 500:
+            self._observations = self._observations[-400:]
 
-        # Apply reasoning rules
+        # Apply per-result reasoning rules
         rules = [
             self._reason_about_errors,
             self._reason_about_status_codes,
@@ -454,22 +521,164 @@ class AdversarialReasoningEngine:
         for rule in rules:
             try:
                 hypotheses = rule(tool_name, tool_input, result_data)
-                for h in hypotheses:
-                    h_hash = hashlib.md5(
-                        f"{h['hypothesis']}:{h.get('endpoint', '')}".encode()
-                    ).hexdigest()
-                    if h_hash not in self._hypothesis_hashes:
-                        self._hypothesis_hashes.add(h_hash)
-                        self._hypotheses.append(h)
-                        new_hypotheses.append(h)
+                new_hypotheses.extend(self._dedupe_and_store(hypotheses))
             except Exception:
                 continue
 
+        # Cross-observation dynamic rules (fires across accumulated data)
+        try:
+            dynamic = self._generate_dynamic_rules(current_findings)
+            new_hypotheses.extend(self._dedupe_and_store(dynamic))
+        except Exception:
+            pass
+
         return new_hypotheses
 
+    def generate_hypotheses(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Generate testable hypotheses from the full pentesting state.
+
+        Called periodically (e.g. from the compressor node) to derive
+        hypotheses from the accumulated knowledge — endpoints, findings,
+        tech stack, traffic intelligence, accounts — rather than from
+        a single tool result.
+
+        Returns only *new* hypotheses (already-seen ones are deduped).
+        """
+        new_hypotheses: list[dict[str, Any]] = []
+
+        generators = [
+            self._hypothesize_from_endpoints,
+            self._hypothesize_from_findings,
+            self._hypothesize_from_tech_stack,
+            self._hypothesize_from_traffic_intel,
+            self._hypothesize_from_api_versions,
+            self._hypothesize_from_auth_gaps,
+            self._hypothesize_from_error_patterns,
+        ]
+
+        for gen in generators:
+            try:
+                new_hypotheses.extend(self._dedupe_and_store(gen(state)))
+            except Exception:
+                continue
+
+        if new_hypotheses:
+            logger.info(
+                "adversarial_state_hypotheses",
+                new=len(new_hypotheses),
+                total=len(self._hypotheses),
+            )
+        return new_hypotheses
+
+    def prioritize_hypotheses(
+        self,
+        hypotheses: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rank hypotheses by testability * impact * novelty.
+
+        If *hypotheses* is ``None``, operates on all internal pending hypotheses.
+        Returns a new list sorted best-first (does **not** mutate the input).
+        """
+        candidates = hypotheses if hypotheses is not None else self.get_hypotheses("untested")
+        if not candidates:
+            candidates = self.get_hypotheses("pending")
+
+        scored: list[tuple[float, dict[str, Any]]] = []
+        seen_vuln_types: set[str] = set()
+
+        for h in candidates:
+            impact = _IMPACT_WEIGHTS.get(h.get("vuln_type", ""), 5)
+            testability = _TESTABILITY.get(h.get("suggested_tool", ""), 5)
+            # Novelty bonus: first time we see this vuln_type gets 1.5x
+            vuln_type = h.get("vuln_type", h.get("suggested_tool", "unknown"))
+            novelty = 1.5 if vuln_type not in seen_vuln_types else 1.0
+            seen_vuln_types.add(vuln_type)
+            # Priority bonus
+            prio_bonus = {"critical": 2.0, "high": 1.5, "medium": 1.0, "low": 0.5}.get(
+                h.get("priority", "medium"), 1.0,
+            )
+            score = impact * testability * novelty * prio_bonus
+            scored.append((score, h))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [h for _, h in scored]
+
+    def update_hypothesis_status(
+        self,
+        hypothesis_id: str,
+        status: str,
+        evidence: str = "",
+    ) -> bool:
+        """Update the status of a hypothesis.
+
+        *status* must be one of: ``untested``, ``pending``, ``confirmed``,
+        ``rejected``.
+
+        Returns ``True`` if a matching hypothesis was found and updated.
+        """
+        for h in self._hypotheses:
+            if h.get("id") == hypothesis_id:
+                h["status"] = status
+                if evidence:
+                    h["evidence"] = evidence
+                h["updated_at"] = time.time()
+                return True
+        return False
+
     def get_hypotheses(self, status: str = "pending") -> list[dict[str, Any]]:
-        """Get hypotheses by status."""
+        """Get hypotheses filtered by status."""
         return [h for h in self._hypotheses if h.get("status") == status]
+
+    def get_all_hypotheses(self) -> list[dict[str, Any]]:
+        """Return every hypothesis regardless of status."""
+        return list(self._hypotheses)
+
+    def get_hypothesis_summary(self, max_items: int = 15) -> str:
+        """Return a compact text summary suitable for prompt injection.
+
+        Shows at most *max_items* total, sorted by priority score.
+        """
+        if not self._hypotheses:
+            return ""
+
+        prioritized = self.prioritize_hypotheses(self._hypotheses)
+        lines: list[str] = []
+        shown = 0
+        for h in prioritized:
+            if shown >= max_items:
+                remaining = len(prioritized) - shown
+                if remaining > 0:
+                    lines.append(f"  ... and {remaining} more")
+                break
+            status = h.get("status", "pending")
+            prio = h.get("priority", "?")
+            desc = h.get("hypothesis", "?")
+            # Truncate long descriptions
+            if len(desc) > 120:
+                desc = desc[:117] + "..."
+            lines.append(f"  [{status}|{prio}] {desc}")
+            shown += 1
+        return "\n".join(lines)
+
+    # ── Internal helpers ────────────────────────────────────────────
+
+    def _dedupe_and_store(self, hypotheses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Deduplicate hypotheses, assign IDs, store internally. Return new ones."""
+        new: list[dict[str, Any]] = []
+        for h in hypotheses:
+            h_hash = hashlib.md5(
+                f"{h.get('hypothesis', '')}:{h.get('endpoint', '')}".encode()
+            ).hexdigest()
+            if h_hash not in self._hypothesis_hashes:
+                self._hypothesis_hashes.add(h_hash)
+                h.setdefault("id", f"hyp_{h_hash[:8]}")
+                h.setdefault("status", "untested")
+                h.setdefault("created_at", time.time())
+                self._hypotheses.append(h)
+                new.append(h)
+        return new
+
+    # ── Per-result reasoning rules (unchanged public interface) ────
 
     def _reason_about_errors(
         self, tool_name: str, tool_input: dict, result: Any,
@@ -478,7 +687,7 @@ class AdversarialReasoningEngine:
         hypotheses: list[dict[str, Any]] = []
         result_str = str(result).lower()
 
-        # Stack trace → technology identification + potential injection
+        # Stack trace -> technology identification + potential injection
         if any(kw in result_str for kw in ["traceback", "stack trace", "exception"]):
             endpoint = tool_input.get("url", tool_input.get("target", ""))
             hypotheses.append({
@@ -487,12 +696,13 @@ class AdversarialReasoningEngine:
                 "endpoint": endpoint,
                 "suggested_tool": "response_diff_analyze",
                 "priority": "high",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "info_disclosure",
                 "reasoning": "Verbose error messages indicate weak error handling, which often "
                     "correlates with other security weaknesses like SQLi or path traversal.",
             })
 
-        # SQL error → SQLi likely
+        # SQL error -> SQLi likely
         if any(kw in result_str for kw in ["sql", "mysql", "postgres", "sqlite", "ora-"]):
             endpoint = tool_input.get("url", "")
             hypotheses.append({
@@ -501,7 +711,8 @@ class AdversarialReasoningEngine:
                 "endpoint": endpoint,
                 "suggested_tool": "test_sqli",
                 "priority": "critical",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "sqli",
                 "reasoning": "Database errors in response body confirm the parameter reaches SQL engine.",
             })
 
@@ -523,7 +734,8 @@ class AdversarialReasoningEngine:
                 "endpoint": endpoint,
                 "suggested_tool": "test_auth_bypass",
                 "priority": "high",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "auth_bypass",
                 "reasoning": "403 confirms the endpoint exists. 404 would mean it doesn't. "
                     "Many WAFs and access controls can be bypassed via HTTP tricks.",
             })
@@ -537,7 +749,8 @@ class AdversarialReasoningEngine:
                 "endpoint": endpoint,
                 "suggested_tool": "response_diff_analyze",
                 "priority": "high",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "sqli",
                 "reasoning": "500 errors from user input indicate insufficient input validation.",
             })
 
@@ -551,26 +764,27 @@ class AdversarialReasoningEngine:
         result_str = str(result).lower()
 
         tech_attacks = {
-            "laravel": "Test for .env exposure, mass assignment (is_admin=1), debug mode at /_ignition",
-            "django": "Test for debug page at /admin, SSTI in templates, settings.SECRET_KEY exposure",
-            "express": "Test for prototype pollution via __proto__, NoSQL injection, path traversal",
-            "spring": "Test for actuator endpoints (/actuator/env, /actuator/heapdump), SSTI, SpEL injection",
-            "wordpress": "Test for wp-config.php.bak, xmlrpc.php attacks, plugin vulnerabilities",
-            "php": "Test for type juggling, LFI via php://filter, file upload bypasses (.phtml, .php5)",
-            "graphql": "Test for introspection, field-level auth bypass, batching attacks, nested query DoS",
-            "jwt": "Test for alg:none bypass, weak secret brute-force, algorithm confusion (RS256→HS256)",
-            "nginx": "Test for ..;/ path traversal, off-by-slash misconfiguration, alias traversal",
-            "apache": "Test for .htaccess upload, mod_proxy SSRF, server-status/server-info exposure",
+            "laravel": ("Test for .env exposure, mass assignment (is_admin=1), debug mode at /_ignition", "mass_assignment"),
+            "django": ("Test for debug page at /admin, SSTI in templates, settings.SECRET_KEY exposure", "ssti"),
+            "express": ("Test for prototype pollution via __proto__, NoSQL injection, path traversal", "prototype_pollution"),
+            "spring": ("Test for actuator endpoints (/actuator/env, /actuator/heapdump), SSTI, SpEL injection", "ssti"),
+            "wordpress": ("Test for wp-config.php.bak, xmlrpc.php attacks, plugin vulnerabilities", "rce"),
+            "php": ("Test for type juggling, LFI via php://filter, file upload bypasses (.phtml, .php5)", "path_traversal"),
+            "graphql": ("Test for introspection, field-level auth bypass, batching attacks, nested query DoS", "broken_access_control"),
+            "jwt": ("Test for alg:none bypass, weak secret brute-force, algorithm confusion (RS256->HS256)", "jwt_vulnerability"),
+            "nginx": ("Test for ..;/ path traversal, off-by-slash misconfiguration, alias traversal", "path_traversal"),
+            "apache": ("Test for .htaccess upload, mod_proxy SSRF, server-status/server-info exposure", "ssrf"),
         }
 
-        for tech, attack_suggestion in tech_attacks.items():
+        for tech, (attack_suggestion, vuln_type) in tech_attacks.items():
             if tech in result_str:
                 hypotheses.append({
                     "hypothesis": f"Technology '{tech}' detected. {attack_suggestion}",
                     "endpoint": tool_input.get("url", tool_input.get("target", "")),
                     "suggested_tool": "systematic_fuzz",
                     "priority": "medium",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": vuln_type,
                     "reasoning": f"Framework-specific vulnerabilities for {tech} are well-documented.",
                 })
 
@@ -583,7 +797,7 @@ class AdversarialReasoningEngine:
         hypotheses: list[dict[str, Any]] = []
         result_str = str(result).lower()
 
-        # ID parameters → IDOR
+        # ID parameters -> IDOR
         id_patterns = ["user_id", "account_id", "order_id", "profile_id", "document_id"]
         for pattern in id_patterns:
             if pattern in result_str:
@@ -593,12 +807,13 @@ class AdversarialReasoningEngine:
                     "endpoint": tool_input.get("url", ""),
                     "suggested_tool": "test_idor",
                     "priority": "high",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": "idor",
                     "reasoning": f"Sequential or guessable {pattern} values are a classic IDOR pattern.",
                 })
                 break
 
-        # URL/redirect parameters → SSRF/Open Redirect
+        # URL/redirect parameters -> SSRF/Open Redirect
         url_params = ["url", "redirect", "callback", "next", "return", "goto", "dest", "forward"]
         for param in url_params:
             if f'"{param}"' in result_str or f"'{param}'" in result_str or f"name=\"{param}\"" in result_str:
@@ -608,12 +823,13 @@ class AdversarialReasoningEngine:
                     "endpoint": tool_input.get("url", ""),
                     "suggested_tool": "send_http_request",
                     "priority": "high",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": "ssrf",
                     "reasoning": "URL parameters are high-value targets for SSRF and redirect attacks.",
                 })
                 break
 
-        # File parameters → Upload vulnerabilities
+        # File parameters -> Upload vulnerabilities
         if "type=\"file\"" in result_str or "multipart" in result_str:
             hypotheses.append({
                 "hypothesis": "File upload field detected. Test for unrestricted file upload "
@@ -621,7 +837,8 @@ class AdversarialReasoningEngine:
                 "endpoint": tool_input.get("url", ""),
                 "suggested_tool": "test_file_upload",
                 "priority": "high",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "file_upload",
                 "reasoning": "File upload is a common RCE vector if validation is weak.",
             })
 
@@ -642,11 +859,12 @@ class AdversarialReasoningEngine:
                 "endpoint": tool_input.get("url", ""),
                 "suggested_tool": "test_jwt",
                 "priority": "high",
-                "status": "pending",
+                "status": "untested",
+                "vuln_type": "jwt_vulnerability",
                 "reasoning": "JWT implementation flaws are extremely common and high-impact.",
             })
 
-        # Different error messages for auth → enumeration
+        # Different error messages for auth -> enumeration
         if tool_name in ("send_http_request", "navigate_and_extract"):
             if any(kw in result_str for kw in ["invalid username", "user not found", "no such user"]):
                 hypotheses.append({
@@ -655,7 +873,8 @@ class AdversarialReasoningEngine:
                     "endpoint": tool_input.get("url", ""),
                     "suggested_tool": "systematic_fuzz",
                     "priority": "medium",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": "user_enumeration",
                     "reasoning": "Differential error messages reveal valid usernames.",
                 })
 
@@ -676,7 +895,8 @@ class AdversarialReasoningEngine:
                     "endpoint": tool_input.get("url", ""),
                     "suggested_tool": "blind_sqli_extract",
                     "priority": "high",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": "sqli",
                     "reasoning": "Responses >5s may indicate the payload triggered a SLEEP() or similar.",
                 })
 
@@ -691,24 +911,484 @@ class AdversarialReasoningEngine:
 
         # Source code or config file exposed
         sensitive_patterns = [
-            ("<?php", "PHP source code exposed — check for hardcoded credentials, SQL queries"),
-            ("DB_PASSWORD", "Database credentials exposed in configuration"),
-            ("SECRET_KEY", "Application secret key exposed — enables session forgery"),
-            ("api_key", "API key exposed — test for privilege escalation"),
-            ("password", "Password or credential reference found"),
-            (".git/", "Git repository exposed — download full source with git-dumper"),
+            ("<?php", "PHP source code exposed — check for hardcoded credentials, SQL queries", "info_disclosure"),
+            ("DB_PASSWORD", "Database credentials exposed in configuration", "credential_theft"),
+            ("SECRET_KEY", "Application secret key exposed — enables session forgery", "credential_theft"),
+            ("api_key", "API key exposed — test for privilege escalation", "credential_theft"),
+            ("password", "Password or credential reference found", "credential_theft"),
+            (".git/", "Git repository exposed — download full source with git-dumper", "info_disclosure"),
         ]
 
-        for pattern, description in sensitive_patterns:
+        for pattern, description, vuln_type in sensitive_patterns:
             if pattern in result_str:
                 hypotheses.append({
                     "hypothesis": description,
                     "endpoint": tool_input.get("url", ""),
                     "suggested_tool": "send_http_request",
                     "priority": "critical",
-                    "status": "pending",
+                    "status": "untested",
+                    "vuln_type": vuln_type,
                     "reasoning": f"Pattern '{pattern}' found in response indicates sensitive data exposure.",
                 })
                 break
+
+        return hypotheses
+
+    # ── State-based hypothesis generators ───────────────────────────
+
+    def _hypothesize_from_endpoints(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Derive hypotheses from discovered endpoints."""
+        hypotheses: list[dict[str, Any]] = []
+        endpoints = state.get("endpoints", {})
+        tested = state.get("tested_techniques", {})
+
+        for url, info in list(endpoints.items())[:100]:  # Cap iteration
+            method = info.get("method", "GET")
+            auth_required = info.get("auth_required", False)
+
+            # Admin/sensitive endpoint accessible without auth
+            if not auth_required and any(
+                seg in url.lower()
+                for seg in ["/admin", "/dashboard", "/manage", "/internal", "/debug", "/config"]
+            ):
+                hypotheses.append({
+                    "hypothesis": f"Sensitive endpoint {url} appears accessible without auth. "
+                        "Verify access control and test for privilege escalation.",
+                    "endpoint": url,
+                    "suggested_tool": "send_http_request",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "broken_access_control",
+                    "reasoning": "Admin/internal endpoints without auth are high-severity by definition.",
+                })
+
+            # POST/PUT/DELETE without tested CSRF
+            if method in ("POST", "PUT", "DELETE", "PATCH"):
+                csrf_key = f"{url}::csrf"
+                if csrf_key not in tested:
+                    hypotheses.append({
+                        "hypothesis": f"State-changing {method} endpoint {url} — test for CSRF.",
+                        "endpoint": url,
+                        "suggested_tool": "send_http_request",
+                        "priority": "medium",
+                        "status": "untested",
+                        "vuln_type": "csrf",
+                        "reasoning": f"{method} endpoints that modify data are CSRF targets if missing tokens.",
+                    })
+
+            # Endpoint with ID-like path segments
+            if re.search(r'/\d+(/|$)', url) or re.search(r'/[a-f0-9-]{36}(/|$)', url):
+                idor_key = f"{url}::idor"
+                if idor_key not in tested:
+                    hypotheses.append({
+                        "hypothesis": f"Endpoint {url} has an ID in the path — test IDOR "
+                            "by substituting other IDs.",
+                        "endpoint": url,
+                        "suggested_tool": "test_idor",
+                        "priority": "high",
+                        "status": "untested",
+                        "vuln_type": "idor",
+                        "reasoning": "Numeric or UUID path segments often map to object IDs.",
+                    })
+
+        return hypotheses
+
+    def _hypothesize_from_findings(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Derive follow-up hypotheses from existing findings."""
+        hypotheses: list[dict[str, Any]] = []
+        findings = state.get("findings", {})
+
+        for _fid, fdata in findings.items():
+            vuln_type = fdata.get("vuln_type", "")
+            endpoint = fdata.get("endpoint", "")
+            confirmed = fdata.get("confirmed", False)
+
+            # If we have a confirmed XSS, check if cookies lack HttpOnly
+            if vuln_type == "xss" and confirmed:
+                hypotheses.append({
+                    "hypothesis": f"Confirmed XSS at {endpoint} — check if session cookies "
+                        "lack HttpOnly flag for account takeover via cookie theft.",
+                    "endpoint": endpoint,
+                    "suggested_tool": "send_http_request",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "account_takeover",
+                    "reasoning": "XSS + missing HttpOnly = ATO chain (critical on HackerOne).",
+                })
+
+            # If we have SQLi, try to extract credentials
+            if vuln_type == "sqli":
+                hypotheses.append({
+                    "hypothesis": f"SQLi at {endpoint} — attempt to extract user table "
+                        "(usernames, password hashes) for credential theft.",
+                    "endpoint": endpoint,
+                    "suggested_tool": "blind_sqli_extract",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "credential_theft",
+                    "reasoning": "SQLi -> credential extraction is a standard escalation path.",
+                })
+
+            # If we have SSRF, try cloud metadata
+            if vuln_type == "ssrf":
+                hypotheses.append({
+                    "hypothesis": f"SSRF at {endpoint} — probe cloud metadata endpoints "
+                        "(169.254.169.254, metadata.google.internal) for IAM credentials.",
+                    "endpoint": endpoint,
+                    "suggested_tool": "send_http_request",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "credential_theft",
+                    "reasoning": "SSRF -> cloud metadata is the most common critical chain.",
+                })
+
+            # If we have path traversal, try reading sensitive files
+            if vuln_type == "path_traversal":
+                hypotheses.append({
+                    "hypothesis": f"Path traversal at {endpoint} — read /etc/passwd, "
+                        ".env, config files for credential harvesting.",
+                    "endpoint": endpoint,
+                    "suggested_tool": "send_http_request",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "credential_theft",
+                    "reasoning": "Path traversal -> config read -> credential theft is a proven chain.",
+                })
+
+        return hypotheses
+
+    def _hypothesize_from_tech_stack(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Derive hypotheses from the detected technology stack."""
+        hypotheses: list[dict[str, Any]] = []
+        tech_stack = state.get("tech_stack", [])
+        if not tech_stack:
+            return hypotheses
+
+        tech_lower = " ".join(tech_stack).lower()
+        target_url = state.get("target_url", "")
+
+        # JWT in tech stack
+        if "jwt" in tech_lower:
+            hypotheses.append({
+                "hypothesis": "JWT detected in tech stack. Test for alg:none bypass, "
+                    "weak secret brute-force, and RS256->HS256 algorithm confusion.",
+                "endpoint": target_url,
+                "suggested_tool": "test_jwt",
+                "priority": "high",
+                "status": "untested",
+                "vuln_type": "jwt_vulnerability",
+                "reasoning": "JWT is in the tech stack, so it's used for auth. Weak implementations are common.",
+            })
+
+        # GraphQL in tech stack
+        if "graphql" in tech_lower:
+            hypotheses.append({
+                "hypothesis": "GraphQL detected. Test introspection query, field-level "
+                    "authorization bypass, and batched query attacks.",
+                "endpoint": target_url,
+                "suggested_tool": "send_http_request",
+                "priority": "high",
+                "status": "untested",
+                "vuln_type": "broken_access_control",
+                "reasoning": "GraphQL introspection often leaks the full schema including private fields.",
+            })
+
+        # File upload capability
+        if any("upload" in t.lower() for t in tech_stack):
+            hypotheses.append({
+                "hypothesis": "File upload capability in tech stack. Test for unrestricted "
+                    "upload (webshell, polyglot, path traversal in filename).",
+                "endpoint": target_url,
+                "suggested_tool": "test_file_upload",
+                "priority": "high",
+                "status": "untested",
+                "vuln_type": "file_upload",
+                "reasoning": "File upload -> RCE is a high-impact chain.",
+            })
+
+        return hypotheses
+
+    def _hypothesize_from_traffic_intel(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Derive hypotheses from traffic intelligence analysis."""
+        hypotheses: list[dict[str, Any]] = []
+        ti = state.get("traffic_intelligence", {})
+        if not ti:
+            return hypotheses
+
+        target_url = state.get("target_url", "")
+
+        # Missing security headers
+        gaps = ti.get("security_header_gaps", [])
+        if any(g.lower() == "x-frame-options" for g in gaps):
+            hypotheses.append({
+                "hypothesis": "Missing X-Frame-Options header — test for clickjacking on "
+                    "sensitive actions (password change, payment, settings).",
+                "endpoint": target_url,
+                "suggested_tool": "send_http_request",
+                "priority": "medium",
+                "status": "untested",
+                "vuln_type": "csrf",
+                "reasoning": "Clickjacking can be chained with CSRF for high-impact attacks.",
+            })
+
+        # ID parameters detected in traffic
+        id_params = ti.get("id_params", [])
+        for param in id_params[:5]:
+            hypotheses.append({
+                "hypothesis": f"ID parameter '{param}' observed in traffic — test IDOR "
+                    "by modifying the value.",
+                "endpoint": target_url,
+                "suggested_tool": "test_idor",
+                "priority": "high",
+                "status": "untested",
+                "vuln_type": "idor",
+                "reasoning": f"Traffic analysis found '{param}' used as an object reference.",
+            })
+
+        # Cookie issues
+        cookie_issues = ti.get("cookie_issues", [])
+        if cookie_issues:
+            hypotheses.append({
+                "hypothesis": "Cookie security issues detected: "
+                    f"{', '.join(str(c) for c in cookie_issues[:3])}. "
+                    "Test for session fixation and cookie theft.",
+                "endpoint": target_url,
+                "suggested_tool": "send_http_request",
+                "priority": "medium",
+                "status": "untested",
+                "vuln_type": "account_takeover",
+                "reasoning": "Insecure cookies enable session theft especially when combined with XSS.",
+            })
+
+        # WAF detected -> suggest bypass techniques
+        if ti.get("waf_detected"):
+            waf_type = ti.get("waf_type", "unknown")
+            hypotheses.append({
+                "hypothesis": f"WAF detected ({waf_type}). Use encoding tricks, HTTP/2 "
+                    "downgrade, chunked transfer, and case variations to bypass.",
+                "endpoint": target_url,
+                "suggested_tool": "systematic_fuzz",
+                "priority": "medium",
+                "status": "untested",
+                "vuln_type": "sqli",
+                "reasoning": f"WAF ({waf_type}) blocks naive payloads but bypass techniques exist.",
+            })
+
+        return hypotheses
+
+    def _hypothesize_from_api_versions(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Detect API versioning and hypothesize about older versions."""
+        hypotheses: list[dict[str, Any]] = []
+        endpoints = state.get("endpoints", {})
+
+        versions_seen: dict[str, set[str]] = {}  # base_path -> set of versions
+        for url in endpoints:
+            match = re.search(r'/(v\d+)/', url)
+            if match:
+                version = match.group(1)
+                # Replace version segment with placeholder for grouping
+                base = url[:match.start()] + "/{VERSION}/" + url[match.end():]
+                versions_seen.setdefault(base, set()).add(version)
+
+        for base, versions in versions_seen.items():
+            version_nums = sorted(
+                [int(v[1:]) for v in versions if v[1:].isdigit()],
+            )
+            if version_nums:
+                latest = version_nums[-1]
+                # Suggest testing older versions
+                for v in range(1, latest):
+                    if v not in version_nums:
+                        old_url = base.replace("{VERSION}", f"v{v}")
+                        rule_key = f"api_version_v{v}_{base}"
+                        if rule_key not in self._fired_dynamic_rules:
+                            self._fired_dynamic_rules.add(rule_key)
+                            hypotheses.append({
+                                "hypothesis": f"API v{latest} exists — test if v{v} is still "
+                                    "accessible and lacks security patches.",
+                                "endpoint": old_url,
+                                "suggested_tool": "send_http_request",
+                                "priority": "high",
+                                "status": "untested",
+                                "vuln_type": "broken_access_control",
+                                "reasoning": f"Older API versions (v{v}) often lack auth or validation "
+                                    "that was added in newer versions.",
+                            })
+
+        return hypotheses
+
+    def _hypothesize_from_auth_gaps(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Identify endpoints that might have auth inconsistencies."""
+        hypotheses: list[dict[str, Any]] = []
+        endpoints = state.get("endpoints", {})
+        accounts = state.get("accounts", {})
+
+        # If we have accounts but some endpoints are marked auth_required
+        # and we haven't tested them with different roles
+        if not accounts:
+            return hypotheses
+
+        roles_available = {info.get("role", "user") for info in accounts.values()}
+        auth_endpoints = [
+            url for url, info in endpoints.items()
+            if info.get("auth_required")
+        ]
+
+        if len(roles_available) >= 2 and auth_endpoints:
+            rule_key = "multi_role_authz"
+            if rule_key not in self._fired_dynamic_rules:
+                self._fired_dynamic_rules.add(rule_key)
+                hypotheses.append({
+                    "hypothesis": f"Multiple roles available ({', '.join(roles_available)}). "
+                        f"Test {len(auth_endpoints)} auth-required endpoints for horizontal/vertical "
+                        "privilege escalation by replaying requests across roles.",
+                    "endpoint": auth_endpoints[0] if auth_endpoints else "",
+                    "suggested_tool": "send_http_request",
+                    "priority": "critical",
+                    "status": "untested",
+                    "vuln_type": "privilege_escalation",
+                    "reasoning": "Cross-role request replay is the most reliable way to find BAC bugs.",
+                })
+
+        return hypotheses
+
+    def _hypothesize_from_error_patterns(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Cross-reference error observations to find differential behavior."""
+        hypotheses: list[dict[str, Any]] = []
+
+        # Group observations by endpoint and look for status code variation
+        endpoint_status: dict[str, set[str]] = {}
+        for obs in self._observations[-200:]:
+            url = obs.get("input", {}).get("url", "")
+            if not url:
+                continue
+            summary = obs.get("result_summary", "")
+            for code in ["200", "301", "302", "400", "401", "403", "404", "500"]:
+                if code in summary:
+                    endpoint_status.setdefault(url, set()).add(code)
+
+        for url, codes in endpoint_status.items():
+            # 200 + 500 on same endpoint means some inputs crash it
+            if "200" in codes and "500" in codes:
+                rule_key = f"diff_500_{url}"
+                if rule_key not in self._fired_dynamic_rules:
+                    self._fired_dynamic_rules.add(rule_key)
+                    hypotheses.append({
+                        "hypothesis": f"Endpoint {url} returns both 200 and 500 for different inputs — "
+                            "differential behavior suggests injection point. "
+                            "Use response_diff_analyze to map input->error boundaries.",
+                        "endpoint": url,
+                        "suggested_tool": "response_diff_analyze",
+                        "priority": "high",
+                        "status": "untested",
+                        "vuln_type": "sqli",
+                        "reasoning": "Inconsistent status codes for the same endpoint indicate "
+                            "certain inputs reach unprotected code paths.",
+                    })
+
+            # 403 on some requests, 200 on others -> incomplete access control
+            if "403" in codes and "200" in codes:
+                rule_key = f"diff_403_{url}"
+                if rule_key not in self._fired_dynamic_rules:
+                    self._fired_dynamic_rules.add(rule_key)
+                    hypotheses.append({
+                        "hypothesis": f"Endpoint {url} returns both 403 and 200 — access control "
+                            "is inconsistent. Test with different HTTP methods and headers.",
+                        "endpoint": url,
+                        "suggested_tool": "test_auth_bypass",
+                        "priority": "high",
+                        "status": "untested",
+                        "vuln_type": "broken_access_control",
+                        "reasoning": "Inconsistent access control (403+200) often means "
+                            "the check can be bypassed via verb tampering or header manipulation.",
+                    })
+
+        return hypotheses
+
+    # ── Cross-observation dynamic rules ─────────────────────────────
+
+    def _generate_dynamic_rules(
+        self, current_findings: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Generate rules by cross-referencing accumulated observations.
+
+        Unlike the per-result rules above, these look at *patterns across
+        multiple observations* to find things a single-result rule would miss.
+        """
+        hypotheses: list[dict[str, Any]] = []
+        if len(self._observations) < 3:
+            return hypotheses
+
+        # 1. Detect endpoints that reflect user input (potential XSS/SSTI)
+        for obs in self._observations[-20:]:  # Only recent observations
+            summary = obs.get("result_summary", "").lower()
+            tool_input = obs.get("input", {})
+            # Check if any input value appears in the output
+            for _key, val in tool_input.items():
+                if isinstance(val, str) and len(val) > 3 and val.lower() in summary:
+                    endpoint = tool_input.get("url", "")
+                    rule_key = f"reflection_{endpoint}_{val[:20]}"
+                    if rule_key not in self._fired_dynamic_rules:
+                        self._fired_dynamic_rules.add(rule_key)
+                        hypotheses.append({
+                            "hypothesis": f"Input value '{val[:50]}' reflected in response from "
+                                f"{endpoint}. Test for XSS and SSTI.",
+                            "endpoint": endpoint,
+                            "suggested_tool": "test_xss",
+                            "priority": "high",
+                            "status": "untested",
+                            "vuln_type": "xss",
+                            "reasoning": "Input reflection without encoding is the root cause of XSS.",
+                        })
+                    break  # One reflection hypothesis per observation
+
+        # 2. Detect redirect chains (multiple 302s)
+        redirect_endpoints: list[str] = []
+        for obs in self._observations:
+            summary = obs.get("result_summary", "")
+            if "302" in summary or "301" in summary:
+                endpoint = obs.get("input", {}).get("url", "")
+                if endpoint:
+                    redirect_endpoints.append(endpoint)
+
+        if len(redirect_endpoints) >= 2:
+            rule_key = "redirect_chain"
+            if rule_key not in self._fired_dynamic_rules:
+                self._fired_dynamic_rules.add(rule_key)
+                hypotheses.append({
+                    "hypothesis": f"Multiple redirect endpoints found ({len(redirect_endpoints)}). "
+                        "Test for open redirect and OAuth token theft via redirect manipulation.",
+                    "endpoint": redirect_endpoints[0],
+                    "suggested_tool": "send_http_request",
+                    "priority": "high",
+                    "status": "untested",
+                    "vuln_type": "open_redirect",
+                    "reasoning": "Applications with many redirects often have at least one open redirect.",
+                })
+
+        # 3. Detect consistent auth patterns -> test for bypass
+        auth_observed = set()
+        for obs in self._observations:
+            summary = obs.get("result_summary", "").lower()
+            if "401" in summary or "login" in summary or "unauthorized" in summary:
+                endpoint = obs.get("input", {}).get("url", "")
+                if endpoint:
+                    auth_observed.add(endpoint)
+
+        if len(auth_observed) >= 3:
+            rule_key = "many_auth_endpoints"
+            if rule_key not in self._fired_dynamic_rules:
+                self._fired_dynamic_rules.add(rule_key)
+                hypotheses.append({
+                    "hypothesis": f"{len(auth_observed)} endpoints require auth. "
+                        "Test if any share a common auth middleware that can be bypassed "
+                        "with X-Original-URL, X-Rewrite-URL, or path prefix tricks.",
+                    "endpoint": list(auth_observed)[0],
+                    "suggested_tool": "test_auth_bypass",
+                    "priority": "high",
+                    "status": "untested",
+                    "vuln_type": "auth_bypass",
+                    "reasoning": "Centralized auth middleware often has bypass routes.",
+                })
 
         return hypotheses
