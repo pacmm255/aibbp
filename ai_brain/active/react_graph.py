@@ -26,7 +26,7 @@ from langgraph.graph import END, StateGraph
 from ai_brain.active.chain_discovery import ChainDiscoveryEngine, AdversarialReasoningEngine
 from ai_brain.active.observation_model import Observation, wrap_tool_result
 from ai_brain.active.work_queue import AdaptiveWorkQueue
-from ai_brain.active.capability_graph import CapabilityGraph
+from ai_brain.active.capability_graph import CapabilityGraph, build_dynamic_chain_prompt
 from ai_brain.active.react_knowledge_graph import KnowledgeGraph
 from ai_brain.active.react_prompt import (
     build_static_prompt, build_free_brain_prompt, build_dynamic_prompt,
@@ -4128,6 +4128,26 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
             strategic_updates["capability_snapshot"] = cap_snapshot
     except Exception as e:
         logger.debug("capability_graph_failed", error=str(e)[:100])
+
+    # Dynamic chain builder: fires when findings >= 2 OR turn >= 20
+    n_findings = len(state.get("findings", {}))
+    if n_findings >= 2 or turn_count >= 20:
+        try:
+            chain_prompt = build_dynamic_chain_prompt(dict(state))
+            if chain_prompt:
+                # Prepend dynamic chains before static capability snapshot
+                existing_snap = strategic_updates.get("capability_snapshot", "")
+                strategic_updates["capability_snapshot"] = (
+                    chain_prompt + "\n\n" + existing_snap
+                ).strip()
+                logger.info(
+                    "dynamic_chains_built",
+                    turn=turn_count,
+                    findings=n_findings,
+                    prompt_len=len(chain_prompt),
+                )
+        except Exception as e:
+            logger.debug("dynamic_chain_builder_failed", error=str(e)[:100])
 
     wm_result: dict[str, Any] = {}
     if updated_wm != state.get("working_memory", {}):
