@@ -4990,3 +4990,179 @@ class JWTDeepAnalyzer:
 
     async def close(self):
         await self._client.aclose()
+
+
+# ── Response Fingerprinter ──────────────────────────────────────────────
+# Builds fingerprints of "normal" responses so the brain can detect when
+# a supposed "vulnerability" response is actually the baseline behavior.
+
+
+class ResponseFingerprinter:
+    """Fingerprint HTTP responses and detect anomalies vs baselines.
+
+    Stores a baseline fingerprint for each (url, method) pair during recon.
+    Later, during exploitation, compares a candidate response fingerprint
+    against the baseline to decide if the response is truly anomalous.
+    """
+
+    def __init__(self) -> None:
+        # key = "METHOD url" → fingerprint dict
+        self._baselines: dict[str, dict[str, Any]] = {}
+
+    # ── Public API ───────────────────────────────────────────────────
+
+    def fingerprint(
+        self,
+        url: str,
+        method: str,
+        status: int,
+        headers: dict[str, str],
+        body: str,
+    ) -> dict[str, Any]:
+        """Create a fingerprint dict for a single HTTP response."""
+        import hashlib as _hl
+
+        content_type = headers.get("content-type", headers.get("Content-Type", ""))
+        # Normalize content-type (drop charset, boundary, etc.)
+        ct_base = content_type.split(";")[0].strip().lower() if content_type else ""
+
+        body_hash = _hl.sha256(body.encode(errors="replace")).hexdigest()[:16]
+        tmpl_hash = self._template_hash(body, ct_base)
+
+        key_headers = {}
+        for h in ("x-powered-by", "server", "x-frame-options",
+                   "content-security-policy", "x-content-type-options",
+                   "access-control-allow-origin"):
+            val = headers.get(h, headers.get(h.title(), ""))
+            if val:
+                key_headers[h] = val
+
+        return {
+            "status": status,
+            "content_type": ct_base,
+            "body_hash": body_hash,
+            "body_length": len(body),
+            "template_hash": tmpl_hash,
+            "key_headers": key_headers,
+        }
+
+    def add_baseline(self, url: str, method: str, fp: dict[str, Any]) -> None:
+        """Store a fingerprint as the baseline for a (url, method) pair."""
+        key = f"{method.upper()} {url}"
+        self._baselines[key] = fp
+
+    def get_baseline(self, url: str, method: str) -> dict[str, Any] | None:
+        """Return stored baseline for (url, method), or None."""
+        return self._baselines.get(f"{method.upper()} {url}")
+
+    @staticmethod
+    def is_anomalous(
+        candidate: dict[str, Any],
+        baseline: dict[str, Any],
+    ) -> bool:
+        """Return True if candidate fingerprint differs meaningfully from baseline.
+
+        Differences checked:
+        - Status code differs
+        - Template structure differs (HTML/JSON skeleton changed)
+        - Body length changed by >30%
+        """
+        if candidate["status"] != baseline["status"]:
+            return True
+        if candidate["template_hash"] != baseline["template_hash"]:
+            return True
+        bl = baseline["body_length"]
+        cl = candidate["body_length"]
+        if bl > 0 and abs(cl - bl) / bl > 0.30:
+            return True
+        return False
+
+    def compare(
+        self,
+        url: str,
+        method: str,
+        status: int,
+        headers: dict[str, str],
+        body: str,
+    ) -> dict[str, Any]:
+        """Fingerprint a response and compare against stored baseline.
+
+        Returns a dict with fingerprint data, baseline data (if any),
+        and whether the response is anomalous.
+        """
+        fp = self.fingerprint(url, method, status, headers, body)
+        baseline = self.get_baseline(url, method)
+        result: dict[str, Any] = {"fingerprint": fp}
+        if baseline is None:
+            result["baseline"] = None
+            result["anomalous"] = None
+            result["reason"] = "no baseline stored for this endpoint"
+        else:
+            result["baseline"] = baseline
+            result["anomalous"] = self.is_anomalous(fp, baseline)
+            diffs = self._diff_details(fp, baseline)
+            result["diffs"] = diffs
+            result["reason"] = (
+                f"anomalous: {', '.join(diffs)}" if diffs
+                else "response matches baseline"
+            )
+        return result
+
+    def get_all_baselines(self) -> dict[str, dict[str, Any]]:
+        """Return a copy of all stored baselines."""
+        return dict(self._baselines)
+
+    def load_baselines(self, data: dict[str, dict[str, Any]]) -> None:
+        """Load baselines from serialized state (e.g., PentestState)."""
+        self._baselines.update(data)
+
+    # ── Internal ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _template_hash(body: str, content_type: str) -> str:
+        """Hash the structural skeleton of the body, ignoring dynamic values.
+
+        For HTML: extracts the tag skeleton (ordered sequence of tag names).
+        For JSON: extracts the key skeleton (sorted set of keys at all depths).
+        For other: hash of body length bucket (rounded to nearest 1KB).
+        """
+        import hashlib as _hl
+
+        skeleton = ""
+        if "html" in content_type or (body.lstrip()[:1] == "<" and "<html" in body[:500].lower()):
+            # HTML: extract tag names in order
+            tags = re.findall(r"<(/?\w+)", body)
+            skeleton = " ".join(t.lower() for t in tags[:200])
+        elif "json" in content_type or body.lstrip()[:1] in ("{", "["):
+            # JSON: extract all keys at all depths
+            keys = sorted(set(re.findall(r'"([a-zA-Z_]\w*)"(?=\s*:)', body)))
+            skeleton = " ".join(keys[:200])
+        else:
+            # Other: bucket by length (1KB granularity)
+            bucket = len(body) // 1024
+            skeleton = f"len_bucket:{bucket}"
+
+        return _hl.sha256(skeleton.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _diff_details(
+        candidate: dict[str, Any],
+        baseline: dict[str, Any],
+    ) -> list[str]:
+        """Return human-readable list of differences."""
+        diffs: list[str] = []
+        if candidate["status"] != baseline["status"]:
+            diffs.append(f"status {baseline['status']}→{candidate['status']}")
+        if candidate["template_hash"] != baseline["template_hash"]:
+            diffs.append("template structure changed")
+        bl = baseline["body_length"]
+        cl = candidate["body_length"]
+        if bl > 0:
+            pct = abs(cl - bl) / bl * 100
+            if pct > 30:
+                diffs.append(f"body length {bl}→{cl} ({pct:.0f}% change)")
+        elif cl > 0:
+            diffs.append(f"body length 0→{cl}")
+        if candidate["content_type"] != baseline["content_type"]:
+            diffs.append(f"content-type {baseline['content_type']}→{candidate['content_type']}")
+        return diffs

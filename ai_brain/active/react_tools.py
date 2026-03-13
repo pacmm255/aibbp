@@ -1587,6 +1587,29 @@ async def _dispatch(
         analyzer = ResponseDiffAnalyzer(deps.scope_guard, socks_proxy=deps.goja_socks5_url)
         return await analyzer.analyze(**inp)
 
+    if tool_name == "compare_responses":
+        from ai_brain.active.deterministic_tools import ResponseFingerprinter
+        _state = deps.current_state or {}
+        # Get or create fingerprinter, load existing baselines from state
+        fp = ResponseFingerprinter()
+        fp.load_baselines(_state.get("baselines", {}))
+        url = inp["url"]
+        method = inp.get("method", "GET").upper()
+        status = inp["status"]
+        headers = inp.get("headers", {})
+        body = inp.get("body", "")
+        result = fp.compare(url, method, status, headers, body)
+        if result.get("baseline") is None:
+            # No baseline existed — store this response as the baseline
+            fp.add_baseline(url, method, result["fingerprint"])
+            result["action"] = "stored as new baseline"
+            result["_state_update"] = {"baselines": fp.get_all_baselines()}
+        elif not result.get("anomalous"):
+            result["action"] = "response matches baseline — likely NOT a vulnerability"
+        else:
+            result["action"] = "response is ANOMALOUS vs baseline — worth investigating"
+        return result
+
     if tool_name == "systematic_fuzz":
         from ai_brain.active.deterministic_tools import SystematicFuzzer
         fuzzer = SystematicFuzzer(deps.scope_guard, socks_proxy=deps.goja_socks5_url)
@@ -3529,6 +3552,34 @@ async def _validate_findings(
 
             # ── Anti-fabrication gate 3b: evidence quality score ──
             score, score_reason = _score_evidence(info)
+
+            # ── Baseline fingerprint check ──
+            # If the finding's endpoint has a stored baseline and the response
+            # matches normal behavior, cap the score at 2 (needs more evidence).
+            if score >= 3 and deps and deps.current_state:
+                _baselines = deps.current_state.get("baselines", {})
+                if _baselines:
+                    _finding_endpoint = info.get("endpoint", "")
+                    _finding_method = info.get("method", "GET").upper()
+                    _baseline_fp = _baselines.get(f"{_finding_method} {_finding_endpoint}")
+                    if _baseline_fp:
+                        _resp_dump = str(info.get("response_dump", ""))
+                        if _resp_dump and len(_resp_dump) > 20:
+                            _st_match = re.search(r"HTTP/?\S*\s+(\d{3})", _resp_dump)
+                            if _st_match:
+                                _cand_status = int(_st_match.group(1))
+                                # Check status + body length against baseline
+                                _bl = _baseline_fp.get("body_length", 0)
+                                _status_match = (_cand_status == _baseline_fp.get("status"))
+                                _len_match = _bl > 0 and abs(len(_resp_dump) - _bl) / _bl <= 0.30
+                                if _status_match and _len_match:
+                                    score = min(score, 2)
+                                    score_reason = (
+                                        f"baseline_match: response matches normal baseline "
+                                        f"(status={_cand_status}), capped at 2. "
+                                        f"Original: {score_reason}"
+                                    )
+
             info["evidence_score"] = score
             info["evidence_score_reason"] = score_reason
             min_score = 4 if severity in ("critical", "high") else 3

@@ -3365,6 +3365,43 @@ _UTILITY_TOOLS: list[dict[str, Any]] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "compare_responses",
+        "description": (
+            "Compare an HTTP response against the stored baseline fingerprint for an endpoint. "
+            "Detects whether the response is anomalous (different status, template structure, "
+            "or body length) vs the normal baseline collected during recon. Use this BEFORE "
+            "reporting a finding to verify the response actually differs from normal behavior. "
+            "If no baseline exists, stores this response as the baseline. Zero LLM cost."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The endpoint URL",
+                },
+                "method": {
+                    "type": "string",
+                    "description": "HTTP method (GET, POST, etc.)",
+                    "default": "GET",
+                },
+                "status": {
+                    "type": "integer",
+                    "description": "HTTP status code of the response",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Response headers as key-value pairs",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Response body text (can be truncated for large responses)",
+                },
+            },
+            "required": ["url", "status", "headers", "body"],
+        },
+    },
 ]
 
 
@@ -3869,6 +3906,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "build_app_model",
         "send_http_request",  # needed for probing endpoints during recon
         "discover_workflows", "ingest_api_schema",  # Sprint 4: schema intelligence
+        "compare_responses",  # baseline fingerprinting
     } | _UNIVERSAL_TOOLS,
     "auth": {
         "register_account", "login_account", "navigate_and_extract",
@@ -3896,6 +3934,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "update_knowledge", "build_app_model",
         "discover_workflows", "ingest_api_schema",  # Sprint 4: schema intelligence
         "run_role_differential", "create_role_account",  # Sprint 4: authz testing
+        "compare_responses",  # baseline fingerprinting
     } | _UNIVERSAL_TOOLS,
     "exploitation": {
         "send_http_request", "test_sqli", "test_xss", "test_cmdi",
@@ -3917,6 +3956,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "create_role_account", "run_role_differential",
         "discover_workflows", "test_workflow_invariant", "test_step_skipping",
         "track_object_ownership", "ingest_api_schema",
+        "compare_responses",  # baseline fingerprinting
     } | _UNIVERSAL_TOOLS,
     "post_exploit": {
         "send_http_request", "run_custom_exploit", "blind_sqli_extract",
