@@ -2685,6 +2685,140 @@ def _canonicalize_vuln_type(vt: str) -> str:
     return _VULN_TYPE_CANONICAL.get(vt_lower, vt_lower)
 
 
+# ── Semantic False Positive Detector ──────────────────────────────────
+# Catches the most common FP patterns BEFORE evidence scoring.
+
+_FP_PUBLIC_PATH_SEGMENTS = frozenset({
+    "login", "signin", "sign-in", "sign_in",
+    "register", "signup", "sign-up", "sign_up",
+    "forgot-password", "forget-password", "forgot_password",
+    "reset-password", "reset_password", "password-reset",
+    "oauth", "sso", "auth", "logout", "callback", "verify",
+    "confirm", "activate", "public", "health", "status", "ping",
+    "captcha",
+})
+
+_FP_CSRF_PARAMS = frozenset({
+    "_token", "csrf_token", "csrfmiddlewaretoken",
+    "__requestverificationtoken", "csrf", "_csrf",
+    "authenticity_token", "csrftoken",
+    "xsrf-token", "_xsrf",
+})
+
+_FP_WAF_CDN_HEADERS = frozenset({
+    "cloudflare", "akamai", "awselb", "aws", "incapsula", "imperva",
+    "sucuri", "barracuda", "f5", "fortinet", "citrix", "radware",
+})
+
+_FP_WAF_STATUS_CODES = frozenset({403, 429, 503, 405})
+
+_FP_ERROR_PAGE_PATTERNS = re.compile(
+    r"(?:page\s+not\s+found|404\s+not\s+found|not\s+found|"
+    r"500\s+internal\s+server\s+error|error\s+page|"
+    r"<title>[^<]*(?:404|not\s*found|error|forbidden|access\s*denied)[^<]*</title>)",
+    re.IGNORECASE,
+)
+
+_FP_IDOR_BAC_TYPES = frozenset({
+    "idor", "insecure_direct_object_reference",
+    "broken_access_control", "access_control_bypass", "access_control",
+    "bac", "privilege_escalation", "privesc",
+})
+
+
+def _semantic_fp_check(finding: dict) -> tuple[bool, str]:
+    """Detect common semantic false positive patterns BEFORE evidence scoring.
+
+    Returns (is_fp, reason). If is_fp is True, the finding should be rejected.
+    Catches patterns that evidence scoring misses because the evidence may
+    technically contain HTTP artifacts but the finding is still nonsensical.
+    """
+    vuln_type = (finding.get("vuln_type") or "").lower().strip()
+    canonical = _canonicalize_vuln_type(vuln_type)
+    endpoint = (finding.get("endpoint") or "").strip()
+    parameter = (finding.get("parameter") or "").lower().strip()
+    evidence = str(finding.get("evidence", ""))
+    evidence_lower = evidence.lower()
+
+    # ── Parse endpoint path once (reused by checks 2 and 6) ──
+    ep_path = ""
+    ep_segments: list[str] = []
+    if endpoint:
+        try:
+            from urllib.parse import urlparse
+            ep_path = urlparse(endpoint).path.rstrip("/").lower()
+        except Exception:
+            ep_path = endpoint.lower()
+        ep_segments = [s for s in ep_path.split("/") if s]
+
+    # ── Extract HTTP status code once (reused by checks 1 and 3) ──
+    _status_match = re.search(r"(?:status|code)\s*[:=]?\s*(\d{3})|HTTP/\S+\s+(\d{3})", evidence)
+    _status = 0
+    if _status_match:
+        try:
+            _status = int(_status_match.group(1) or _status_match.group(2))
+        except (ValueError, TypeError):
+            pass
+
+    # ── 1. WAF/CDN false positives ──
+    # Response from WAF/CDN with block status is not a real vuln
+    if _status in _FP_WAF_STATUS_CODES:
+        for waf_name in _FP_WAF_CDN_HEADERS:
+            if waf_name in evidence_lower:
+                return True, f"waf_cdn_block: {waf_name} returned status {_status}"
+        if re.search(r"cf-ray:\s*\S+", evidence_lower):
+            return True, f"waf_cdn_block: Cloudflare cf-ray with status {_status}"
+
+    # ── 2. Public page IDOR/BAC ──
+    # IDOR/BAC on public endpoints is not a real finding
+    if canonical in _FP_IDOR_BAC_TYPES and ep_segments:
+        if ep_segments[-1] in _FP_PUBLIC_PATH_SEGMENTS:
+            return True, f"public_page_idor: {canonical} on public endpoint /{ep_segments[-1]}"
+        if any(seg in _FP_PUBLIC_PATH_SEGMENTS for seg in ep_segments):
+            return True, f"public_page_idor: {canonical} on endpoint with public segment"
+
+    # ── 3. Error page reflection ──
+    # Input reflected in error/404/500 page is NOT XSS
+    if canonical in ("xss", "reflected_xss", "stored_xss", "ssti"):
+        if _FP_ERROR_PAGE_PATTERNS.search(evidence):
+            if _status in (404, 500, 502, 503):
+                return True, f"error_page_reflection: {canonical} reflected in {_status} error page"
+            # Even without explicit status code, error page title is a strong signal
+            title_match = re.search(r"<title>([^<]*)</title>", evidence, re.IGNORECASE)
+            if title_match:
+                title_text = title_match.group(1).lower()
+                if any(w in title_text for w in ("404", "not found", "error", "forbidden")):
+                    return True, f"error_page_reflection: {canonical} reflected in error page (title: {title_match.group(1)[:50]})"
+
+    # ── 4. CSRF token parameter as vuln ──
+    # Finding on CSRF protection parameters is never a real vuln
+    if parameter and parameter in _FP_CSRF_PARAMS:
+        return True, f"csrf_param_as_vuln: finding on CSRF token param '{parameter}'"
+
+    # ── 5. Same response for all inputs (baseline == payload) ──
+    if re.search(
+        r"(?:same\s+(?:response|body|content|output)|identical\s+(?:response|body|content)|"
+        r"no\s+(?:difference|change|variation)|responses?\s+(?:are|were)\s+identical|"
+        r"body\s+hash(?:es)?\s+match)",
+        evidence_lower,
+    ):
+        return True, "same_response: baseline and payload responses are identical"
+    body_hashes = re.findall(r"(?:hash|md5|sha\d*)[:=]\s*([a-f0-9]{32,64})", evidence_lower)
+    if len(body_hashes) >= 2 and body_hashes[0] == body_hashes[1]:
+        return True, "same_response: body hashes match between baseline and payload"
+
+    # ── 6. Generic scanner noise: no specific endpoint ──
+    # Findings with only the domain root and no specific path are noise
+    if endpoint and not ep_path:
+        # Domain root only — no specific endpoint targeted
+        # Exception: info_disclosure and subdomain_takeover can be root-level
+        if canonical not in ("info_disclosure", "subdomain_takeover", "cors",
+                             "host_header", "header_injection"):
+            return True, f"generic_scanner_noise: {canonical} finding on domain root with no specific endpoint"
+
+    return False, ""
+
+
 def _has_raw_http_artifacts(evidence: str) -> bool:
     """Check if evidence contains actual HTTP response data vs narrative description.
 
@@ -3496,6 +3630,19 @@ async def _validate_findings(
         vt_words = set(vuln_type.lower().replace("-", "_").split("_"))
         if vt_words & _REJECT_VULN_TYPE_WORDS:
             logger.warning("finding_rejected_summary_type", finding_id=fid, vuln_type=vuln_type)
+            continue
+
+        # ── Anti-fabrication gate 1b: semantic false positive check ──
+        _sfp_is_fp, _sfp_reason = _semantic_fp_check(info)
+        if _sfp_is_fp:
+            info["fp_reason"] = _sfp_reason
+            logger.warning(
+                "finding_rejected_semantic_fp",
+                finding_id=fid,
+                vuln_type=vuln_type,
+                endpoint=info.get("endpoint", "")[:100],
+                fp_reason=_sfp_reason,
+            )
             continue
 
         if source == "brain":
