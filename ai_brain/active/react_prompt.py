@@ -617,6 +617,9 @@ DYNAMIC_STATE_TEMPLATE = """\
 ### Strategic Insights (auto-derived from knowledge graph)
 {graph_insights}
 
+### Cross-Endpoint Intelligence
+{cross_endpoint_intel}
+
 ### Available Local Tools
 {available_tools}
 
@@ -1060,7 +1063,7 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
     max_turns = state.get("max_turns", 150)
     max_turns_display = " (indefinite)" if max_turns == 0 else f" / {max_turns}"
 
-    # Knowledge graph insights
+    # Knowledge graph insights + cross-endpoint intelligence
     try:
         from ai_brain.active.react_knowledge_graph import KnowledgeGraph
         kg = state.get("_knowledge_graph")
@@ -1068,9 +1071,14 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
             kg = KnowledgeGraph()
         graph_insights = kg.generate_insights(state)
         if not graph_insights:
-            graph_insights = "  (not enough data yet — keep exploring)"
+            graph_insights = "  (not enough data yet -- keep exploring)"
+        # Cross-endpoint intelligence (surfaces param/auth/pattern links)
+        cross_endpoint_intel = kg.get_cross_endpoint_intelligence()
+        if not cross_endpoint_intel:
+            cross_endpoint_intel = "  (no cross-endpoint patterns detected yet)"
     except Exception:
         graph_insights = "  (graph unavailable)"
+        cross_endpoint_intel = "  (unavailable)"
 
     # Available local tools
     available_tools = _get_available_tools()
@@ -1355,6 +1363,7 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         accounts_summary=accounts_summary,
         traffic_intelligence=traffic_intelligence,
         graph_insights=graph_insights,
+        cross_endpoint_intel=cross_endpoint_intel,
         available_tools=available_tools,
         dedup_summary=dedup_summary,
         memory_context=memory_context,

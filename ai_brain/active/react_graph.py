@@ -4017,6 +4017,14 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
         except Exception as _neo4j_err:
             logger.debug("neo4j_sync_failed", error=str(_neo4j_err)[:200])
 
+    # ── Update NetworkX Knowledge Graph (cross-endpoint context) ────
+    _nx_kg = config["configurable"].get("_knowledge_graph")
+    if _nx_kg is not None:
+        try:
+            _nx_kg.update_graph(dict(state))
+        except Exception as _kg_err:
+            logger.debug("knowledge_graph_update_failed", error=str(_kg_err)[:200])
+
     # ── Budget rebalance every 5 turns ──────────────────────────────
     budget_mgr = config["configurable"].get("budget")
     if budget_mgr and turn_count > 0 and turn_count % 5 == 0:
