@@ -4126,6 +4126,10 @@ async def context_compressor(state: PentestState, config: RunnableConfig) -> dic
         cap_snapshot = cap_graph.get_chain_suggestions()
         if cap_snapshot:
             strategic_updates["capability_snapshot"] = cap_snapshot
+        # Attack Capability Map (compact view for prompt)
+        attack_cap_map = cap_graph.format_for_prompt(state)
+        if attack_cap_map:
+            strategic_updates["attack_capability_map"] = attack_cap_map
     except Exception as e:
         logger.debug("capability_graph_failed", error=str(e)[:100])
 

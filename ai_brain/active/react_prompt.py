@@ -1338,6 +1338,13 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         work_queue_prompt = f"## Work Queue\n{work_queue_prompt}"
     capability_snapshot = state.get("capability_snapshot", "")
 
+    # Prepend Attack Capability Map (computed in react_graph.py compressor)
+    attack_cap_map = state.get("attack_capability_map", "")
+    if attack_cap_map:
+        capability_snapshot = (
+            attack_cap_map + ("\n\n" + capability_snapshot if capability_snapshot else "")
+        )
+
     dynamic = DYNAMIC_STATE_TEMPLATE.format(
         target_url=state.get("target_url", "?"),
         tech_stack=", ".join(state.get("tech_stack", [])) or "(unknown)",
