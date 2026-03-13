@@ -61,6 +61,18 @@ _http_rate_lock = asyncio.Lock()
 _GLOBAL_OBSERVATIONS: list[Observation] = []
 _MAX_OBSERVATIONS = 200
 
+# ── CTF mode flag ────────────────────────────────────────────────────
+# Set to True when budget <= $5 to relax transcript verification.
+# Set by react_main.py / react_graph.py at startup.
+_CTF_MODE: bool = False
+
+# ── Transcript-exempt vuln types ─────────────────────────────────────
+# These vuln types genuinely may not produce HTTP transcript data.
+_TRANSCRIPT_EXEMPT_TYPES: frozenset[str] = frozenset({
+    "race_condition", "denial_of_service", "business_logic",
+    "default_credentials", "weak_password", "missing_security_header",
+})
+
 
 async def _http_rate_limit() -> None:
     """Wait if needed to enforce global HTTP rate limit."""
@@ -2722,6 +2734,45 @@ def _has_raw_http_artifacts(evidence: str) -> bool:
     return False
 
 
+def _verify_claim_against_transcript(finding: dict, ctf_mode: bool = False) -> tuple[bool, str]:
+    """Verify that a finding has actual HTTP transcript data backing it.
+
+    Default-FAIL: findings with no raw HTTP section AND no response_dump are
+    rejected, since narrative-only evidence is untrusted.
+
+    Exceptions:
+    - CTF mode (budget <= $5): pass through (CTFs often have simpler evidence).
+    - Transcript-exempt vuln types (race_condition, DoS, etc.): pass through.
+
+    Returns (passed, reason).
+    """
+    # CTF bypass — use module-level flag OR explicit parameter
+    if ctf_mode or _CTF_MODE:
+        return True, "ctf_mode_bypass"
+
+    # Check vuln type exemption (reuse existing canonicalization)
+    vuln_type_raw = str(finding.get("vuln_type", ""))
+    canonical = _canonicalize_vuln_type(vuln_type_raw)
+    # Also normalize with underscores for hyphenated/spaced variants (e.g. "race-condition")
+    normalized = canonical.replace("-", "_").replace(" ", "_")
+    if canonical in _TRANSCRIPT_EXEMPT_TYPES or normalized in _TRANSCRIPT_EXEMPT_TYPES:
+        return True, "transcript_exempt_type"
+
+    # Check for raw HTTP section (enrichment marker)
+    evidence = str(finding.get("evidence", ""))
+    has_raw_section = "--- RAW TOOL OUTPUT ---" in evidence
+
+    # Check for response_dump field
+    response_dump = str(finding.get("response_dump", "")).strip()
+    has_response_dump = bool(response_dump) and len(response_dump) > 10
+
+    if has_raw_section or has_response_dump:
+        return True, "transcript_data_present"
+
+    # Default: reject findings with no HTTP transcript data
+    return False, "no_transcript_data"
+
+
 def _score_evidence(finding: dict) -> tuple[int, str]:
     """Score evidence quality 0-5. Returns (score, reason).
 
@@ -3532,6 +3583,19 @@ async def _validate_findings(
             info["evidence_score"] = score
             info["evidence_score_reason"] = score_reason
             min_score = 4 if severity in ("critical", "high") else 3
+
+            # ── Anti-fabrication gate 3c: transcript verification ──
+            # Reject findings with no HTTP transcript data (narrative-only).
+            # Exempt: CTF mode, race_condition, DoS, business_logic, etc.
+            transcript_ok, transcript_reason = _verify_claim_against_transcript(info)
+            if not transcript_ok:
+                logger.warning(
+                    "finding_rejected_no_transcript",
+                    finding_id=fid,
+                    vuln_type=vuln_type,
+                    reason=transcript_reason,
+                )
+                continue
 
             # ── Hybrid validation: ALL findings go through 3-tier check ──
             # Tier 1: score >= 5 (definitive — OOB, root:x:0:0) → auto-pass
