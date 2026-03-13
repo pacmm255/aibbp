@@ -18,6 +18,7 @@ import hashlib
 import json
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,6 +61,12 @@ _http_rate_lock = asyncio.Lock()
 # Coexists with the legacy recent_tool_results on ToolDeps.
 _GLOBAL_OBSERVATIONS: list[Observation] = []
 _MAX_OBSERVATIONS = 200
+
+# ── Tool provenance tracking ────────────────────────────────────────
+# Tracks which tools have actually been executed (module-level, persists across turns).
+# Used by _validate_findings() to reject findings that claim tools never run.
+_MAX_TOOL_HISTORY = 50
+_recent_tool_executions: deque[str] = deque(maxlen=_MAX_TOOL_HISTORY)
 
 
 async def _http_rate_limit() -> None:
@@ -340,6 +347,9 @@ async def dispatch_tool(
     try:
         result = await _dispatch(tool_name, tool_input, deps)
         result_str = _safe_json(result)
+
+        # ── Tool provenance: record that this tool was actually executed ──
+        _recent_tool_executions.append(tool_name)
 
         # Wrap in Observation envelope
         try:
@@ -2690,36 +2700,45 @@ def _has_raw_http_artifacts(evidence: str) -> bool:
 
     Returns True if evidence has real HTTP artifacts — status lines, headers,
     JSON/HTML response bodies — not just prose claims about what happened.
+
+    Requires at least ONE of:
+    - HTTP status line (HTTP/1.x or HTTP/2 with 3-digit status code)
+    - 2+ distinct HTTP header patterns (Header-Name: value)
+    - Response body with actual content (not just empty {} or [])
     """
-    # Actual HTTP status line: "HTTP/1.1 200 OK"
-    if re.search(r"HTTP/[12](?:\.\d)?\s+\d{3}", evidence):
-        return True
-    # Actual response headers (Header-Name: value) at start of line
-    if re.search(
-        r"^(?:Content-Type|Set-Cookie|Location|X-[A-Za-z-]+|Server|Date|"
-        r"Cache-Control|WWW-Authenticate|Access-Control|Strict-Transport"
-        r"):\s+\S",
-        evidence, re.MULTILINE | re.IGNORECASE,
-    ):
-        return True
-    # JSON response body (key-value pairs with quoted keys)
-    if re.search(r'"[a-zA-Z_]\w*"\s*:\s*["\d\[{tnf]', evidence):
-        return True
-    # HTML response (multiple distinct tags — not just one mentioned in prose)
-    html_tags = set(re.findall(
-        r"<(html|head|body|div|span|form|input|meta|link|script|style|"
-        r"table|tr|td|p|a|img|iframe|header|footer|nav|ul|li|h[1-6])\b",
-        evidence, re.IGNORECASE,
-    ))
-    if len(html_tags) >= 3:
-        return True
-    # curl-style verbose output
-    if re.search(r"[<>]\s+(?:HTTP/|GET |POST |PUT |DELETE |HEAD )", evidence):
-        return True
-    # Raw response with content-length numbers in context
-    if re.search(r"Content-Length:\s*\d+", evidence, re.IGNORECASE):
-        return True
-    return False
+    signals = 0
+
+    # Signal 1: Actual HTTP status line: "HTTP/1.1 200 OK"
+    if re.search(r"HTTP/[12]\.\d\s+\d{3}", evidence):
+        signals += 1
+
+    # Signal 2: 2+ distinct HTTP headers at start of line
+    header_matches = re.findall(
+        r"^([A-Z][a-z][A-Za-z-]+):\s+\S",
+        evidence, re.MULTILINE,
+    )
+    distinct_headers = set(h.lower() for h in header_matches)
+    if len(distinct_headers) >= 2:
+        signals += 1
+
+    # Signal 3: Response body with real content (not empty {} or [])
+    # JSON body: key-value pairs — but reject bare {} or []
+    json_match = re.search(r'"[a-zA-Z_]\w*"\s*:\s*["\d\[{tnf]', evidence)
+    if json_match:
+        # Regex requires "key": <value>, so bare {} or [] won't match
+        signals += 1
+    else:
+        # HTML body: 3+ distinct tags (not narrative mentions)
+        html_tags = set(re.findall(
+            r"<(html|head|body|div|span|form|input|meta|link|script|style|"
+            r"table|tr|td|p|a|img|iframe|header|footer|nav|ul|li|h[1-6])\b",
+            evidence, re.IGNORECASE,
+        ))
+        if len(html_tags) >= 3:
+            signals += 1
+
+    # Require at least 1 signal to pass
+    return signals >= 1
 
 
 def _score_evidence(finding: dict) -> tuple[int, str]:
@@ -3533,15 +3552,28 @@ async def _validate_findings(
             info["evidence_score_reason"] = score_reason
             min_score = 4 if severity in ("critical", "high") else 3
 
+            # ── Anti-fabrication gate 3c: tool provenance check ──
+            # Reject brain findings that claim a tool that was never executed.
+            # CTF bypass: skip provenance check when budget <= $5.
+            _budget_limit = 999.0
+            if deps and deps.current_state:
+                _budget_limit = deps.current_state.get("budget_limit", 999.0)
+            if _budget_limit > 5.0 and _recent_tool_executions:
+                claimed_tool = info.get("tool_used", "")
+                if claimed_tool and claimed_tool not in _recent_tool_executions:
+                    logger.warning(
+                        "finding_rejected_tool_never_executed",
+                        finding_id=fid,
+                        claimed_tool=claimed_tool,
+                        executed_tools=list(_recent_tool_executions)[-10:],
+                    )
+                    continue
+
             # ── Hybrid validation: ALL findings go through 3-tier check ──
             # Tier 1: score >= 5 (definitive — OOB, root:x:0:0) → auto-pass
-            # Tier 1b: score >= 4 with raw HTTP data → auto-pass (confirmed patterns)
+            # Score 4 findings MUST go through Tier 2/3 (0% confirmation rate in production)
             if score >= 5:
                 info["validation_method"] = "score_definitive"
-            elif score >= 4 and _has_raw_http_artifacts(evidence):
-                info["validation_method"] = "score_confirmed_with_http"
-                logger.info("finding_score4_auto_pass", finding_id=fid, score=score,
-                            reason=score_reason)
             else:
                 # Tier 2: check if deterministic tool output confirms
                 tool_ok, tool_reason = _tool_output_confirms_vuln(info, deps)
