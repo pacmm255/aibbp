@@ -129,6 +129,17 @@ class CapabilityGraph:
     Findings add capabilities; BFS finds paths to goals.
     """
 
+    # ── Human-readable goal labels ──────────────────────────────────
+    _GOAL_LABELS: dict[str, str] = {
+        "execute:os_command": "RCE",
+        "exfiltrate:pii": "Data Exfil",
+        "escalate:admin": "Admin Access",
+        "read:cloud_credentials": "Cloud Creds",
+        "escalate:account_takeover": "Account Takeover",
+        "read:database": "DB Access",
+        "write:filesystem": "File Write",
+    }
+
     def __init__(self) -> None:
         self._capabilities: dict[str, Capability] = {}
         self._findings: list[dict[str, Any]] = []
@@ -257,6 +268,80 @@ class CapabilityGraph:
                         suggestions.add(f"Test {effect.vuln_type} (can reach {cap})")
 
         return sorted(suggestions)[:10]
+
+    def format_for_prompt(self, state: dict[str, Any]) -> str:
+        """Build a compact Attack Capability Map for the dynamic prompt.
+
+        Shows:
+        - Unlocked capabilities from current findings
+        - Nearest reachable goal states with steps needed
+        - Blocked paths with what's missing
+
+        Only triggers when findings >= 2 or credentials/tokens exist.
+        Capped at 400 chars.
+        """
+        findings = state.get("findings", {})
+        wm = state.get("working_memory", {})
+        creds = wm.get("credentials", {}) if isinstance(wm, dict) else {}
+        accounts = state.get("accounts", {})
+        has_creds = bool(creds) or bool(accounts)
+
+        if len(findings) < 2 and not has_creds:
+            return ""
+
+        # Register findings if not already populated (idempotent — skips known caps)
+        if not self._findings:
+            for finfo in findings.values():
+                if isinstance(finfo, dict):
+                    self.register_finding(finfo)
+            self.bootstrap_from_tech_stack(state.get("tech_stack", []))
+
+        lines: list[str] = []
+
+        # 1) Unlocked capabilities (deduped by subject)
+        if self._granted:
+            seen: set[str] = set()
+            short_caps: list[str] = []
+            for c in sorted(self._granted):
+                subj = c.split(":", 1)[-1]
+                if subj not in seen:
+                    seen.add(subj)
+                    short_caps.append(subj)
+            lines.append("Unlocked: " + ", ".join(short_caps[:8]))
+
+        # 2) Nearest goals & blocked paths
+        chains = self.find_reachable_goals()
+        reached: list[str] = []
+        near: list[str] = []
+        blocked: list[str] = []
+        for chain in chains:
+            label = self._GOAL_LABELS.get(chain.goal, chain.goal)
+            if chain.confidence >= 1.0:
+                # Goal capability already granted by a finding
+                reached.append(label)
+            elif chain.confidence >= 0.8:
+                # Reachable: path exists, prereqs met, 1 step away
+                vuln_needed = chain.steps[0].get("vuln_type", "?") if chain.steps else "?"
+                near.append(f"{label}(via {vuln_needed})")
+            elif chain.missing_capabilities:
+                need = chain.missing_capabilities[0].split(":", 1)[-1]
+                blocked.append(f"{label}(need {need})")
+
+        if reached:
+            lines.append("REACHED: " + ", ".join(reached))
+        if near:
+            lines.append("Near: " + ", ".join(near[:3]))
+        if blocked:
+            lines.append("Blocked: " + ", ".join(blocked[:3]))
+
+        if not lines:
+            return ""
+
+        result = "## Attack Capability Map\n" + "\n".join(lines)
+        # Hard cap at 400 chars
+        if len(result) > 400:
+            result = result[:397] + "..."
+        return result
 
     def get_chain_suggestions(self) -> str:
         """Build prompt section with chain analysis."""

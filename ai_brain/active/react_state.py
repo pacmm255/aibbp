@@ -165,6 +165,8 @@ class PentestState(TypedDict, total=False):
     work_queue_stats: dict[str, Any]
     # Capability graph summary for prompt
     capability_snapshot: str
+    # Compact attack capability map for prompt
+    attack_capability_map: str
 
     # ── AuthZ & Schema Intelligence (Sprint 4) ────────────────────────
     # role -> serialized RoleContext
