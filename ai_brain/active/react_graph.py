@@ -3865,6 +3865,37 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
     })
     result["info_gain_history"] = info_gain_history[-20:]  # Keep last 20
 
+    # ── Anti-checklist: turns_since_finding counter ──────────
+    if new_findings > 0:
+        result["turns_since_finding"] = 0
+    else:
+        result["turns_since_finding"] = state.get("turns_since_finding", 0) + 1
+
+    # ── Anti-checklist: dead-end endpoint detection ─────────
+    # An endpoint becomes a dead end when >=3 tests on it returned nothing.
+    dead_ends = dict(state.get("dead_end_endpoints", {}))
+    current_turn = state.get("turn_count", 0)
+    if not had_progress:
+        # Count which endpoints were tested this turn without progress
+        for tc in tool_calls:
+            _tc_input = tc.input if hasattr(tc, "input") else {}
+            _ep_url = (
+                _tc_input.get("url", "")
+                or _tc_input.get("target", "")
+                or _tc_input.get("start_url", "")
+            )
+            if _ep_url:
+                entry = dead_ends.get(_ep_url, {"tests_run": 0, "last_test_turn": 0})
+                entry["tests_run"] = entry.get("tests_run", 0) + 1
+                entry["last_test_turn"] = current_turn
+                dead_ends[_ep_url] = entry
+    # Cap at 50 entries to prevent unbounded growth
+    if len(dead_ends) > 50:
+        # Keep the 50 with highest test counts
+        sorted_de = sorted(dead_ends.items(), key=lambda x: x[1].get("tests_run", 0), reverse=True)
+        dead_ends = dict(sorted_de[:50])
+    result["dead_end_endpoints"] = dead_ends
+
     # Update snapshots for next brain iteration
     if "endpoints" in result:
         result["endpoints_snapshot"] = json.dumps(result["endpoints"], default=str, indent=2)[:5000]
