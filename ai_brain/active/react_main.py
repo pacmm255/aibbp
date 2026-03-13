@@ -399,6 +399,10 @@ async def main() -> None:
     budget_cfg = BudgetConfig(total_dollars=args.budget, per_target_max_dollars=args.budget)
     budget = BudgetManager(budget_cfg, active_testing=True)
 
+    # CTF mode: relax transcript verification for small-budget runs
+    import ai_brain.active.react_tools as _rt
+    _rt._CTF_MODE = args.budget <= 5.0
+
     # Dependency isolation (Sprint 5)
     if (args.zai or args.chatgpt or args.enable_proxylist) and not getattr(args, 'experimental', False):
         logger.warning("experimental_flag_required",

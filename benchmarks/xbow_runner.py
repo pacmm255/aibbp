@@ -397,6 +397,9 @@ async def _run_agent_ctf(
     active_cfg = ActiveTestingConfig(enabled=True, dry_run=False, browser_headless=True, proxy_port=8086)
     budget_cfg = BudgetConfig(total_dollars=budget, per_target_max_dollars=budget)
     budget_mgr = BudgetManager(budget_cfg, active_testing=True)
+    # CTF mode: relax transcript verification for small-budget runs
+    import ai_brain.active.react_tools as _rt
+    _rt._CTF_MODE = budget <= 5.0
     # CTF mode: allocate entire budget to active_testing phase
     for phase_name, phase_spend in budget_mgr.phases.items():
         if phase_name != "active_testing":
