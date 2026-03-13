@@ -617,6 +617,8 @@ DYNAMIC_STATE_TEMPLATE = """\
 ### Strategic Insights (auto-derived from knowledge graph)
 {graph_insights}
 
+{tech_recommendations}
+
 ### Available Local Tools
 {available_tools}
 
@@ -1072,6 +1074,21 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
     except Exception:
         graph_insights = "  (graph unavailable)"
 
+    # Tech-stack-aware attack recommendations
+    tech_recommendations = ""
+    try:
+        from ai_brain.active.react_knowledge_graph import get_tech_recommendations
+        tech_stack_list = state.get("tech_stack", [])
+        app_model_for_tech = state.get("app_model", {})
+        recs = get_tech_recommendations(tech_stack_list, app_model_for_tech)
+        if recs:
+            rec_lines = ["### Tech-Stack Attacks (PRIORITIZE THESE)"]
+            for r in recs[:15]:  # Cap at 15 to stay under ~500 chars
+                rec_lines.append(f"  - {r}")
+            tech_recommendations = "\n".join(rec_lines)
+    except Exception:
+        pass  # Non-critical: tech recommendations are advisory
+
     # Available local tools
     available_tools = _get_available_tools()
 
@@ -1355,6 +1372,7 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         accounts_summary=accounts_summary,
         traffic_intelligence=traffic_intelligence,
         graph_insights=graph_insights,
+        tech_recommendations=tech_recommendations,
         available_tools=available_tools,
         dedup_summary=dedup_summary,
         memory_context=memory_context,

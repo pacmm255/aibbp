@@ -252,31 +252,14 @@ class KnowledgeGraph:
         return chains
 
     def _suggest_tech_attacks(self, state: dict[str, Any]) -> list[str]:
-        """Suggest attacks based on detected technologies."""
-        tech_stack = [t.lower() for t in state.get("tech_stack", [])]
-        suggestions = []
+        """Suggest attacks based on detected technologies.
 
-        tech_attack_map = {
-            "laravel": "Test Laravel debug mode (/_ignition), mass assignment, .env exposure",
-            "php": "Test PHP type juggling, LFI via include params, deserialization",
-            "wordpress": "Test wp-admin, xmlrpc.php, plugin vulns, user enumeration",
-            "django": "Test Django debug mode, SSTI in templates, admin panel",
-            "node": "Test prototype pollution, SSTI in Express/Pug, npm package vulns",
-            "react": "Check for exposed source maps, API keys in JS bundles",
-            "angular": "Test template injection in Angular expressions",
-            "spring": "Test Spring Actuator endpoints, SpEL injection",
-            "nginx": "Test path traversal via off-by-slash, alias misconfiguration",
-            "apache": "Test .htaccess bypass, mod_status, server-info",
-            "graphql": "Test GraphQL introspection, batch queries, injection in variables",
-            "jwt": "Test JWT none algorithm, key confusion, weak secrets",
-        }
-
-        for tech in tech_stack:
-            for key, attack in tech_attack_map.items():
-                if key in tech:
-                    suggestions.append(attack)
-
-        return suggestions
+        Delegates to the module-level TECH_ATTACK_MAP, returning the first
+        attack per matched technology for a compact insights summary.
+        """
+        recs = get_tech_recommendations(state.get("tech_stack", []))
+        # Return just the first recommendation per match for the compact insight line
+        return recs[:5]
 
     def _compute_hash(self, state: dict[str, Any]) -> str:
         """Compute a quick hash of state knowledge dicts."""
@@ -293,3 +276,217 @@ class KnowledgeGraph:
             if d:
                 parts.append(",".join(sorted(d.keys())[:20]))
         return "|".join(parts)
+
+
+# ── Tech-Stack Attack Map ────────────────────────────────────────────────
+# Maps technology keywords (lowercase) to ordered lists of specific attack
+# vectors.  Used by KnowledgeGraph._suggest_tech_attacks() (via delegation)
+# and by the module-level helper get_tech_recommendations().
+
+TECH_ATTACK_MAP: dict[str, list[str]] = {
+    "laravel": [
+        "Mass assignment via $fillable — POST extra fields (is_admin, role, balance)",
+        "Debug mode /_ignition — RCE via Ignition solution gadgets",
+        ".env exposure — GET /.env for APP_KEY, DB creds, mail secrets",
+        "Blade SSTI — inject {{ }} and {!! !!} in user-controlled template vars",
+        "Session cookie deserialization — tamper laravel_session with known APP_KEY",
+        "_debugbar — GET /_debugbar/open for queries, requests, vars",
+    ],
+    "express": [
+        "Prototype pollution — __proto__, constructor.prototype in JSON body",
+        "NoSQL injection — $gt, $ne, $regex operators in JSON params",
+        "SSRF via url/href/path params — internal service access",
+        "SSTI in Pug/EJS/Handlebars — #{} / <%= %> / {{}} in template inputs",
+        "Path traversal via ../ in Express static middleware",
+    ],
+    "node": [
+        "Prototype pollution — __proto__, constructor.prototype in JSON body",
+        "NoSQL injection — $gt, $ne, $regex operators in MongoDB queries",
+        "SSRF via url/href/path params — internal service access",
+        "npm package vulns — check package.json exposure, outdated deps",
+    ],
+    "django": [
+        "Debug page info leak — trigger 500 with DEBUG=True for settings, paths",
+        "ORM injection — extra(), raw(), annotate() with user input",
+        "Template injection — {% %} and {{ }} in user-controlled strings",
+        "Admin panel brute force — /admin/ with common creds",
+        "ALLOWED_HOSTS bypass — Host header manipulation for password reset poisoning",
+    ],
+    "spring": [
+        "Actuator endpoints — /actuator/env, /actuator/heapdump, /actuator/mappings",
+        "SpEL injection — ${} in error messages, input fields, headers",
+        "Deserialization RCE — ysoserial gadgets in serialized Java objects",
+        "Path traversal via ; — /admin;/..;/actuator/env bypasses path filters",
+        "Spring4Shell — class.module.classLoader.* parameter manipulation",
+    ],
+    "java": [
+        "Deserialization RCE — ysoserial gadgets in cookies, params, file uploads",
+        "JNDI injection — ${jndi:ldap://} in Log4j-vulnerable inputs",
+        "Path traversal via ; — /admin;/resource bypasses security filters",
+        "JSP webshell upload — .jsp extension in file upload features",
+    ],
+    "php": [
+        "Type juggling — 0e hash comparison bypass (0e123 == 0 in loose compare)",
+        "LFI/RFI — include/require params with ../../etc/passwd, php://filter",
+        "php:// wrappers — php://input for RCE, php://filter/convert.base64-encode",
+        ".php~ and .php.bak backup files — source code disclosure",
+        "Deserialization — unserialize() on user-controlled POP chain data",
+        "open_basedir bypass — symlink/glob:// for restricted file reads",
+    ],
+    "wordpress": [
+        "xmlrpc.php — system.multicall brute force, pingback SSRF",
+        "wp-json API — /wp-json/wp/v2/users for user enumeration",
+        "Plugin enumeration — /wp-content/plugins/[name]/ probing",
+        "User enumeration via ?author=1 — redirect leaks usernames",
+        "wp-config.php.bak — backup config with DB creds",
+        "wpscan — automated vuln scanning of plugins/themes/core",
+    ],
+    "asp.net": [
+        "ViewState deserialization — tamper __VIEWSTATE with known machineKey",
+        "IIS shortnames ~1 — /ABCDEF~1 brute force for hidden files/dirs",
+        "web.config disclosure — GET /web.config for connection strings, keys",
+        "Padding oracle — valid ciphertext manipulation on encrypted cookies",
+        "Trace.axd — /trace.axd for request/response history",
+    ],
+    "iis": [
+        "IIS shortnames ~1 — /ABCDEF~1 brute force for hidden files/dirs",
+        "web.config disclosure — path traversal to read web.config",
+        "Trace.axd — /trace.axd for request/response history",
+        ".aspx source via ::$DATA — /page.aspx::$DATA alternate data stream",
+    ],
+    "rails": [
+        "Mass assignment — unpermitted params (role, admin, is_superuser) in POST/PATCH",
+        "YAML deserialization — Psych/Syck gadgets in YAML-accepting endpoints",
+        "Debug console — /rails/info/routes, /_debug_console (dev mode)",
+        "secret_key_base leak — ENV exposure for cookie forgery/RCE",
+        "Render file — path traversal in render file: params",
+    ],
+    "ruby": [
+        "YAML deserialization — Psych/Syck gadgets in YAML-accepting endpoints",
+        "ERB template injection — <%= %> in user-controlled strings",
+        "Mass assignment — unpermitted params in strong parameters bypass",
+    ],
+    "nginx": [
+        "Off-by-slash path traversal — /static../etc/passwd (alias misconfiguration)",
+        "Alias misconfiguration — location /i { alias /data/; } leaks parent dir",
+        "Merge_slashes off — //admin bypasses location blocks",
+        "Raw backend response — X-Accel-Redirect header injection",
+    ],
+    "apache": [
+        ".htaccess upload — override server config for PHP execution",
+        "mod_status — /server-status for live request monitoring",
+        "mod_info — /server-info for full Apache configuration",
+        "Path traversal via %2e — /cgi-bin/.%2e/%2e%2e/etc/passwd (CVE-2021-41773)",
+        "AddHandler bypass — .php.jpg for PHP execution",
+    ],
+    "graphql": [
+        "Introspection query — full schema dump via __schema",
+        "Batch query — alias-based brute force (100+ login attempts in 1 request)",
+        "Injection in variables — SQLi/NoSQLi through variable values",
+        "Nested query DoS — deeply nested relationships for resource exhaustion",
+        "Field suggestion enumeration — typo-based field name discovery",
+    ],
+    "jwt": [
+        "None algorithm — set alg:none to bypass signature verification",
+        "Key confusion — RS256 to HS256 with public key as HMAC secret",
+        "Weak secret brute force — hashcat/jwt_tool on HS256 tokens",
+        "Kid injection — kid header for SQLi/LFI/command injection",
+        "JKU/X5U spoofing — point to attacker-controlled key server",
+    ],
+    "flask": [
+        "SSTI in Jinja2 — {{ config }} {{ ''.__class__.__mro__[1].__subclasses__() }}",
+        "Debug PIN — /console with Werkzeug debugger PIN calculation",
+        "Secret key brute force — flask-unsign for session cookie forgery",
+        "Blueprint enumeration — route discovery via debug mode or error pages",
+    ],
+    "fastapi": [
+        "OpenAPI schema — /docs, /redoc, /openapi.json for full API docs",
+        "Pydantic validation bypass — type coercion edge cases",
+        "Dependency injection — parameter pollution in query/body params",
+    ],
+    "nextjs": [
+        "API route SSRF — /api/* routes may proxy internal services",
+        "Source map exposure — /_next/static/ for source code",
+        "_next/data leaks — /__nextjs_original-stack-frame for debug info",
+        "Middleware bypass — direct fetch to API skipping auth middleware",
+    ],
+    "react": [
+        "Source maps — .map files expose original source code",
+        "API keys in JS bundles — search for hardcoded tokens, secrets",
+        "dangerouslySetInnerHTML — XSS via React-rendered user content",
+    ],
+    "angular": [
+        "Template injection — {{constructor.constructor('return this')()}}",
+        "Source maps — .map files expose TypeScript source",
+        "Bypassable sanitization — [innerHTML] with crafted payloads",
+    ],
+    "mongodb": [
+        "NoSQL injection — $gt, $ne, $regex, $where in query params",
+        "BSON injection — type confusion in ObjectId fields",
+        "Server-side JS — $where with JavaScript code injection",
+    ],
+    "redis": [
+        "Unauthenticated access — default port 6379, no password",
+        "SSRF to Redis — gopher:// or dict:// for command execution",
+        "Lua injection — EVAL command with user-controlled scripts",
+    ],
+    "docker": [
+        "Docker socket exposure — /var/run/docker.sock via SSRF",
+        "Container escape — privileged mode, mounted host dirs",
+        "Registry access — /v2/_catalog for image enumeration",
+    ],
+    "kubernetes": [
+        "API server access — /api/v1/pods, /api/v1/secrets via SSRF",
+        "Service account token — /var/run/secrets/kubernetes.io/serviceaccount/token",
+        "etcd access — unauthenticated etcd on port 2379",
+    ],
+    "aws": [
+        "SSRF to metadata — http://169.254.169.254/latest/meta-data/ for IAM creds",
+        "S3 bucket misconfiguration — public listing, unauthenticated upload",
+        "Cognito pool enumeration — user pools with self-registration enabled",
+    ],
+    "firebase": [
+        "Insecure Firestore rules — read/write without authentication",
+        "Cloud Functions — unauthenticated invocation of admin functions",
+        "Storage bucket — public listing of uploaded files",
+    ],
+}
+
+
+def get_tech_recommendations(
+    detected_techs: list[str],
+    app_model: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return prioritized attack recommendations for detected technologies.
+
+    Args:
+        detected_techs: List of technology strings from state['tech_stack'].
+        app_model: Optional app_model dict for additional tech signals.
+
+    Returns:
+        Deduplicated list of actionable attack strings.
+    """
+    all_techs: list[str] = [t.lower().strip() for t in detected_techs]
+    if app_model:
+        for t in app_model.get("tech_signals", []):
+            if isinstance(t, str):
+                all_techs.append(t.lower().strip())
+
+    if not all_techs:
+        return []
+
+    seen: set[str] = set()
+    recommendations: list[str] = []
+    for tech_keyword, attacks in TECH_ATTACK_MAP.items():
+        matched = False
+        for det in all_techs:
+            if tech_keyword in det:
+                matched = True
+                break
+        if matched:
+            for atk in attacks:
+                if atk not in seen:
+                    seen.add(atk)
+                    recommendations.append(atk)
+
+    return recommendations
