@@ -180,6 +180,13 @@ class PentestState(TypedDict, total=False):
     # {tool_name: "healthy"|"degraded"|"unavailable"} — set by preflight checks
     tool_health: dict[str, str]
 
+    # ── Anti-Checklist Exploitation ──────────────────────────────────
+    # Turns since the last finding was recorded (resets to 0 on new finding)
+    turns_since_finding: int
+    # Endpoints where >=3 tests returned nothing interesting → skip these
+    # endpoint_url → {tests_run: int, last_test_turn: int}
+    dead_end_endpoints: dict[str, dict[str, Any]]
+
     # ── Internal (not for brain consumption) ────────────────────────
     # Pending tool calls from brain_node → tool_executor_node
     _pending_tool_calls: list[Any]

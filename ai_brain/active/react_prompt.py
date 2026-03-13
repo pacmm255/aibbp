@@ -622,6 +622,9 @@ DYNAMIC_STATE_TEMPLATE = """\
 
 ### Testing Progress
 {dedup_summary}
+{stale_finding_warning}
+
+{dead_end_display}
 
 {working_memory_display}
 
@@ -683,25 +686,43 @@ scanner-level tasks. Spend your budget on DEEP testing of promising attack vecto
 - **ONE finding per vuln_type per endpoint** — duplicate findings for the same vulnerability on the same endpoint are auto-rejected. Do NOT submit open_redirect on /login 5 times with different parameter variants.
 - **These are NOT real vulnerabilities** (do not submit): login pages existing, password reset existing, public APIs returning public data, version numbers in headers, generic error pages, CAPTCHA not being rate-limited, standard OAuth redirects to the same domain, pre-auth session tokens
 
-### CRITICAL: No Repetition / Be Creative
-- **NEVER repeat a technique on the same endpoint.** Check "Testing Progress" above. If it's listed, \
-it's DONE. Move on.
-- **Think like a $100K bug bounty hunter.** The obvious tests are already done. You MUST be creative:
-  1. **Chain vulns together** — combine info disclosure + SSRF + auth bypass for bigger impact
-  2. **Race conditions** — concurrent requests to payment/transfer/vote endpoints
-  3. **Business logic** — buy negative quantities, use expired coupons, skip steps in wizards
-  4. **Second-order injection** — store XSS/SQLi via profile, trigger via admin view/export/PDF
-  5. **OAuth/SSO flaws** — redirect_uri manipulation, state parameter CSRF, token leakage
-  6. **WebSocket testing** — check ws:// endpoints for auth bypass, injection, IDOR
-  7. **GraphQL depth/complexity** — nested queries, alias batching, field suggestion enumeration
-  8. **Deserialization** — test upload/import features with serialized payloads
-  9. **Cache poisoning** — Host header, X-Forwarded-Host, parameter cloaking
-  10. **API versioning** — /v1/ vs /v2/ vs /v3/, /internal/, /debug/, /admin/
-  11. **Mobile API** — different User-Agent, /api/mobile/, different auth flows
-  12. **Subdomain takeover** — dangling CNAME, unclaimed cloud resources
-  13. **Email-based attacks** — password reset poisoning, Host header in email links
-  14. **JWT attacks** — algorithm confusion, key ID injection, claim manipulation
-- **Every 5 turns, ask yourself:** "What attack surface have I NOT touched yet?" Then go test it.
+### Decision Framework — Adaptive Testing (NOT a Checklist)
+
+After EVERY test, ask yourself these questions before choosing the next action:
+
+**1. Did this test reveal something interesting?**
+- YES (error, reflection, timing change, different status) → GO DEEPER on this exact endpoint \
+and parameter. Do NOT log it and move on. Test variations, chain it, escalate it.
+- NO (generic response, WAF block, identical to baseline) → MOVE ON immediately. Do not retry \
+the same class of test on this endpoint.
+
+**2. Can I CHAIN what I found?**
+- If you find information disclosure → use it to access something else (creds → login, paths → LFI)
+- If you find injection → extract data, pivot to admin, chain to RCE
+- If you find auth bypass → map the entire privileged surface, not just one page
+- A finding you cannot chain or demonstrate impact for is NOT bounty-worthy
+
+**3. Am I stuck in a loop?**
+- **Diminishing returns rule**: If you have tested 3+ vuln types on an endpoint with zero \
+interesting responses, mark it as a dead end and STOP testing it
+- **Approach pivot rule**: If 5+ endpoints show zero findings, CHANGE YOUR ENTIRE APPROACH. \
+Switch from injection testing to business logic, from parameter fuzzing to JS analysis, from \
+unauthenticated to authenticated testing
+- **Never test more than 3 vuln types** on an endpoint that shows no signs of vulnerability
+
+**Signs of a dead end (STOP testing here):**
+- WAF blocking everything with identical responses
+- All responses identical regardless of input (static page)
+- No dynamic content, no parameters, no forms
+- Endpoint returns same status/body for any payload
+
+**Signs of a live lead (GO DEEPER here):**
+- Different error messages for different inputs
+- Verbose errors revealing internals (stack traces, SQL errors, template errors)
+- Dynamic content that reflects or transforms input
+- Inconsistent auth enforcement across methods/paths
+- Timing variations that correlate with payload complexity
+- Different response sizes for similar inputs
 """
 
 
@@ -1158,6 +1179,43 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
 
     dedup_summary = "\n".join(dedup_lines) if dedup_lines else "  (no tests executed yet)"
 
+    # ── Turns since finding warning ──
+    turns_since_finding = state.get("turns_since_finding", 0)
+    stale_finding_warning = ""
+    if turns_since_finding >= 10:
+        stale_finding_warning = (
+            "\n### WARNING: No findings in {n} turns\n"
+            "You have been testing for {n} turns without discovering anything new. "
+            "This means your current approach is NOT working. Consider:\n"
+            "- Test DIFFERENT endpoint types (APIs, admin paths, authenticated surfaces)\n"
+            "- Switch to business logic attacks (race conditions, price manipulation, step skipping)\n"
+            "- Look for configuration issues (exposed .env, .git, backups, debug endpoints)\n"
+            "- Analyze JS bundles for hardcoded secrets, internal API routes, hidden endpoints\n"
+            "- Try authenticated testing if you haven't created accounts yet\n"
+            "- Focus on attack chains from existing partial findings\n"
+            "- If all else fails, pivot to a completely new attack surface (subdomains, mobile API)"
+        ).format(n=turns_since_finding)
+    elif turns_since_finding >= 5:
+        stale_finding_warning = (
+            "\n  NOTE: {n} turns without new findings. Your current approach may be losing effectiveness. "
+            "Consider pivoting soon."
+        ).format(n=turns_since_finding)
+
+    # ── Dead-end endpoints display ──
+    dead_ends = state.get("dead_end_endpoints", {})
+    dead_end_display = ""
+    if dead_ends:
+        actual_dead = {
+            ep: info for ep, info in dead_ends.items()
+            if info.get("tests_run", 0) >= 3
+        }
+        if actual_dead:
+            de_lines = ["### Dead Ends (skip these — 3+ tests with no results)"]
+            for ep, info in sorted(actual_dead.items(), key=lambda x: x[1].get("tests_run", 0), reverse=True)[:15]:
+                de_lines.append(f"  - {ep} ({info.get('tests_run', 0)} tests, last turn {info.get('last_test_turn', '?')})")
+            de_lines.append("Do NOT waste more turns on these endpoints. Focus on untested surfaces.")
+            dead_end_display = "\n".join(de_lines)
+
     # Session memory context (from prior sessions)
     memory_context = ""
     memory_path = state.get("memory_path", "")
@@ -1357,6 +1415,8 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
         graph_insights=graph_insights,
         available_tools=available_tools,
         dedup_summary=dedup_summary,
+        stale_finding_warning=stale_finding_warning,
+        dead_end_display=dead_end_display,
         memory_context=memory_context,
         working_memory_display=working_memory_display,
         phase_budget_display=phase_budget_display,
