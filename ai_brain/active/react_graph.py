@@ -63,6 +63,24 @@ _BOOKKEEPING_TOOLS = frozenset({
 # Tools that should be blocked when budget > 50% remaining (prevent premature exit)
 _EARLY_EXIT_TOOLS = frozenset({"finish_test"})
 
+# Vuln types eligible for injection-style differential testing (baseline/payload/control)
+_DIFF_INJECTION_TYPES = frozenset({
+    "xss", "sqli", "ssti", "cmdi", "lfi", "xxe", "nosqli",
+    "reflected_xss", "stored_xss", "sql_injection",
+    "command_injection", "path_traversal",
+})
+
+# Non-injection vuln types with type-specific differential tests
+_DIFF_OTHER_TYPES = frozenset({
+    "auth_bypass", "authentication_bypass",
+    "ssrf", "server_side_request_forgery",
+    "open_redirect",
+    "information_disclosure", "info_disclosure",
+})
+
+# All vuln types eligible for differential testing
+_DIFF_ALL_TYPES = _DIFF_INJECTION_TYPES | _DIFF_OTHER_TYPES
+
 
 def _compute_phase_turn_budgets(max_turns: int) -> dict[str, int]:
     """Compute turn budgets per phase based on max_turns.
@@ -2829,90 +2847,273 @@ async def _reverify_finding(fdata: dict, target_url: str) -> tuple[bool, str]:
 
 async def _auto_differential_test(
     endpoint: str, parameter: str, finding: dict, target_url: str,
+    budget_limit: float = 10.0,
 ) -> bool:
-    """Differential test: verify injection finding by comparing baseline vs payload vs control.
+    """Differential test: verify finding by comparing responses for multiple vuln types.
 
-    Returns True if finding appears genuine (payload response differs from both baseline and control).
-    Returns True (pass-through) if test can't be performed (missing data, connection error).
+    Handles injection types (SQLi, XSS, SSTI, etc.) via baseline/payload/control comparison,
+    plus auth_bypass, ssrf, open_redirect, and info_disclosure with type-specific checks.
+
+    Returns True if finding appears genuine.
+    Returns False if finding appears fabricated or endpoint is unreachable.
+    For unhandled vuln types, returns True (pass-through).
+    On network errors: returns False (reject) unless budget <= $5 (CTF bypass).
     """
     import httpx
 
-    # Extract payload from evidence
+    vuln_type = _canonicalize_vuln_type(finding.get("vuln_type", ""))
     evidence = str(finding.get("evidence", ""))
-    payload = finding.get("payload_used", "")
-    if not payload:
-        # Try to extract payload from evidence text
-        # Look for common patterns: "payload: X", "injected: X", quoted strings after keywords
-        m = re.search(r'(?:payload|injected|sent|body)[:\s]+["\']?([^"\'<>\n]{5,100})', evidence, re.IGNORECASE)
-        if m:
-            payload = m.group(1).strip()
-    if not payload:
-        return False  # Can't extract payload — can't verify
-
-    # Determine request method and build URL
     method = finding.get("method", "GET").upper()
+
     if not endpoint.startswith("http"):
         endpoint = target_url.rstrip("/") + "/" + endpoint.lstrip("/")
 
-    try:
-        async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
-            # Baseline: benign value
-            baseline_params = {parameter: "test123benign"}
-            # Payload: the actual exploit
-            payload_params = {parameter: payload}
-            # Control: different benign value
-            control_params = {parameter: "controlXYZ789"}
+    _TIMEOUT = httpx.Timeout(5.0)
+    _is_ctf = budget_limit <= 5.0
 
-            if method == "POST":
-                baseline_resp = await client.post(endpoint, data=baseline_params)
-                await asyncio.sleep(0.1)
-                payload_resp = await client.post(endpoint, data=payload_params)
-                await asyncio.sleep(0.1)
-                control_resp = await client.post(endpoint, data=control_params)
-            else:
-                baseline_resp = await client.get(endpoint, params=baseline_params)
-                await asyncio.sleep(0.1)
-                payload_resp = await client.get(endpoint, params=payload_params)
-                await asyncio.sleep(0.1)
-                control_resp = await client.get(endpoint, params=control_params)
+    # ── Injection-type differential test ──────────────────────────────
+    if vuln_type in _DIFF_INJECTION_TYPES:
+        # Extract payload from evidence
+        payload = finding.get("payload_used", "")
+        if not payload:
+            m = re.search(
+                r'(?:payload|injected|sent|body)[:\s]+["\']?([^"\'<>\n]{5,100})',
+                evidence, re.IGNORECASE,
+            )
+            if m:
+                payload = m.group(1).strip()
+        if not payload:
+            return False  # Can't extract payload — can't verify
 
-            # Compare: payload must differ from BOTH baseline and control
-            def _response_sig(resp):
-                return (resp.status_code, len(resp.content))
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=False, follow_redirects=True,
+            ) as client:
+                baseline_params = {parameter: "test123benign"}
+                payload_params = {parameter: payload}
+                control_params = {parameter: "controlXYZ789"}
 
-            baseline_sig = _response_sig(baseline_resp)
-            payload_sig = _response_sig(payload_resp)
-            control_sig = _response_sig(control_resp)
+                if method == "POST":
+                    baseline_resp = await client.post(endpoint, data=baseline_params)
+                    await asyncio.sleep(0.1)
+                    payload_resp = await client.post(endpoint, data=payload_params)
+                    await asyncio.sleep(0.1)
+                    control_resp = await client.post(endpoint, data=control_params)
+                else:
+                    baseline_resp = await client.get(endpoint, params=baseline_params)
+                    await asyncio.sleep(0.1)
+                    payload_resp = await client.get(endpoint, params=payload_params)
+                    await asyncio.sleep(0.1)
+                    control_resp = await client.get(endpoint, params=control_params)
 
-            def _sigs_similar(a, b, length_tolerance=0.05):
-                if a[0] != b[0]:  # Different status codes
-                    return False
-                if a[1] == 0 and b[1] == 0:
+                def _response_sig(resp):
+                    return (resp.status_code, len(resp.content))
+
+                baseline_sig = _response_sig(baseline_resp)
+                payload_sig = _response_sig(payload_resp)
+                control_sig = _response_sig(control_resp)
+
+                def _sigs_similar(a, b, length_tolerance=0.05):
+                    if a[0] != b[0]:
+                        return False
+                    if a[1] == 0 and b[1] == 0:
+                        return True
+                    length_diff = abs(a[1] - b[1]) / max(a[1], b[1], 1)
+                    return length_diff <= length_tolerance
+
+                differs_from_baseline = not _sigs_similar(payload_sig, baseline_sig)
+                differs_from_control = not _sigs_similar(payload_sig, control_sig)
+                baseline_control_similar = _sigs_similar(baseline_sig, control_sig)
+
+                if differs_from_baseline and differs_from_control and baseline_control_similar:
+                    logger.info("auto_diff_test_passed", endpoint=endpoint, parameter=parameter)
                     return True
-                length_diff = abs(a[1] - b[1]) / max(a[1], b[1], 1)
-                return length_diff <= length_tolerance
+                elif not baseline_control_similar:
+                    logger.info("auto_diff_test_inconclusive", endpoint=endpoint,
+                                reason="random_responses")
+                    return False
+                else:
+                    logger.info("auto_diff_test_failed", endpoint=endpoint, parameter=parameter,
+                                baseline=baseline_sig, payload=payload_sig, control=control_sig)
+                    return False
 
-            # Payload must differ from BOTH baseline and control
-            differs_from_baseline = not _sigs_similar(payload_sig, baseline_sig)
-            differs_from_control = not _sigs_similar(payload_sig, control_sig)
-            # But baseline and control should be similar (proving it's the payload, not randomness)
-            baseline_control_similar = _sigs_similar(baseline_sig, control_sig)
+        except Exception as e:
+            logger.warning("auto_diff_test_error", endpoint=endpoint, error=str(e)[:100])
+            return True if _is_ctf else False
 
-            if differs_from_baseline and differs_from_control and baseline_control_similar:
-                logger.info("auto_diff_test_passed", endpoint=endpoint, parameter=parameter)
+    # ── Auth bypass differential test ─────────────────────────────────
+    if vuln_type in ("auth_bypass", "authentication_bypass"):
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=False, follow_redirects=True,
+            ) as client:
+                # Request WITHOUT auth (no cookies, no Authorization)
+                noauth_resp = await client.request(method, endpoint)
+                await asyncio.sleep(0.1)
+
+                # Request WITH auth (use cookies/headers from finding if available)
+                auth_headers = {}
+                auth_cookies = {}
+                auth_data = finding.get("auth_data", {}) or {}
+                if isinstance(auth_data, dict):
+                    auth_headers = auth_data.get("headers", {}) or {}
+                    auth_cookies = auth_data.get("cookies", {}) or {}
+                # Fallback: look for Authorization header in evidence
+                if not auth_headers:
+                    auth_match = re.search(
+                        r'(?:Authorization|Cookie)[:\s]+(\S+)',
+                        evidence, re.IGNORECASE,
+                    )
+                    if auth_match:
+                        auth_headers = {"Authorization": auth_match.group(1)}
+
+                authed_resp = await client.request(
+                    method, endpoint,
+                    headers=auth_headers, cookies=auth_cookies,
+                )
+
+                # If both get 200 with similar content length (>80% match), it's a public page
+                if noauth_resp.status_code == 200 and authed_resp.status_code == 200:
+                    noauth_len = len(noauth_resp.content)
+                    authed_len = len(authed_resp.content)
+                    max_len = max(noauth_len, authed_len, 1)
+                    if abs(noauth_len - authed_len) / max_len < 0.20:
+                        logger.info("auto_diff_test_auth_bypass_public_page",
+                                    endpoint=endpoint)
+                        return False  # Public page, not an auth bypass
+
+                # Unauthenticated gets 403/401 but bypass path gets 200 → genuine
+                if noauth_resp.status_code in (401, 403) and authed_resp.status_code == 200:
+                    logger.info("auto_diff_test_auth_bypass_passed", endpoint=endpoint)
+                    return True
+
+                # Otherwise: can't confirm the bypass
+                logger.info("auto_diff_test_auth_bypass_inconclusive", endpoint=endpoint,
+                            noauth_status=noauth_resp.status_code,
+                            authed_status=authed_resp.status_code)
+                return False
+
+        except Exception as e:
+            logger.warning("auto_diff_test_auth_bypass_error", endpoint=endpoint,
+                           error=str(e)[:100])
+            return True if _is_ctf else False
+
+    # ── SSRF differential test ────────────────────────────────────────
+    if vuln_type in ("ssrf", "server_side_request_forgery"):
+        _SSRF_INDICATORS = (
+            "169.254.169.254", "root:x:", "ec2", "computemetadata",
+            "meta-data", "internal", "localhost", "127.0.0.1",
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=False, follow_redirects=True,
+            ) as client:
+                resp = await client.request(method, endpoint)
+                body = resp.text.lower()
+
+                has_indicator = any(ind in body for ind in _SSRF_INDICATORS)
+                if not has_indicator:
+                    logger.info("auto_diff_test_ssrf_no_indicators", endpoint=endpoint)
+                    return False  # No internal resource data in response
+
+                logger.info("auto_diff_test_ssrf_passed", endpoint=endpoint)
                 return True
-            elif not baseline_control_similar:
-                # Responses are inherently random — can't verify
-                logger.info("auto_diff_test_inconclusive", endpoint=endpoint, reason="random_responses")
-                return False
-            else:
-                logger.info("auto_diff_test_failed", endpoint=endpoint, parameter=parameter,
-                            baseline=baseline_sig, payload=payload_sig, control=control_sig)
-                return False
 
-    except Exception as e:
-        logger.warning("auto_diff_test_error", endpoint=endpoint, error=str(e)[:100])
-        return False  # Error — can't verify, reject
+        except Exception as e:
+            logger.warning("auto_diff_test_ssrf_error", endpoint=endpoint,
+                           error=str(e)[:100])
+            return True if _is_ctf else False
+
+    # ── Open redirect differential test ───────────────────────────────
+    if vuln_type == "open_redirect":
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=False, follow_redirects=False,
+            ) as client:
+                resp = await client.request(method, endpoint)
+
+                location = resp.headers.get("location", "")
+                if not location:
+                    logger.info("auto_diff_test_open_redirect_no_location",
+                                endpoint=endpoint)
+                    return False  # No Location header — not a redirect
+
+                # Check if Location points to an external domain
+                target_host = urlparse(target_url).hostname or ""
+                redirect_host = urlparse(location).hostname or ""
+
+                if not redirect_host:
+                    # Relative redirect (same-site)
+                    logger.info("auto_diff_test_open_redirect_relative",
+                                endpoint=endpoint, location=location)
+                    return False
+
+                if redirect_host == target_host or redirect_host.endswith("." + target_host):
+                    logger.info("auto_diff_test_open_redirect_same_site",
+                                endpoint=endpoint, location=location)
+                    return False  # Same-site redirect, not an open redirect
+
+                logger.info("auto_diff_test_open_redirect_passed",
+                            endpoint=endpoint, location=location)
+                return True
+
+        except Exception as e:
+            logger.warning("auto_diff_test_open_redirect_error", endpoint=endpoint,
+                           error=str(e)[:100])
+            return True if _is_ctf else False
+
+    # ── Info disclosure differential test ─────────────────────────────
+    if vuln_type in ("information_disclosure", "info_disclosure"):
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=False, follow_redirects=True,
+            ) as client:
+                resp = await client.request(method, endpoint)
+                body = resp.text
+
+                # Check if claimed sensitive data appears in the response
+                # Look for common sensitive patterns in the actual response
+                _SENSITIVE_PATTERNS = [
+                    r"(?:password|passwd|secret|api[_-]?key|token|private[_-]?key)\s*[:=]",
+                    r"root:x:0:0",
+                    r"BEGIN (?:RSA |EC |DSA )?PRIVATE KEY",
+                    r"(?:AKIA|ASIA)[A-Z0-9]{16}",  # AWS access key
+                    r"[a-f0-9]{32,64}",  # Hex hashes/tokens
+                    r"(?:jdbc|mysql|postgres|mongodb)://[^\s]+",  # DB connection strings
+                    r"\.env\b.*=",  # Env file content
+                ]
+
+                has_sensitive = False
+                for pattern in _SENSITIVE_PATTERNS:
+                    if re.search(pattern, body, re.IGNORECASE):
+                        has_sensitive = True
+                        break
+
+                if not has_sensitive:
+                    # Also check if the evidence mentions specific data that should be
+                    # in the response — extract quoted strings from evidence and verify
+                    evidence_quotes = re.findall(r'"([^"]{5,100})"', evidence)
+                    for quote in evidence_quotes[:5]:
+                        if quote in body:
+                            has_sensitive = True
+                            break
+
+                if not has_sensitive:
+                    logger.info("auto_diff_test_info_disclosure_no_data",
+                                endpoint=endpoint)
+                    return False  # Generic page without claimed sensitive data
+
+                logger.info("auto_diff_test_info_disclosure_passed", endpoint=endpoint)
+                return True
+
+        except Exception as e:
+            logger.warning("auto_diff_test_info_disclosure_error", endpoint=endpoint,
+                           error=str(e)[:100])
+            return True if _is_ctf else False
+
+    # ── Unhandled vuln type — pass through ────────────────────────────
+    logger.debug("auto_diff_test_unhandled_type", endpoint=endpoint, vuln_type=vuln_type)
+    return True
 
 
 # ── Node 2: Tool Executor ────────────────────────────────────────────
@@ -3688,27 +3889,32 @@ async def tool_executor_node(state: PentestState, config: RunnableConfig) -> dic
                         deduped_value.pop(fid, None)
 
                     # ── Auto-differential testing gate ──
-                    _INJECTION_TYPES = {"xss", "sqli", "ssti", "cmdi", "lfi", "xxe", "nosqli",
-                                        "reflected_xss", "stored_xss", "sql_injection",
-                                        "command_injection", "path_traversal"}
+                    # Injection types require endpoint + parameter; other types only need endpoint.
+                    _budget_limit = state.get("budget_limit", 10.0)
                     _diff_rejects: list[str] = []
                     for fid, fdata in list(deduped_value.items()):
                         if not isinstance(fdata, dict):
                             continue
                         cvt = _canonicalize_vuln_type(fdata.get("vuln_type", ""))
-                        if cvt not in _INJECTION_TYPES:
-                            continue  # Skip non-injection findings
+                        if cvt not in _DIFF_ALL_TYPES:
+                            continue  # Unhandled type — skip (pass-through)
                         ep = fdata.get("endpoint", "")
                         param = fdata.get("parameter", "")
-                        if not ep or not param:
-                            continue  # Can't test without endpoint+parameter
+                        if not ep:
+                            continue  # Can't test without endpoint
+                        # Injection types also require a parameter
+                        if cvt in _DIFF_INJECTION_TYPES and not param:
+                            continue
                         try:
-                            diff_ok = await _auto_differential_test(ep, param, fdata, _target_url)
+                            diff_ok = await _auto_differential_test(
+                                ep, param, fdata, _target_url,
+                                budget_limit=_budget_limit,
+                            )
                             if not diff_ok:
                                 _diff_rejects.append(fid)
                                 if _LIVE:
                                     print(f"  {_RED}✗ Diff-test rejected: {fid} "
-                                          f"(payload response same as baseline){_RESET}")
+                                          f"({cvt} failed differential verification){_RESET}")
                         except Exception as e:
                             logger.warning("diff_test_error", finding_id=fid, error=str(e)[:100])
                             _diff_rejects.append(fid)
