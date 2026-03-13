@@ -1006,14 +1006,23 @@ def _build_dynamic_state(state: dict[str, Any]) -> str:
     else:
         findings_snapshot = "  (none yet)"
 
-    # Hypotheses summary
+    # Hypotheses summary (brain-generated + adversarial engine)
     hypotheses = state.get("hypotheses", {})
+    h_lines: list[str] = []
     if hypotheses:
-        h_lines = []
         for hid, info in hypotheses.items():
             status = info.get("status", "pending")
             desc = info.get("description", "?")
             h_lines.append(f"  [{status}] {desc}")
+
+    # Append adversarial hypotheses from the reasoning engine (if available)
+    adversarial_summary = state.get("_adversarial_hypothesis_summary", "")
+    if adversarial_summary:
+        if h_lines:
+            h_lines.append("  --- auto-generated from observations ---")
+        h_lines.append(adversarial_summary)
+
+    if h_lines:
         hypotheses_summary = "\n".join(h_lines)
     else:
         hypotheses_summary = "  (none yet — form hypotheses during recon!)"
