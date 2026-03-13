@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import statistics
 import time
 from typing import Any
 
@@ -4347,8 +4348,7 @@ class AppLevelDoSScanner:
     )
 
     _NESTED_JSON_DEPTH = 500
-    _SLOWDOWN_THRESHOLD = 5.0
-    _MODERATE_THRESHOLD = 3.0
+    _SLOWDOWN_THRESHOLD = 10.0
     _MAX_REQUESTS = 90
 
     def __init__(self, scope_guard: ActiveScopeGuard, timeout: int = 10,
@@ -4369,10 +4369,12 @@ class AppLevelDoSScanner:
         findings: list[dict[str, Any]] = []
         endpoints_tested = 0
 
-        # Get baseline timing
-        baseline_ms = await self._get_baseline(base_url)
-        if baseline_ms is None:
-            baseline_ms = 200.0  # Fallback
+        # Get baseline timing (median + stdev)
+        baseline_result = await self._get_baseline(base_url)
+        if baseline_result is None:
+            baseline_ms, baseline_stdev = 200.0, 0.0  # Fallback
+        else:
+            baseline_ms, baseline_stdev = baseline_result
 
         # Collect test targets
         targets: list[str] = []
@@ -4393,7 +4395,7 @@ class AppLevelDoSScanner:
                 params = endpoints[url].get("params") or {}
             if params:
                 endpoints_tested += 1
-                f = await self._test_redos(url, params, baseline_ms)
+                f = await self._test_redos(url, params, baseline_ms, baseline_stdev)
                 findings.extend(f)
 
         # Test XML bomb on first few endpoints
@@ -4401,14 +4403,14 @@ class AppLevelDoSScanner:
             if self._requests_sent >= self._MAX_REQUESTS:
                 break
             endpoints_tested += 1
-            f = await self._test_xml_bomb(url, baseline_ms)
+            f = await self._test_xml_bomb(url, baseline_ms, baseline_stdev)
             if f:
                 findings.append(f)
 
         # Test GraphQL depth
         if graphql_url and self._requests_sent < self._MAX_REQUESTS:
             endpoints_tested += 1
-            f = await self._test_graphql_depth(graphql_url, baseline_ms)
+            f = await self._test_graphql_depth(graphql_url, baseline_ms, baseline_stdev)
             if f:
                 findings.append(f)
 
@@ -4417,7 +4419,7 @@ class AppLevelDoSScanner:
             if self._requests_sent >= self._MAX_REQUESTS:
                 break
             endpoints_tested += 1
-            f = await self._test_json_nesting(url, baseline_ms)
+            f = await self._test_json_nesting(url, baseline_ms, baseline_stdev)
             if f:
                 findings.append(f)
 
@@ -4441,10 +4443,16 @@ class AppLevelDoSScanner:
             "elapsed_seconds": elapsed,
         }
 
-    async def _get_baseline(self, url: str) -> float | None:
-        """Average response time over 3 requests (ms)."""
+    async def _get_baseline(self, url: str) -> tuple[float, float] | None:
+        """Median response time and stdev over 5 requests (ms).
+
+        Returns ``(median_ms, stdev_ms)`` or *None* if no successful
+        requests.  The median is clamped to a minimum of 100 ms so that
+        sub-100 ms baselines (dominated by jitter) don't produce
+        spurious slowdown ratios.
+        """
         times: list[float] = []
-        for _ in range(3):
+        for _ in range(5):
             if self._requests_sent >= self._MAX_REQUESTS:
                 break
             try:
@@ -4454,10 +4462,27 @@ class AppLevelDoSScanner:
                 times.append((time.monotonic() - t0) * 1000)
             except Exception:
                 pass
-        return sum(times) / len(times) if times else None
+        if not times:
+            return None
+        median = max(statistics.median(times), 100.0)  # floor at 100 ms
+        stdev = statistics.stdev(times) if len(times) > 1 else 0.0
+        return median, stdev
+
+    def _is_significant_slowdown(
+        self, test_ms: float, baseline_ms: float, baseline_stdev: float,
+    ) -> bool:
+        """Return True if the payload time is a statistically significant
+        slowdown — must exceed BOTH the ratio threshold AND 3-sigma above
+        the baseline median."""
+        ratio = test_ms / max(baseline_ms, 1)
+        return (
+            ratio >= self._SLOWDOWN_THRESHOLD
+            and test_ms > baseline_ms + 3 * baseline_stdev
+        )
 
     async def _test_redos(
         self, url: str, params: dict, baseline_ms: float,
+        baseline_stdev: float,
     ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
         text_params = [p for p in params if isinstance(params.get(p), str) or params.get(p) is None]
@@ -4465,6 +4490,8 @@ class AppLevelDoSScanner:
             text_params = list(params.keys())[:2]
 
         for param in text_params[:2]:
+            consecutive_slow = 0
+            last_slow_result: dict[str, Any] | None = None
             for dos_name, payload in self._REDOS_PAYLOADS:
                 if self._requests_sent >= self._MAX_REQUESTS:
                     return findings
@@ -4479,21 +4506,23 @@ class AppLevelDoSScanner:
                     test_ms = 10000.0
                     resp = None
                 except Exception:
+                    consecutive_slow = 0
+                    last_slow_result = None
                     continue
 
                 ratio = test_ms / max(baseline_ms, 1)
-                if ratio >= self._MODERATE_THRESHOLD:
-                    score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+                if self._is_significant_slowdown(test_ms, baseline_ms, baseline_stdev):
+                    consecutive_slow += 1
+                    score = 4 if ratio >= self._SLOWDOWN_THRESHOLD * 2 else 3
                     req_dump = f"GET {url}?{param}={payload[:80]}"
-                    resp_dump = ""
                     if resp:
                         resp_dump = f"HTTP {resp.status_code} ({test_ms:.0f}ms vs {baseline_ms:.0f}ms baseline)"
                     else:
                         resp_dump = f"TIMEOUT ({test_ms:.0f}ms vs {baseline_ms:.0f}ms baseline)"
-                    findings.append({
+                    last_slow_result = {
                         "endpoint": url,
                         "dos_type": f"redos_{dos_name}",
-                        "detail": f"ReDoS ({dos_name}) on param '{param}': {ratio:.1f}x slowdown",
+                        "detail": f"ReDoS ({dos_name}) on param '{param}': {ratio:.1f}x slowdown (confirmed by {consecutive_slow} consecutive payloads)",
                         "evidence_score": score,
                         "status_code": resp.status_code if resp else 0,
                         "baseline_time_ms": round(baseline_ms, 1),
@@ -4501,11 +4530,19 @@ class AppLevelDoSScanner:
                         "slowdown_ratio": round(ratio, 1),
                         "request_dump": req_dump,
                         "response_dump": resp_dump,
-                    })
+                    }
+                    if consecutive_slow >= 2:
+                        findings.append(last_slow_result)
+                        # Reset so we don't double-report for this param
+                        consecutive_slow = 0
+                        last_slow_result = None
+                else:
+                    consecutive_slow = 0
+                    last_slow_result = None
         return findings
 
     async def _test_xml_bomb(
-        self, url: str, baseline_ms: float,
+        self, url: str, baseline_ms: float, baseline_stdev: float,
     ) -> dict[str, Any] | None:
         try:
             self._requests_sent += 1
@@ -4521,11 +4558,11 @@ class AppLevelDoSScanner:
         except Exception:
             return None
 
-        ratio = test_ms / max(baseline_ms, 1)
-        if ratio < self._MODERATE_THRESHOLD:
+        if not self._is_significant_slowdown(test_ms, baseline_ms, baseline_stdev):
             return None
 
-        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        ratio = test_ms / max(baseline_ms, 1)
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD * 2 else 3
         return {
             "endpoint": url,
             "dos_type": "xml_bomb",
@@ -4540,7 +4577,7 @@ class AppLevelDoSScanner:
         }
 
     async def _test_graphql_depth(
-        self, graphql_url: str, baseline_ms: float,
+        self, graphql_url: str, baseline_ms: float, baseline_stdev: float,
     ) -> dict[str, Any] | None:
         # Build 50-deep nested __typename query
         query = "{ __typename " + "{ __typename " * 49 + "}" * 49 + "}"
@@ -4559,11 +4596,11 @@ class AppLevelDoSScanner:
         except Exception:
             return None
 
-        ratio = test_ms / max(baseline_ms, 1)
-        if ratio < self._MODERATE_THRESHOLD:
+        if not self._is_significant_slowdown(test_ms, baseline_ms, baseline_stdev):
             return None
 
-        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        ratio = test_ms / max(baseline_ms, 1)
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD * 2 else 3
         return {
             "endpoint": graphql_url,
             "dos_type": "graphql_depth",
@@ -4644,7 +4681,7 @@ class AppLevelDoSScanner:
             return None
 
     async def _test_json_nesting(
-        self, url: str, baseline_ms: float,
+        self, url: str, baseline_ms: float, baseline_stdev: float,
     ) -> dict[str, Any] | None:
         nested = "x"
         for _ in range(self._NESTED_JSON_DEPTH):
@@ -4663,11 +4700,11 @@ class AppLevelDoSScanner:
         except Exception:
             return None
 
-        ratio = test_ms / max(baseline_ms, 1)
-        if ratio < self._MODERATE_THRESHOLD:
+        if not self._is_significant_slowdown(test_ms, baseline_ms, baseline_stdev):
             return None
 
-        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD else 3
+        ratio = test_ms / max(baseline_ms, 1)
+        score = 4 if ratio >= self._SLOWDOWN_THRESHOLD * 2 else 3
         return {
             "endpoint": url,
             "dos_type": "json_nesting",
