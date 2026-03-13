@@ -2628,20 +2628,14 @@ _REJECT_VULN_TYPE_WORDS = frozenset({
     "general", "comprehensive", "final", "testing_complete",
 })
 
-# ── Evidence quality: at least one concrete indicator must be present ──
+# ── Evidence quality: require ACTUAL HTTP evidence, not narrative claims ──
+# Each match counts as one indicator; we require >=2 matches (see usage below).
 _EVIDENCE_INDICATORS = re.compile(
-    r"HTTP/[12][\.\d]*\s+\d{3}"  # HTTP status line (strict — not just any 3 digits)
-    r"|https?://\S+"    # URL
-    r"|<[a-zA-Z][^>]*>" # HTML/XML tag
-    r'|\{"\w+'          # JSON object with a key
-    r"|<script"         # XSS payload
-    r"|UNION\s+SELECT"  # SQLi payload (strict)
-    r"|\{\{7\*7\}\}"    # SSTI payload (strict)
-    r"|alert\("         # XSS indicator
-    r"|Location:\s*\S+" # HTTP redirect header with value
-    r"|Content-Type:\s*\S+" # HTTP header with value
-    r"|Set-Cookie:\s*\S+" # HTTP header with value
-    r"|sleep\s*\(\s*\d" # Time-based injection (function call)
+    r"HTTP/[12][\.\d]* \d{3}"                                                  # HTTP status line (strongest indicator)
+    r"|(?:Content-Type|Server|X-Powered-By|Set-Cookie|Location|WWW-Authenticate):\s"  # HTTP response headers
+    r"|\"(?:status(?:_code)?|headers|body|error|message|data)\"\s*:"            # JSON response keys
+    r"|<(?:html|head|body|form|input|script|div|table|pre)[>\s]"               # Actual HTML elements (not arbitrary tags)
+    r"|(?:root:x:0|uid=\d|\\x[0-9a-f]{2})"                                    # Binary/system data
     , re.IGNORECASE,
 )
 
@@ -3519,10 +3513,12 @@ async def _validate_findings(
                 )
                 continue
 
-            if not _EVIDENCE_INDICATORS.search(evidence):
+            indicator_matches = _EVIDENCE_INDICATORS.findall(evidence)
+            if len(indicator_matches) < 2:
                 logger.warning(
-                    "finding_rejected_no_indicators",
+                    "finding_rejected_insufficient_indicators",
                     finding_id=fid,
+                    indicator_count=len(indicator_matches),
                     evidence_preview=evidence[:100],
                 )
                 continue
