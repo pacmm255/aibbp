@@ -1119,7 +1119,7 @@ async def _dispatch(
     # ── Attack Tools ─────────────────────────────────────────────
 
     # Auto-WAF-fingerprint: before running attack tools, ensure WAF profile exists
-    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf"}
+    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_xss_comprehensive", "test_cmdi", "test_ssti", "test_ssrf"}
     if tool_name in _WAF_ATTACK_TOOLS and deps.waf_engine:
         url = inp.get("url", "")
         if url:
@@ -1152,6 +1152,32 @@ async def _dispatch(
             url=inp["url"],
             params=inp.get("params"),
         )
+
+    if tool_name == "test_xss_comprehensive":
+        from ai_brain.active.xss_attack_engine import XSSAttackEngine
+        engine = XSSAttackEngine(
+            rate_delay=0.3,
+            scope_domains=getattr(deps, "scope_domains", None),
+        )
+        results = await engine.full_scan(
+            url=inp["url"],
+            method=inp.get("method", "GET"),
+            param=inp.get("param"),
+            params=inp.get("params"),
+        )
+        # Build summary
+        vulns = [r for r in results if r.get("vulnerable")]
+        sections = []
+        for v in vulns:
+            sections.append(
+                f"- [{v.get('severity','medium').upper()}] {v.get('technique','unknown')}: "
+                f"{v.get('description','')[:200]}"
+            )
+        summary = (
+            f"XSS comprehensive scan: {len(results)} tests, {len(vulns)} potential vulnerabilities\n"
+            + "\n".join(sections[:20])
+        )
+        return {"raw_text": summary, "findings": vulns, "total_tests": len(results)}
 
     if tool_name == "test_cmdi":
         return await deps.tool_runner.run_commix(
@@ -3182,7 +3208,7 @@ _REQUIRED_FINDING_FIELDS = ("vuln_type", "endpoint", "severity")
 
 # ── Anti-fabrication: tool provenance allowlist ──
 _REAL_TOOL_NAMES = frozenset({
-    "test_sqli", "test_xss", "test_cmdi", "test_ssrf", "test_ssti",
+    "test_sqli", "test_xss", "test_xss_comprehensive", "test_cmdi", "test_ssrf", "test_ssti",
     "test_auth_bypass", "test_idor", "test_jwt", "test_file_upload",
     "test_race_condition", "test_authz_matrix",
     "blind_sqli_extract", "systematic_fuzz", "response_diff_analyze",
@@ -3586,7 +3612,7 @@ def _get_matching_tool_result(finding: dict, deps: ToolDeps | None) -> str:
                     return tresult
 
     # Pass 3: return the most recent exploitation tool result (better than nothing)
-    _exploit_tools = {"test_xss", "test_sqli", "test_ssrf", "test_ssti", "test_cmdi",
+    _exploit_tools = {"test_xss", "test_xss_comprehensive", "test_sqli", "test_ssrf", "test_ssti", "test_cmdi",
                       "test_idor", "test_auth_bypass", "test_race_condition", "test_jwt",
                       "test_file_upload", "test_authz_matrix", "run_custom_exploit",
                       "send_http_request", "response_diff_analyze", "blind_sqli_extract",
@@ -3638,6 +3664,13 @@ def _tool_output_confirms_vuln(finding: dict, deps: ToolDeps | None) -> tuple[bo
                     and (f.get("payload") or f.get("poc") or f.get("data"))]
             if real:
                 return True, f"tool_confirmed: test_xss found {len(real)} XSS with payloads"
+
+    # ── test_xss_comprehensive: XSSAttackEngine findings ──
+    if tool_used == "test_xss_comprehensive":
+        findings = data.get("findings", [])
+        real = [f for f in findings if f.get("vulnerable")]
+        if real:
+            return True, f"tool_confirmed: test_xss_comprehensive found {len(real)} XSS"
 
     # ── test_sqli / sqlmap: injectable or extracted data ──
     if tool_used in ("test_sqli", "blind_sqli_extract"):
