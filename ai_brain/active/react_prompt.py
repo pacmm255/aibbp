@@ -78,7 +78,7 @@ strict priority order:
 `scan_csrf`, `scan_error_responses`. \
 These are FREE (zero LLM cost), run hundreds of tests, and are highly reliable.
 2. **Built-in attack tools SECOND** — `send_http_request`, `test_sqli`, `test_xss`, \
-`test_auth_bypass`, `test_idor`, `test_jwt`, `test_file_upload`. These \
+`test_xss_comprehensive`, `test_auth_bypass`, `test_idor`, `test_jwt`, `test_file_upload`. These \
 are purpose-built and handle edge cases better than hand-written scripts.
 3. **Browser tools THIRD** — `navigate_and_extract`, `browser_interact` for JS-heavy \
 pages, form interactions, cookie-based auth, and visual verification.
@@ -545,6 +545,7 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
     "test_sqli": "sqli",
     "blind_sqli_extract": "sqli",
     "test_xss": "xss",
+    "test_xss_comprehensive": "xss",
     "test_ssrf": "ssrf",
     "test_cmdi": "cmdi",
     "test_ssti": "ssti",
@@ -1911,6 +1912,41 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
                 "params": {
                     "type": "object",
                     "description": "Specific parameters to test",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "test_xss_comprehensive",
+        "description": (
+            "Comprehensive XSS scan with 360+ payloads across 12 categories: "
+            "reflected (HTML body, attribute, JS context), stored, DOM-based, "
+            "mutation XSS (mXSS), filter/WAF/CSP bypass, browser-specific, "
+            "framework-specific (Angular/React/Vue/jQuery), and non-standard vectors. "
+            "Includes context-aware payload selection, CSP analysis, and "
+            "CVE-referenced techniques. Zero LLM cost — pure deterministic testing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target URL to test for XSS",
+                },
+                "method": {
+                    "type": "string",
+                    "description": "HTTP method (GET or POST)",
+                    "enum": ["GET", "POST"],
+                },
+                "param": {
+                    "type": "string",
+                    "description": "Specific parameter name to test",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameters to include in the request",
                     "additionalProperties": {"type": "string"},
                 },
             },
@@ -3898,7 +3934,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "run_role_differential", "create_role_account",  # Sprint 4: authz testing
     } | _UNIVERSAL_TOOLS,
     "exploitation": {
-        "send_http_request", "test_sqli", "test_xss", "test_cmdi",
+        "send_http_request", "test_sqli", "test_xss", "test_xss_comprehensive", "test_cmdi",
         "test_auth_bypass", "test_idor", "test_file_upload", "test_jwt",
         "run_custom_exploit", "blind_sqli_extract", "response_diff_analyze",
         "systematic_fuzz", "browser_interact", "navigate_and_extract",
