@@ -539,6 +539,7 @@ STANDARD_TECHNIQUES: list[str] = [
     "upload", "jwt", "race", "info_disc", "diff", "js_scan", "graphql", "fuzz",
     "csrf", "error_disc", "crlf", "header_injection",
     "nosqli", "xxe", "deser", "dos", "jwt_deep",
+    "memcorrupt",
 ]
 
 _TOOL_TO_TECHNIQUE: dict[str, str] = {
@@ -583,6 +584,7 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
     "test_step_skipping": "fuzz",
     "track_object_ownership": "authz",
     "ingest_api_schema": "fuzz",
+    "test_memcorrupt": "memcorrupt",
 }
 
 # ── Dynamic State Template (changes every turn, NOT cached) ──────
@@ -2790,6 +2792,26 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "url": {"type": "string", "description": "Target URL to discover specs from"},
                 "spec_url": {"type": "string", "description": "Direct URL to spec (optional, auto-discovers if empty)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "test_memcorrupt",
+        "description": "Test for memory corruption vulnerabilities: buffer overflow, heap overflow, use-after-free, Heartbleed, Shellshock, HTTP/2 CONTINUATION flood, Rapid Reset, Log4Shell, Spring4Shell, server-specific CVEs (Apache, nginx, IIS, HAProxy, Envoy), runtime CVEs (PHP, Java, Node.js, .NET), network appliance CVEs (PAN-OS, Citrix, FortiOS, F5, Ivanti). Uses version fingerprinting, protocol-level probes, crash detection, and error pattern analysis. 175+ CVE database.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL to test"},
+                "tech_stack": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Known technologies (e.g. ['apache', 'php', 'mysql']). Helps prioritize relevant probes.",
+                },
+                "skip_protocol_probes": {
+                    "type": "boolean",
+                    "description": "Skip raw socket TLS/HTTP2 probes (faster but misses Heartbleed, CONTINUATION flood, etc.)",
+                },
             },
             "required": ["url"],
         },

@@ -1080,7 +1080,7 @@ async def _dispatch(
     # ── Attack Tools ─────────────────────────────────────────────
 
     # Auto-WAF-fingerprint: before running attack tools, ensure WAF profile exists
-    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf"}
+    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf", "test_memcorrupt"}
     if tool_name in _WAF_ATTACK_TOOLS and deps.waf_engine:
         url = inp.get("url", "")
         if url:
@@ -1105,6 +1105,25 @@ async def _dispatch(
             url=inp["url"],
             params=inp.get("params"),
         )
+
+    if tool_name == "test_memcorrupt":
+        from ai_brain.active.memcorrupt_attack_engine import MemCorruptionAttackEngine
+        engine = MemCorruptionAttackEngine(
+            rate_delay=0.3,
+            scope_domains=getattr(deps, "scope_domains", None),
+            scope_guard=getattr(deps, "scope_guard", None),
+            socks_proxy=getattr(deps, "socks_proxy", None),
+        )
+        results = await engine.full_scan(
+            url=inp["url"],
+            tech_stack=inp.get("tech_stack"),
+            skip_protocol_probes=inp.get("skip_protocol_probes", False),
+        )
+        vulns = [r for r in results if r.get("vulnerable")]
+        summary_parts = [f"Memory corruption scan complete: {len(results)} tests, {len(vulns)} vulnerabilities found"]
+        for v in vulns[:10]:
+            summary_parts.append(f"  - [{v.get('severity','?').upper()}] {v.get('technique','?')}: {v.get('description','')[:120]} (confidence: {v.get('confidence','?')}, CVEs: {', '.join(v.get('cves', [])[:3])})")
+        return {"raw_text": "\n".join(summary_parts), "findings": vulns, "total_tests": len(results)}
 
     if tool_name == "test_cmdi":
         return await deps.tool_runner.run_commix(
@@ -2620,6 +2639,7 @@ _REAL_TOOL_NAMES = frozenset({
     "discover_auth_endpoints",
     "build_app_model",
     "recon_blitz_opus",
+    "test_memcorrupt",
 })
 
 # ── Anti-fabrication: reject summary/meta vuln types ──
@@ -2893,7 +2913,7 @@ def _get_matching_tool_result(finding: dict, deps: ToolDeps | None) -> str:
                       "test_idor", "test_auth_bypass", "test_race_condition", "test_jwt",
                       "test_file_upload", "test_authz_matrix", "run_custom_exploit",
                       "send_http_request", "response_diff_analyze", "blind_sqli_extract",
-                      "scan_auth_bypass"}
+                      "scan_auth_bypass", "test_memcorrupt"}
     for tname, tresult in reversed(deps.recent_tool_results):
         if tname in _exploit_tools:
             return tresult
@@ -2966,6 +2986,13 @@ def _tool_output_confirms_vuln(finding: dict, deps: ToolDeps | None) -> tuple[bo
             return True, "tool_confirmed: SSRF with internal data in response"
         # Don't auto-confirm SSRF that just got a normal page back
         return False, "ssrf_vulnerable_but_no_internal_data"
+
+    # ── test_memcorrupt: confirmed/probable findings ──
+    if tool_used == "test_memcorrupt":
+        findings = data.get("findings", [])
+        confirmed = [f for f in findings if isinstance(f, dict) and f.get("vulnerable") and f.get("confidence") in ("confirmed", "probable")]
+        if confirmed:
+            return True, f"tool_confirmed: memcorrupt found {len(confirmed)} issues ({', '.join(c.get('technique', '?') for c in confirmed[:3])})"
 
     return False, ""
 
