@@ -61,6 +61,15 @@ _http_rate_lock = asyncio.Lock()
 _GLOBAL_OBSERVATIONS: list[Observation] = []
 _MAX_OBSERVATIONS = 200
 
+# ── SQLi comprehensive engine result sections ──────────────────────────
+# Shared between the tool handler and _tool_output_confirms_vuln to avoid drift.
+_SQLI_COMPREHENSIVE_SECTIONS = (
+    "error_based", "union_based", "boolean_blind",
+    "time_blind", "oob", "second_order",
+    "stacked_queries", "header_injection", "nosql",
+    "orm_injection", "db_quirks",
+)
+
 
 async def _http_rate_limit() -> None:
     """Wait if needed to enforce global HTTP rate limit."""
@@ -1080,7 +1089,7 @@ async def _dispatch(
     # ── Attack Tools ─────────────────────────────────────────────
 
     # Auto-WAF-fingerprint: before running attack tools, ensure WAF profile exists
-    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf"}
+    _WAF_ATTACK_TOOLS = {"test_sqli", "test_xss", "test_cmdi", "test_ssti", "test_ssrf", "test_sqli_comprehensive"}
     if tool_name in _WAF_ATTACK_TOOLS and deps.waf_engine:
         url = inp.get("url", "")
         if url:
@@ -2071,6 +2080,74 @@ async def _dispatch(
             "confidence": inp.get("confidence", "medium"),
         }
 
+    # ── Comprehensive SQLi Testing ─────────────────────────────────────
+    if tool_name == "test_sqli_comprehensive":
+        from ai_brain.active.sqli_attack_engine import SQLiAttackEngine
+        engine = SQLiAttackEngine(
+            scope_guard=deps.scope_guard,
+            socks_proxy=deps.goja_socks5_url,
+        )
+        target_url = inp["url"]
+        method = inp.get("method", "GET")
+        param = inp.get("param")
+        params = inp.get("params")
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (ValueError, TypeError):
+                params = None
+
+        scan_result = await engine.full_scan(
+            target_url,
+            method=method,
+            param=param,
+            params=params if isinstance(params, dict) else None,
+        )
+
+        # Auto-generate findings for confirmed vulnerabilities
+        auto_findings: dict[str, Any] = {}
+        for section in _SQLI_COMPREHENSIVE_SECTIONS:
+            for finding in scan_result.get(section, []):
+                if not finding.get("vulnerable"):
+                    continue
+                technique = finding.get("technique", "unknown")
+                desc = finding.get("description", "")
+                payload = finding.get("payload", finding.get("evidence", ""))
+                severity = finding.get("severity", "medium")
+                db_engine = finding.get("db_engine", "unknown")
+                fid = (
+                    f"sqli_{technique}_"
+                    f"{hashlib.md5((payload or desc).encode(errors='replace')).hexdigest()[:8]}"
+                )
+                auto_findings[fid] = {
+                    "vuln_type": "sql_injection",
+                    "endpoint": target_url,
+                    "parameter": param or technique,
+                    "evidence": (
+                        f"SQLi {technique} ({db_engine}): {desc} "
+                        f"Payload: {str(payload)[:200]}. "
+                        f"Response: HTTP {finding.get('response_status', 'N/A')}. "
+                        f"{finding.get('evidence', '')}"
+                    ),
+                    "severity": severity,
+                    "confirmed": True,
+                    "tool_used": "test_sqli_comprehensive",
+                    "evidence_score": 4,
+                    "evidence_score_reason": f"confirmed: SQLi {technique} on {db_engine}",
+                }
+                cves = finding.get("cves", [])
+                if cves:
+                    auto_findings[fid]["evidence"] += f" Related CVEs: {', '.join(cves)}"
+
+        state_update: dict[str, Any] = {}
+        if auto_findings:
+            state_update["findings"] = auto_findings
+
+        if state_update:
+            scan_result["_state_update"] = state_update
+
+        return scan_result
+
     # ── Subtask Plan Tools ──────────────────────────────────────────
     if tool_name == "plan_subtasks":
         subtasks = inp.get("subtasks", [])
@@ -2893,7 +2970,7 @@ def _get_matching_tool_result(finding: dict, deps: ToolDeps | None) -> str:
                       "test_idor", "test_auth_bypass", "test_race_condition", "test_jwt",
                       "test_file_upload", "test_authz_matrix", "run_custom_exploit",
                       "send_http_request", "response_diff_analyze", "blind_sqli_extract",
-                      "scan_auth_bypass"}
+                      "scan_auth_bypass", "test_sqli_comprehensive"}
     for tname, tresult in reversed(deps.recent_tool_results):
         if tname in _exploit_tools:
             return tresult
@@ -2948,6 +3025,14 @@ def _tool_output_confirms_vuln(finding: dict, deps: ToolDeps | None) -> tuple[bo
             return True, "tool_confirmed: sqlmap injectable=true"
         if data.get("extracted_data") or data.get("extracted"):
             return True, "tool_confirmed: SQL data extracted"
+
+    # ── test_sqli_comprehensive: confirmed findings across 12 categories ──
+    if tool_used == "test_sqli_comprehensive":
+        for section in _SQLI_COMPREHENSIVE_SECTIONS:
+            for f in data.get(section, []):
+                if f.get("vulnerable"):
+                    technique = f.get("technique", section)
+                    return True, f"tool_confirmed: sqli_comprehensive {technique} vulnerable=true"
 
     # ── scan_info_disclosure: deterministic scanner findings ──
     if tool_used == "scan_info_disclosure" and data.get("findings"):

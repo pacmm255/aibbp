@@ -75,7 +75,7 @@ strict priority order:
 1. **$0 deterministic tools FIRST** — `systematic_fuzz`, `response_diff_analyze`, \
 `blind_sqli_extract`, `run_content_discovery`, `test_ssrf`, `test_ssti`, \
 `test_race_condition`, `analyze_graphql`, `analyze_js_bundle`, `test_authz_matrix`, \
-`scan_csrf`, `scan_error_responses`. \
+`scan_csrf`, `scan_error_responses`, `test_sqli_comprehensive`. \
 These are FREE (zero LLM cost), run hundreds of tests, and are highly reliable.
 2. **Built-in attack tools SECOND** — `send_http_request`, `test_sqli`, `test_xss`, \
 `test_auth_bypass`, `test_idor`, `test_jwt`, `test_file_upload`. These \
@@ -91,7 +91,7 @@ extract creds via blind SQLi THEN login with them in one atomic script)
 
 **NEVER use `run_custom_exploit` to do what a built-in tool already does.** For example:
 - Want to send an HTTP request? → Use `send_http_request`, NOT a custom Python script
-- Want to test SQLi? → Use `test_sqli` or `response_diff_analyze`, NOT custom code
+- Want to test SQLi? → Use `test_sqli_comprehensive`, `test_sqli`, or `response_diff_analyze`, NOT custom code
 - Want to fuzz parameters? → Use `systematic_fuzz`, NOT custom loops
 - Want to test CORS? → Use `send_http_request` with Origin header, NOT custom code
 - Want to enumerate directories? → Use `run_content_discovery` or `systematic_fuzz`, NOT custom code
@@ -155,8 +155,8 @@ When you encounter these situations, follow these decision trees:
    Use `run_content_discovery` or `navigate_and_extract` on common paths.
 4. Run `test_auth_bypass` with method=POST — tests header spoofing + verb tampering
 5. Check for SQL injection on EACH form field INDIVIDUALLY (see Parameter Isolation Protocol)
-6. Try `test_sqli` with sqlmap ONLY on identified vulnerable param
-7. Check for NoSQL injection if MongoDB/Node.js detected: `username[$ne]=x&password[$ne]=x`
+6. Try `test_sqli_comprehensive` for 200+ SQLi techniques (error, UNION, blind, OOB, NoSQL, ORM), or `test_sqli` (sqlmap) on identified vulnerable param
+7. Check for NoSQL injection if MongoDB/Node.js detected: `username[$ne]=x&password[$ne]=x` (also covered by `test_sqli_comprehensive`)
 8. Only then consider brute force with hydra
 
 ### Blind Injection Suspected (no output reflected)
@@ -246,7 +246,7 @@ When you encounter these situations, follow these decision trees:
       - target_query: SELECT flag FROM flag (or SELECT password FROM users, etc.)
    c. Alternative: use content_contains condition if the response differs between true/false
 6. For error-based: Look for MySQL/PostgreSQL error strings in the differing response
-7. Run `test_sqli` (sqlmap) ONLY on the identified vulnerable param
+7. Run `test_sqli_comprehensive` for full coverage, or `test_sqli` (sqlmap) on the identified vulnerable param
 8. IMPORTANT: Even if the app uses `prepare()`, one param may be string-interpolated directly
 
 ### 403 Forbidden Response
@@ -566,6 +566,7 @@ _TOOL_TO_TECHNIQUE: dict[str, str] = {
     "test_cache_poisoning": "fuzz",
     "test_ghost_params": "fuzz",
     "test_prototype_pollution": "fuzz",
+    "test_sqli_comprehensive": "sqli",
     "scan_csrf": "csrf",
     "scan_error_responses": "error_disc",
     "scan_crlf": "crlf",
@@ -646,7 +647,7 @@ NO WAF detection, NO missing headers. If it wouldn't get paid on HackerOne, don'
 - ALWAYS verify findings before reporting — false positives waste budget
 - Focus EXCLUSIVELY on HIGH/CRITICAL impact: RCE, SQLi, SSRF, auth bypass, IDOR, ATO, privesc
 - **PREFER built-in tools over run_custom_exploit** — use systematic_fuzz ($0), \
-send_http_request, test_sqli, test_xss, response_diff_analyze, blind_sqli_extract \
+send_http_request, test_sqli, test_sqli_comprehensive, test_xss, response_diff_analyze, blind_sqli_extract \
 BEFORE writing custom code. run_custom_exploit should be <10% of your tool calls.
 - Use $0 deterministic tools (systematic_fuzz, response_diff_analyze, blind_sqli_extract, \
 run_content_discovery) aggressively — they cost nothing and test hundreds of payloads
@@ -1869,9 +1870,11 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
     {
         "name": "test_sqli",
         "description": (
-            "Test a URL/parameter for SQL injection using sqlmap. Supports various "
+            "Test a URL/parameter for SQL injection using sqlmap (external tool). Supports various "
             "techniques (Boolean, Error, Union, Stacked, Time-based). Pass specific "
-            "parameters to test, or let sqlmap auto-detect from the URL query string."
+            "parameters to test, or let sqlmap auto-detect from the URL query string. "
+            "For broader coverage (200+ payloads, NoSQL, ORM, header injection, OOB), "
+            "use test_sqli_comprehensive instead."
         ),
         "input_schema": {
             "type": "object",
@@ -2287,7 +2290,8 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Generate bypass payloads for a specific attack type based on WAF fingerprint. "
             "Must run waf_fingerprint first. Returns payloads ranked by bypass confidence. "
-            "Zero LLM cost."
+            "Strategies include scientific notation, JSON-based injection, Unicode normalization, "
+            "HTTP Parameter Pollution (HPP), and encoding chains. Zero LLM cost."
         ),
         "input_schema": {
             "type": "object",
@@ -2790,6 +2794,47 @@ _ATTACK_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "url": {"type": "string", "description": "Target URL to discover specs from"},
                 "spec_url": {"type": "string", "description": "Direct URL to spec (optional, auto-discovers if empty)"},
+            },
+            "required": ["url"],
+        },
+    },
+    # ── Comprehensive SQLi Testing ──
+    {
+        "name": "test_sqli_comprehensive",
+        "description": (
+            "Comprehensive SQL injection testing engine with 200+ techniques across "
+            "12 categories and 5 database engines (MySQL, MSSQL, PostgreSQL, Oracle, "
+            "SQLite). Tests: error-based (21 variants), UNION-based with column "
+            "enumeration, boolean-blind with differential analysis, time-based blind, "
+            "out-of-band (DNS/HTTP exfiltration), second-order injection, stacked "
+            "queries, header injection (X-Forwarded-For, User-Agent, Cookie), NoSQL "
+            "injection (MongoDB, CouchDB, Redis, Elasticsearch, DynamoDB, Firebase), "
+            "ORM-specific (Hibernate, Django, Rails, Sequelize, Prisma, TypeORM), and "
+            "DB engine quirks (version comments, GBK charset, dollar-quoting, HANDLER, "
+            "ATTACH DATABASE). Zero LLM cost. References: CVE-2023-34362 (MOVEit), "
+            "CVE-2025-1094 (PostgreSQL), CVE-2024-42005 (Django), Valve $25K bounty, "
+            "Mail.ru $15K bounty."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target URL to test for SQL injection",
+                },
+                "method": {
+                    "type": "string",
+                    "description": "HTTP method (GET or POST). Default: GET",
+                    "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                },
+                "param": {
+                    "type": "string",
+                    "description": "Specific parameter name to test. If not provided, tests all params.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameter key-value pairs (e.g., {\"id\": \"1\", \"name\": \"test\"})",
+                },
             },
             "required": ["url"],
         },
@@ -3896,6 +3941,7 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "update_knowledge", "build_app_model",
         "discover_workflows", "ingest_api_schema",  # Sprint 4: schema intelligence
         "run_role_differential", "create_role_account",  # Sprint 4: authz testing
+        "test_sqli_comprehensive",  # Comprehensive SQLi engine
     } | _UNIVERSAL_TOOLS,
     "exploitation": {
         "send_http_request", "test_sqli", "test_xss", "test_cmdi",
@@ -3917,11 +3963,12 @@ _PHASE_TOOLS: dict[str, set[str]] = {
         "create_role_account", "run_role_differential",
         "discover_workflows", "test_workflow_invariant", "test_step_skipping",
         "track_object_ownership", "ingest_api_schema",
+        "test_sqli_comprehensive",
     } | _UNIVERSAL_TOOLS,
     "post_exploit": {
         "send_http_request", "run_custom_exploit", "blind_sqli_extract",
         "discover_chains", "waf_generate_bypasses", "test_ghost_params",
-        "test_authz_matrix", "analyze_graphql",
+        "test_authz_matrix", "analyze_graphql", "test_sqli_comprehensive",
         "browser_interact", "navigate_and_extract", "update_knowledge",
         "update_working_memory", "read_working_memory",
         "manage_chain", "deep_research", "finish_test",
